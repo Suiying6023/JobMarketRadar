@@ -9,8 +9,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import urlencode
 
-from playwright.async_api import BrowserContext, Page
-from playwright.async_api import Error as PlaywrightError
+from patchright.async_api import BrowserContext, Page
+from patchright.async_api import Error as PlaywrightError
 
 from ..models import AutoChatPolicy, CityConfig, CollectionConfig, JobRecord, Platform, SearchFilters
 from ..normalization import (
@@ -32,16 +32,27 @@ SEARCH_BASE = f"{ORIGIN}/web/geek/job"
 
 # BOSS 的搜索页在加载过程中会短暂跳到 about:blank 再跳回，此时相对路径无法解析，
 # 因此同源请求一律使用绝对地址，并在请求前等待页面回到 zhipin 域。
-# 31/37 来自公开项目实测；36「您的账户存在异常行为」是本地实测命中的账号级风控，
-# 比环境级更严重，出现后应停止自动访问并改用普通浏览器手动操作一段时间。
-RISK_CODES = {31, 36, 37}
+# 31/37 来自公开项目实测；36「您的账户存在异常行为」是本地实测命中的账号级风控；
+# 32「您的账户存在异常行为，已暂时被禁止使用」是 2026-08-01 实测命中的临时封禁，
+# 比 36 更严重，出现后应停止自动访问并让账号静置较长时间。
+RISK_CODES = {31, 32, 36, 37}
+# 关键字兜底：防止平台新增的风控码被误判成普通业务错误。
+# 「操作太频繁」「滑块」来自参考项目，实测在 82 条正常详情响应里 0 命中，可安全加入。
+# 参考项目还用了「验证」，但实测它在 82 条正常响应里命中 26 次——全是 JD 正文的
+# 「测试验证」「效果验证」和营业执照说明「经由平台审核验证通过」，会把好数据判成风控，
+# 因此不采用。
 RISK_TEXTS = (
     "访问频繁",
     "安全校验",
     "环境存在异常",
     "账户存在异常",
     "操作过于频繁",
+    "操作太频繁",
+    "滑块",
 )
+
+
+RISK_DUMP_DIR = Path("data/risk_dumps")
 
 
 class RiskControlStop(RuntimeError):
@@ -59,6 +70,8 @@ FILTER_CODES = {
     "degree": {"初中及以下": "209", "中专/中技": "208", "高中": "206", "大专": "202", "本科": "203", "硕士": "204", "博士": "205"},
     "scale": {"0-20人": "301", "20-99人": "302", "100-499人": "303", "500-999人": "304", "1000-9999人": "305", "10000人以上": "306"},
     "stage": {"未融资": "801", "天使轮": "802", "A轮": "803", "B轮": "804", "C轮": "805", "D轮及以上": "806", "已上市": "807", "不需要融资": "808"},
+    # 求职类型（接口参数 jobType）。1901 是「全职」，从 URL 实测确认。
+    "jobType": {"全职": "1901", "兼职": "1902", "实习": "1903"},
 }
 
 
@@ -108,9 +121,18 @@ class BossCollector(Collector):
 
     @staticmethod
     def _filter_value(name: str, value: str | None) -> str | None:
+        """把筛选中文标签映射成接口码；逗号分隔的多选逐个映射后拼接。
+
+        BOSS 多选筛选在 URL 里是逗号分隔（实测 experience=101,104 生效），
+        配置里写「经验不限,1-3年」即可。找不到映射的原始值原样透传，
+        方便直接写码。
+        """
         if not value:
             return None
-        return FILTER_CODES.get(name, {}).get(value, value)
+        mapping = FILTER_CODES.get(name, {})
+        if "," in value:
+            return ",".join(mapping.get(part.strip(), part.strip()) for part in value.split(","))
+        return mapping.get(value, value)
 
     def _params(self, city: CityConfig, keyword: str, filters: SearchFilters, page: int) -> dict[str, str | int]:
         if not city.boss_code:
@@ -143,17 +165,29 @@ class BossCollector(Collector):
 
         BOSS 的安全校验会在加载后触发一次跳转，正好撞上 evaluate 时 Playwright 会抛
         "Execution context was destroyed"。这不是风控，等页面稳定后重试即可。
+        token 在 Python 侧持有（会话内稳定），避免页面刷新把 _PAGE.token 重置。
         """
         assert self.page is not None
-        script = """async (url) => {
+        # BOSS 对不带 token 头的请求给极低配额（实测约 12-13 次/窗口），页面自己的
+        # 请求带齐 token/zp_token/traceId 所以能持续跑。token 的合法来源是
+        # window._PAGE.token（登录后由 __zp_stoken__ 派生）。zp_token 来自 cookie bst，
+        # fetch credentials:'include' 会自动带。traceId 每次请求重新生成，这里暂不构造。
+        script = """async ({url, token}) => {
             try {
-                const response = await fetch(url, {credentials: 'include'});
+                const headers = {
+                    credentials: 'include',
+                    'Accept': 'application/json, text/plain, */*',
+                    'X-Requested-With': 'XMLHttpRequest',
+                };
+                if (token) headers['token'] = token;
+                const response = await fetch(url, headers);
                 const text = await response.text();
                 return {status: response.status, text};
             } catch (err) {
                 return {status: -1, text: '', error: String(err)};
             }
         }"""
+        token = await self._read_token()
         for attempt in range(1, attempts + 1):
             if self.request_count >= self.config.max_requests_per_run:
                 raise RiskControlStop(
@@ -161,15 +195,52 @@ class BossCollector(Collector):
                 )
             self.request_count += 1
             try:
-                return await self.page.evaluate(script, url)
+                return await self.page.evaluate(script, {"url": url, "token": token})
             except PlaywrightError as exc:
                 if "Execution context was destroyed" not in str(exc) or attempt == attempts:
                     raise
                 await self._settle_on_origin()
+                # 页面刷新后 token 可能要重新读
+                token = await self._read_token()
                 await asyncio.sleep(random.uniform(1.5, 3.0))
         raise RuntimeError("同源请求重试耗尽")  # pragma: no cover
 
-    async def _same_origin_fetch(self, path: str) -> dict:
+    async def _read_token(self) -> str:
+        """读 window._PAGE.token（登录会话内稳定）。页面刷新会临时重置，重试几次。"""
+        page = self.page
+        if page is None:
+            return ""
+        for _ in range(3):
+            try:
+                return str(
+                    await page.evaluate(
+                        """() => (typeof window._PAGE !== 'undefined' && window._PAGE)
+                                     ? (window._PAGE.token || '') : ''"""
+                    )
+                )
+            except PlaywrightError as exc:
+                if "Execution context was destroyed" not in str(exc):
+                    raise
+                await asyncio.sleep(2)
+        return ""
+
+    @staticmethod
+    def _dump_risk_body(path: str, status: int, raw_text: str) -> None:
+        """把风控响应正文原样落盘，用于事后判断风控形态。
+
+        风控响应同样是 HTTP 200，正文可能是验证页 HTML 而不是 JSON。只有留下
+        原文，才能区分「可人工过验证」和「硬封」。落盘失败不能影响主流程——
+        这里已经在抛 RiskControlStop 的路上了，不要用 IO 错误盖掉真实原因。
+        """
+        try:
+            RISK_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+            name = re.sub(r"[^A-Za-z0-9]+", "_", path)[:60].strip("_")
+            target = RISK_DUMP_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{status}-{name}.txt"
+            target.write_text(raw_text, encoding="utf-8")
+        except OSError:
+            pass
+
+    async def _same_origin_fetch(self, path: str, recover_code37: bool = False) -> dict:
         assert self.page is not None
         await self._settle_on_origin()
         result = await self._evaluate_fetch(
@@ -179,8 +250,30 @@ class BossCollector(Collector):
         if result.get("error"):
             raise RuntimeError(f"同源请求失败: {result['error']}")
         raw_text = result.get("text") or ""
+        if "环境存在异常" in raw_text and recover_code37:
+            # 2026-08-01 突破：code=37（stoken 过期）可通过让真实浏览器访问
+            # security-check.html 让页面 JS 重算 __zp_stoken__，随后重试即成功。
+            # 不需要等 25 分钟冷却窗口。
+            body = json.loads(raw_text or "{}")
+            zp = body.get("zpData") or {}
+            seed = str(zp.get("seed") or "")
+            name = str(zp.get("name") or "")
+            ts = str(zp.get("ts") or "")
+            if seed and name and ts:
+                self._dump_risk_body(path, status, raw_text)
+                await self._recover_code37(seed, name, ts)
+                result = await self._evaluate_fetch(
+                    f"{ORIGIN}{path}" if path.startswith("/") else path
+                )
+                status = int(result.get("status", 0))
+                raw_text = result.get("text") or ""
         if any(token in raw_text for token in RISK_TEXTS):
-            raise RiskControlStop(f"响应命中风控关键字，HTTP {status}")
+            # 2026-07-30 实测：节流响应是 HTTP 200 + {"code": 0, "message": "访问频繁，请稍后再试"}。
+            # 注意 code 是 0，所以下面所有基于 code 的判断都会放过它，这段关键字检查
+            # 是唯一的防线。正文不是验证页 HTML，没有滑块可过，只能等窗口恢复。
+            # 仍然落盘，因为平台改文案时这里是唯一能看到原始正文的地方。
+            self._dump_risk_body(path, status, raw_text)
+            raise RiskControlStop(f"响应命中风控关键字，HTTP {status}，正文已存 {RISK_DUMP_DIR}")
         try:
             body = json.loads(raw_text or "{}")
         except json.JSONDecodeError as exc:
@@ -192,6 +285,28 @@ class BossCollector(Collector):
         if code not in (None, 0):
             raise RuntimeError(f"BOSS 接口错误 code={code}: {message}")
         return body
+
+    async def _recover_code37(self, seed: str, name: str, ts: str) -> None:
+        """让真实浏览器访问 security-check.html 重算 __zp_stoken__。
+
+        实测（2026-08-01）：导航到 security-check 页后页面 JS 约 3-6 秒自动生成
+        新 stoken，回搜索页后重试原请求即成功。参考 BossAutomation 项目验证。
+        """
+        assert self.page is not None
+        sec_url = (
+            f"{ORIGIN}/web/common/security-check.html?"
+            f"{urlencode({'seed': seed, 'name': name, 'ts': ts, 'callbackUrl': '/web/geek/jobs'})}"
+        )
+        await self.page.goto(sec_url, wait_until="domcontentloaded",
+                             timeout=self.config.browser.navigation_timeout_ms)
+        await self.page.wait_for_timeout(6000)  # 等页面 JS 生成新 stoken
+        # 回搜索页，恢复 fetch 所需的 zhipin 域环境
+        await self.page.goto(
+            f"{SEARCH_BASE}?query=AI%20Agent&city=101210100",
+            wait_until="domcontentloaded",
+            timeout=self.config.browser.navigation_timeout_ms,
+        )
+        await self.page.wait_for_timeout(4000)
 
     def _parse_api_job(self, raw: dict, keyword: str, rank: int) -> JobRecord:
         encrypt_job_id = str(raw.get("encryptJobId") or "")
@@ -264,8 +379,18 @@ class BossCollector(Collector):
         if not security_id:
             raise RuntimeError("列表记录缺少 securityId，无法请求详情接口")
         params = {"securityId": security_id, "lid": str(raw.get("lid") or self.last_lid or "")}
-        body = await self._same_origin_fetch(f"{DETAIL_PATH}?{urlencode(params)}")
+        # recover_code37=True：触发 code=37（stoken 过期）时自动走 security-check 重算重试
+        body = await self._same_origin_fetch(
+            f"{DETAIL_PATH}?{urlencode(params)}", recover_code37=True
+        )
         zp = body.get("zpData") or {}
+        # 平台节流时返回 code=0 但没有 zpData.jobInfo（实测 82 条正常响应全部有 jobInfo）。
+        # 不加这道判断的话，被节流的记录会被当成"成功但 JD 为空"静默写库，
+        # 之后再也不会被 backfill 选中（它只挑 job_description = ''）。
+        if not zp.get("jobInfo"):
+            raise RuntimeError(
+                f"详情响应缺少 zpData.jobInfo（code={body.get('code')}），疑似被节流，不写库"
+            )
         job_info = zp.get("jobInfo") or {}
         boss_info = zp.get("bossInfo") or {}
         brand_info = zp.get("brandComInfo") or {}
@@ -274,7 +399,10 @@ class BossCollector(Collector):
         if description:
             job.job_description = re.sub(r"\n{3,}", "\n\n", description)
 
-        # 详情页的活跃度比列表准：列表 bossOnline 常年 false，activeTimeDesc 根本不返回。
+        # activeTimeDesc 只有详情接口给：2026-07-30 核对 897 条纯列表记录，
+        # 列表响应连这个键都没有（bossOnline 有，但 535/1001 为 true，明显是
+        # 「近期在线」的宽松口径，不能当活跃度用）。
+
         active_desc = str(boss_info.get("activeTimeDesc") or "")
         if active_desc:
             job.recruiter_active_status = active_desc
@@ -325,6 +453,12 @@ class BossCollector(Collector):
             if text and text not in job.welfare:
                 job.welfare.append(text)
         job.raw["detail"] = zp
+        # 详情响应会回一个轮换后的新 securityId。存回去，让下次重试用新鲜 token，
+        # 免得存量记录里的旧 token 越放越久。lid 同理。
+        if zp.get("securityId"):
+            job.raw["securityId"] = str(zp["securityId"])
+        if zp.get("lid"):
+            job.raw["lid"] = str(zp["lid"])
         await asyncio.sleep(random.uniform(*self.config.detail_delay_seconds))
         return job
 

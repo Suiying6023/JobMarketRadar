@@ -18,8 +18,11 @@ class FakePage:
         self.url = url
         self.requested_urls: list[str] = []
 
-    async def evaluate(self, _script: str, arg: str) -> dict:
-        self.requested_urls.append(arg)
+    async def evaluate(self, _script: str, arg=None) -> dict:
+        # _read_token 传 None，fetch 传 {"url":..., "token":...}。只有 fetch 记录 URL。
+        if arg is not None:
+            url = arg["url"] if isinstance(arg, dict) else arg
+            self.requested_urls.append(url)
         return {"status": self.status, "text": json.dumps(self.body, ensure_ascii=False)}
 
     async def wait_for_timeout(self, _ms: int) -> None:

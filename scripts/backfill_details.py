@@ -21,9 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from job_radar.collectors.boss import BossCollector, RiskControlStop  # noqa: E402
+from job_radar.collectors.boss import SEARCH_BASE, BossCollector, RiskControlStop  # noqa: E402
 from job_radar.config import load_config  # noqa: E402
-from job_radar.models import JobRecord  # noqa: E402
+from job_radar.models import JobRecord, SearchFilters  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
 
@@ -97,8 +97,20 @@ async def main() -> None:
 
         collector = BossCollector(cfg)
         await collector.start()
+        # 页面停在 about:blank 时 _settle_on_origin 会卡住，先导航到搜索页建立
+        # zhipin 域环境（详情接口的同源 fetch 依赖页面已在 zhipin 域）。
+        first_city = cfg.cities[0]
+        first_filter = cfg.filters[0] if cfg.filters else SearchFilters()
+        nav_params = collector._params(first_city, cfg.keywords[0], first_filter, 1)
+        nav_visible = {k: v for k, v in nav_params.items() if k not in ("pageSize", "scene")}
+        from urllib.parse import urlencode as _urlencode
+        await collector._goto_search(f"{SEARCH_BASE}?{_urlencode(nav_visible)}")
+        print(f"已导航到搜索页: {collector.page.url[:80]}")
         done = 0
         failed = 0
+        # code=37（stoken 过期）已在 _same_origin_fetch 内部自动走 security-check
+        # 重算重试（约 10 秒/次），不再需要批间长冷却。仅真正的硬风控（32/36）会抛
+        # RiskControlStop 停止整轮。
         try:
             for row in rows:
                 job = _row_to_job(row)
@@ -112,7 +124,7 @@ async def main() -> None:
                     continue
                 store.upsert(job)
                 done += 1
-                if done % 20 == 0:
+                if done % 10 == 0:
                     print(f"进度 {done}/{len(rows)}")
         except RiskControlStop as exc:
             print(f"命中风控，停止：{exc}")

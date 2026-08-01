@@ -20,10 +20,19 @@ detail_limit_per_query: 150
 page_size: 30
 collect_details: true
 request_delay_seconds: [6, 12]
-detail_delay_seconds: [3, 7]
+# 详情接口节流，2026-07-30 两次实测：
+# 1) 不带 token 头：3-7s 间隔 3-4 条命中；15-25s 间隔第 13 条命中（累计配额约 12-13 次/窗口）
+# 2) 带 token 头（window._PAGE.token）+ 10-15s 间隔：15 条全部 code=0，零风控 —— token 是解锁配额的关键
+detail_delay_seconds: [25, 40]
 max_requests_per_run: 250
 filters:
-  - {}
+  # 2026-08-01 数据源筛选（用户手动在搜索页点选确认，码从 URL 实测）：
+  # - jobType 全职（1901）；degree 本科及以下（209,208,206,202,203）
+  # - experience 应届生+经验不限+1年以内+1-3年（102,101,103,104）
+  # 薪资待遇 BOSS 单选，暂不启用（需要时改为 salary: "10-20K" 单值）。
+  - jobType: 全职
+    degree: "初中及以下,中专/中技,高中,大专,本科"
+    experience: "应届生,经验不限,1年以内,1-3年"
 exclude_title_keywords:
   - 销售
   - 主播
@@ -37,7 +46,12 @@ database_path: data/hangzhou_agent.sqlite3
 raw_dir: data/raw
 output_dir: output
 browser:
-  mode: cdp
+  # 2026-08-01 改：persistent 模式用 patchright 直接启动 Chrome（不连调试端口，
+  # 规避 BOSS 端口扫描 + Runtime.enable 检测），复用 .browser-profile 登录态。
+  # 旧 cdp 模式保留兼容但会触发刷新循环。
+  mode: persistent
+  user_data_dir: .browser-profile
+  channel: chrome
   cdp_url: http://127.0.0.1:9222
   headless: false
   navigation_timeout_ms: 30000

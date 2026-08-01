@@ -14,13 +14,23 @@ dist/
 .browser-profile/
 browsers/
 
-# Collected data and outputs (数据库本身按需提交，这里只挡临时文件)
-data/smoke.sqlite3
+# Collected data and outputs (数据库含采集数据/招聘者信息，一律不提交)
+data/*.sqlite3
 data/*.sqlite3-wal
 data/*.sqlite3-shm
 **/data/*.sqlite3.bak*
 data/raw/
 output/
+
+# 探针/调试产物（cookie、token、DOM dump 等，不进仓库）
+data/manual_listen/
+data/token_probe/
+data/vue_probe/
+data/network_probe/
+data/recommend_probe/
+data/risk_dumps/
+data/filter_codes.json
+data/*.log
 
 # Secrets
 .env
@@ -41,3 +51,6 @@ data/*.log
 **/data/probe/
 data/*.sqlite3.bak
 data/targets_*.json
+
+# 风控响应正文可能含账号相关信息，不入库不上传
+data/risk_dumps/

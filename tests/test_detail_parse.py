@@ -35,7 +35,7 @@ def make_collector() -> BossCollector:
     collector = BossCollector(cfg)
     body = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
-    async def fake_fetch(_path: str) -> dict:
+    async def fake_fetch(_path: str, recover_code37: bool = False) -> dict:
         return body
 
     collector._same_origin_fetch = fake_fetch  # type: ignore[assignment]

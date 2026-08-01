@@ -31,6 +31,8 @@ class SearchFilters(BaseModel):
     scale: str | None = None
     stage: str | None = None
     industry: str | None = None
+    # 求职类型：全职/兼职/实习（接口参数 jobType，1901=全职）
+    jobType: str | None = None
 
     def api_params(self) -> dict[str, str]:
         return {k: v for k, v in self.model_dump().items() if v}
