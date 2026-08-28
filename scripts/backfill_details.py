@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -74,6 +75,8 @@ def _row_to_job(row) -> JobRecord:
         matched_queries=json.loads(data["matched_queries_json"] or "[]"),
         source_rank=data["source_rank"],
         raw=json.loads(data["raw_json"] or "{}"),
+        retention_status=data["retention_status"],
+        bookmarked=bool(data["bookmarked"]),
         collected_at=data["collected_at"],
     )
 
@@ -82,13 +85,17 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.hangzhou.yaml")
     parser.add_argument("--limit", type=int, default=150)
+    parser.add_argument("--include-sample", action="store_true",
+                        help="也给 sample 岗位补详情（默认只补 active，省详情配额）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     with JobStore(cfg.database_path) as store:
+        status_filter = "" if args.include_sample else "AND retention_status = 'active' "
         rows = store.conn.execute(
             "SELECT * FROM jobs WHERE job_description = '' "
-            "AND raw_json != '{}' ORDER BY canonical_id LIMIT ?",
+            f"AND raw_json != '{{}}' AND job_invalid = 0 {status_filter}"
+            "ORDER BY canonical_id LIMIT ?",
             (args.limit,),
         ).fetchall()
         print(f"待补详情：{len(rows)} 条")
@@ -96,6 +103,10 @@ async def main() -> None:
             return
 
         collector = BossCollector(cfg)
+        # 注入请求账本：单日累计上限跨进程生效（封禁按累计量算）
+        collector.ledger = store
+        collector.ledger_script = "backfill_details"
+        print(f"今日账本：{store.request_counts()}")
         await collector.start()
         # 页面停在 about:blank 时 _settle_on_origin 会卡住，先导航到搜索页建立
         # zhipin 域环境（详情接口的同源 fetch 依赖页面已在 zhipin 域）。
@@ -108,11 +119,45 @@ async def main() -> None:
         print(f"已导航到搜索页: {collector.page.url[:80]}")
         done = 0
         failed = 0
-        # code=37（stoken 过期）已在 _same_origin_fetch 内部自动走 security-check
-        # 重算重试（约 10 秒/次），不再需要批间长冷却。仅真正的硬风控（32/36）会抛
-        # RiskControlStop 停止整轮。
+        # 拟人化速率方案（2026-08-03）：
+        # - 条内延迟高斯（boss.py），批次大小随机 4-6（打破固定模式）
+        # - 批间大多短休 8-15s，每 2-4 批插入一次长停顿 25-50s + 拟人心跳（滚动页面保鲜）
+        # - code37 触发时 _collect_detail 内建重算（完整重置窗口）
+        from job_radar.throttle import HumanThrottle
+        throttle = HumanThrottle(cfg, detail_batch=5, detail_cooldown=(10.0, 15.0))
+        batch_size = random.randint(4, 6)
+        within = 0
+        batch_count = 0
+        long_pause_after = random.randint(2, 4)
+        # ⚠️ 原为硬编码 35，是"code=37 能预警封禁"这个**已被推翻的旧认知**的最后一处遗留
+        # （2026-08-11 清理时漏了这个局部变量，它遮蔽了 collector 已读好的配置值）。
+        # code=37 是无记忆配额窗口，实测每约 6 次请求必触发一次 → 35 次熔断等于
+        # **把单次调用硬卡在约 205 次请求**，与日线无关。实测 08-11 03:33 就这样在
+        # 170 条详情处掐断，而当日日线 1800 还剩一大截。
+        # 真正的安全线是 max_requests_per_day（由 collector 的账本跨进程执行）。
+        code37_limit = cfg.code37_limit
         try:
-            for row in rows:
+            for idx, row in enumerate(rows, start=1):
+                # 熔断：重算过多说明信任度低，主动停一轮等静置，避免升到 code=32
+                if collector.code37_count >= code37_limit:
+                    raise RiskControlStop(
+                        f"code=37 重算 {collector.code37_count} 次超阈值 {code37_limit}，主动停止防封禁")
+                # 批次边界：大多短休，每 2-4 批一次长停顿 + 拟人心跳
+                if within >= batch_size:
+                    batch_count += 1
+                    if batch_count >= long_pause_after:
+                        dur = throttle._gaussian(25.0, 50.0)
+                        print(f"\n[批次] 长停顿 {dur:.0f}s（拟人心跳）", flush=True)
+                        await throttle.human_heartbeat(collector.page, dur)
+                        long_pause_after = random.randint(2, 4)
+                        batch_count = 0
+                    else:
+                        await asyncio.sleep(throttle._gaussian(10.0, 15.0))
+                    batch_size = random.randint(4, 6)
+                    within = 0
+                    print(f"\n[批次] 下批 {batch_size} 条（{idx}/{len(rows)}）", flush=True)
+                within += 1
+
                 job = _row_to_job(row)
                 try:
                     job = await collector._collect_detail(job)
@@ -120,16 +165,22 @@ async def main() -> None:
                     raise
                 except Exception as exc:
                     failed += 1
-                    print(f"[跳过] {job.title} | {job.company_name}: {exc}")
+                    # 岗位已下架：标记无效并写库，避免下次续跑反复重试浪费请求
+                    if "职位已不存在" in str(exc) or "已暂停" in str(exc):
+                        job.job_invalid = True
+                        store.upsert(job)
+                        print(f"[下架] {job.title} | {job.company_name}")
+                    else:
+                        print(f"[跳过] {job.title} | {job.company_name}: {exc}")
                     continue
                 store.upsert(job)
                 done += 1
-                if done % 10 == 0:
+                if done % 4 == 0:
                     print(f"进度 {done}/{len(rows)}")
         except RiskControlStop as exc:
             print(f"命中风控，停止：{exc}")
         finally:
-            print(f"完成 {done} 条，失败 {failed} 条，共发起请求 {collector.request_count} 次")
+            print(f"完成 {done} 条，失败 {failed} 条，共发起请求 {collector.request_count} 次，code=37 重算 {collector.code37_count} 次")
             await collector.close()
 
 

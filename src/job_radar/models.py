@@ -19,9 +19,27 @@ class BrowserMode(StrEnum):
     PERSISTENT = "persistent"
 
 
+# BOSS 城市码。来源：`GET /wapi/zpCommon/data/cityGroup.json`（免登录）。
+# 2026-08-11 核对，其中杭州与项目里长期在用的 101210100 一致，可信。
+# 要补别的城市直接查那个接口，别猜——码不是简单的行政区划号。
+BOSS_CITY_CODES = {
+    "北京": "101010100",
+    "上海": "101020100",
+    "广州": "101280100",
+    "深圳": "101280600",
+    "杭州": "101210100",
+    "全国": "100010000",   # 不限城市（BOSS 搜索页的"全国"选项）
+}
+
+
 class CityConfig(BaseModel):
     name: str
     boss_code: str | None = None
+
+    def model_post_init(self, _ctx) -> None:
+        # 没显式给码时按城市名自动补，省得每份配置都手抄一遍容易抄错
+        if not self.boss_code and self.name in BOSS_CITY_CODES:
+            object.__setattr__(self, "boss_code", BOSS_CITY_CODES[self.name])
 
 
 class SearchFilters(BaseModel):
@@ -77,6 +95,22 @@ class CollectionConfig(BaseModel):
     # 每抓一条详情后的间隔。详情接口调用量是列表的 N 倍，这里是主要的限速点。
     detail_delay_seconds: tuple[float, float] = (3.0, 7.0)
     max_requests_per_run: int = Field(default=500, ge=1, le=5000)
+    # 节流参数（原先写死在 HumanThrottle.__init__ 默认值里，改配置才能按账号
+    # 信任度调档，不用改代码）。详情接口是 cookie 配额制，批大小和批间冷却是
+    # 唯一有效防线；burst 是"连续 N 条后额外冷却"，打破稳定高速的机器特征。
+    detail_batch: int = Field(default=5, ge=1, le=50)
+    detail_cooldown_seconds: tuple[float, float] = (90.0, 150.0)
+    burst_threshold: int = Field(default=8, ge=1, le=100)
+    burst_penalty_seconds: tuple[float, float] = (60.0, 120.0)
+    # 单日累计请求上限（跨进程，靠 request_log 账本执行）。
+    # 2026-08-10 标定确认：封禁是**累计量制**（同 IP 累计请求量 + 账号信任度），
+    # code=37 只是可恢复的配额窗口信号，不是封禁前兆。所以真正的安全线是这条，
+    # 而 max_requests_per_run 只管单个进程——三个采集脚本各跑一轮就能悄悄
+    # 累到 750 次而每一轮都"没超限"。
+    max_requests_per_day: int = Field(default=600, ge=1, le=5000)
+    # code=37 重算次数熔断阈值。不是封禁预警（见 boss.py 里的说明），
+    # 只是"一轮跑了多少量"的代理指标。激进探测时放开。
+    code37_limit: int = Field(default=35, ge=1, le=5000)
     filters: list[SearchFilters] = Field(default_factory=lambda: [SearchFilters()])
     include_title_keywords: list[str] = Field(default_factory=list)
     exclude_title_keywords: list[str] = Field(default_factory=list)
@@ -134,11 +168,19 @@ class JobRecord(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     job_description: str = ""
+    # 详情成功获取的时间戳（活跃度是时效字段，30 天后就无意义了）。
+    # 用于区分"平台真不返回活跃度"和"没抓过详情"，以及未来做"详情过期重抓"。
+    detail_fetched_at: str = ""
     skills: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
     welfare: list[str] = Field(default_factory=list)
     matched_queries: list[str] = Field(default_factory=list)
     source_rank: int | None = None
+    # 分层保留：active=画像内投递池；sample=画像外但保留作增量去重样本；
+    # purged=待物理清理。状态只由 clean/bookmark 脚本管理，采集 upsert 不覆盖。
+    retention_status: str = "active"
+    # 用户浏览/投递过的岗位，画像外也保留为投递目标（投递池 = active OR bookmarked）。
+    bookmarked: bool = False
     raw: dict[str, Any] = Field(default_factory=dict)
     collected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

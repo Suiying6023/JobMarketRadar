@@ -21,6 +21,7 @@ from ..normalization import (
     source_id_from_url,
     split_location,
 )
+from ..throttle import gaussian
 from .base import Collector
 from .browser import BrowserSession
 
@@ -28,7 +29,11 @@ from .browser import BrowserSession
 ORIGIN = "https://www.zhipin.com"
 API_PATH = "/wapi/zpgeek/search/joblist.json"
 DETAIL_PATH = "/wapi/zpgeek/job/detail.json"
-SEARCH_BASE = f"{ORIGIN}/web/geek/job"
+# 必须是 jobs（带 s）。`/web/geek/job` 会 302 到 `/web/geek/jobs`，多一跳；
+# 2026-08-10 标定实测：code=37 重算后回搜索页那次导航正好撞上这个 302 而超时
+# （Navigation to ".../web/geek/job?..." interrupted），把重算后本该成功的详情
+# 重试白白废掉一条配额。直接写终态 URL，省一跳也不再被 302 打断。
+SEARCH_BASE = f"{ORIGIN}/web/geek/jobs"
 
 # BOSS 的搜索页在加载过程中会短暂跳到 about:blank 再跳回，此时相对路径无法解析，
 # 因此同源请求一律使用绝对地址，并在请求前等待页面回到 zhipin 域。
@@ -38,12 +43,11 @@ SEARCH_BASE = f"{ORIGIN}/web/geek/job"
 RISK_CODES = {31, 32, 36, 37}
 # 关键字兜底：防止平台新增的风控码被误判成普通业务错误。
 # 「操作太频繁」「滑块」来自参考项目，实测在 82 条正常详情响应里 0 命中，可安全加入。
-# 参考项目还用了「验证」，但实测它在 82 条正常响应里命中 26 次——全是 JD 正文的
-# 「测试验证」「效果验证」和营业执照说明「经由平台审核验证通过」，会把好数据判成风控，
-# 因此不采用。
+# 参考项目还用了「验证」「安全校验」，但实测它们在正常 JD 里命中多次——全是正文里的
+# 「测试验证」「效果验证」「数据安全校验」「安全校验通过」等，会把好数据判成风控，不采用。
+# 真正的风控响应是 code=37/32/36（有独立判断）或「访问频繁」这类精确文案。
 RISK_TEXTS = (
     "访问频繁",
-    "安全校验",
     "环境存在异常",
     "账户存在异常",
     "操作过于频繁",
@@ -83,8 +87,30 @@ class BossCollector(Collector):
         self.page: Page | None = None
         self.chat_count = 0
         self.request_count = 0
+        self.code37_count = 0  # security-check 重算次数，高频会升级到 32 封禁
+        # code=37 熔断阈值。2026-08-10/11 标定：code=37 是每约 6 条一次的配额窗口
+        # 信号（间距实测全程稳定 6.0），所以抓 N 条详情正常会触发约 N/6 次。
+        #
+        # ⚠️ 这个阈值**不是封禁预警**：code=37 密度不随累计量上升（无记忆滑动窗口），
+        # 而封禁与 code=37 频率无关——08-03 实测「156 条仅 1 次 code=37 就直接
+        # code=32」，另一次「108 条 21 次 code=37 零封禁」。它只是"跑了多少量"的
+        # 代理指标，作用是防止一轮跑太久。
+        # 从 config 读，激进探测时可放开（config.aggressive.yaml 设到 2000）。
+        self.code37_limit = getattr(config, "code37_limit", 35)
         self.last_lid = ""
         self.owns_page = False
+        self._cached_token = ""  # window._PAGE.token 会话内稳定，避免每条请求重复读
+        # 已有 JD 的 canonical_id：详情接口是最贵资源（封禁红线 150-200 条），
+        # 由 runner 从库里灌进来，命中即跳过详情，配额只花在真正缺 JD 的岗位上。
+        self.skip_detail_ids: set[str] = set()
+        self.detail_skipped = 0
+        # 请求账本（可选注入）。封禁按累计量算，而三个采集脚本各跑各的进程，
+        # 只有落到同一个 DB 表里才能回答"今天一共发了多少"。没注入就是纯内存计数，
+        # 行为不变（不让账本成为采集的硬依赖）。
+        self.ledger = None  # type: ignore[var-annotated]
+        self.ledger_script = ""
+        # 本轮各类请求计数（标定用：区分 list / detail / security_check 的风险差异）
+        self.kind_counts: dict[str, int] = {}
 
     async def start(self) -> None:
         self.context = await self.browser_session.start()
@@ -114,6 +140,7 @@ class BossCollector(Collector):
             await self.page.goto(url, wait_until="domcontentloaded")
             await self.page.wait_for_timeout(random.randint(2500, 4000))
             if ORIGIN in (self.page.url or ""):
+                self._cached_token = ""  # 页面刷新后 window._PAGE 重置，token 需重读
                 return
             if attempt < attempts:
                 await asyncio.sleep(random.uniform(2.0, 4.0))
@@ -160,6 +187,51 @@ class BossCollector(Collector):
             await self.page.wait_for_timeout(250)
         raise RuntimeError(f"页面未停留在 {ORIGIN}，当前为 {self.page.url}")
 
+    @staticmethod
+    def _kind_of(url: str) -> str:
+        """按 URL 判断请求类型。风险差异很大：详情接口几乎承担了全部风控。"""
+        if DETAIL_PATH in url:
+            return "detail"
+        if "security-check" in url:
+            return "security_check"
+        if "/recommend/" in url:
+            return "recommend"
+        return "list"
+
+    def _check_daily_budget(self) -> None:
+        """跨进程单日请求上限。没注入账本时跳过（不让账本成为采集硬依赖）。
+
+        每次请求都查一次 DB 看似浪费，但 request_log 有 (day, kind) 索引且行数
+        是千级，成本远低于一次网络请求；换来的是三个脚本并行/串行跑都不会突破
+        同一条日线——这正是旧代码缺的东西（各进程只管自己的 max_requests_per_run）。
+        """
+        if self.ledger is None:
+            return
+        try:
+            used = self.ledger.request_counts().get("total", 0)
+        except Exception:
+            return
+        cap = self.config.max_requests_per_day
+        if used >= cap:
+            raise RiskControlStop(
+                f"今日累计请求已达 {used}/{cap}（跨进程账本），主动停止。"
+                "封禁按累计量算，明日再跑。"
+            )
+
+    def _count_request(self, url: str, outcome: str = "ok", code: int | None = None) -> None:
+        """本轮内存计数 + 落账本。账本写失败不能打断采集——请求已经发出去了，
+        记不上账是观测问题，把采集中断反而更糟（可能留下半写状态）。"""
+        kind = self._kind_of(url)
+        self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.log_request(
+                kind, outcome=outcome, code=code, script=self.ledger_script
+            )
+        except Exception:
+            pass
+
     async def _evaluate_fetch(self, url: str, attempts: int = 3) -> dict:
         """在页面里发同源请求。
 
@@ -172,36 +244,57 @@ class BossCollector(Collector):
         # 请求带齐 token/zp_token/traceId 所以能持续跑。token 的合法来源是
         # window._PAGE.token（登录后由 __zp_stoken__ 派生）。zp_token 来自 cookie bst，
         # fetch credentials:'include' 会自动带。traceId 每次请求重新生成，这里暂不构造。
-        script = """async ({url, token}) => {
+        # ⚠️ 2026-08-10 两处修复：
+        #
+        # ① headers 必须嵌在 init 的 `headers` 键里。原先写成 `fetch(url, headers)`
+        #    （headers 当 init 顶层字段）—— fetch 只认 method/headers/body/credentials
+        #    等白名单键，Accept/token/X-Requested-With 全被静默丢弃。`credentials`
+        #    恰好是合法键，所以 cookie 一直带上、请求照样成功，把 bug 完全掩盖。
+        #    本地 http server 实测：旧写法服务端收到 token=undefined、accept=*/*。
+        #
+        # ② 被动监听前端真实请求后改用正确的头集合。**前端一个 `token` 头都不发**
+        #    （8 个 wapi 请求全部 token=<无>），它发的是 `zp_token`（= cookie bst 的
+        #    值，前端手动复制到头里）+ `x-requested-with` + `traceid`。所以旧代码执着
+        #    的 window._PAGE.token 方向本身就是错的——而且 _PAGE 在当前前端版本里
+        #    根本不存在（hasPage: false）。
+        #    bst 不是 HttpOnly，JS 可直接从 document.cookie 读。
+        script = """async ({url}) => {
             try {
+                const readCookie = (name) => {
+                    const m = document.cookie.match(
+                        new RegExp('(?:^|; )' + name + '=([^;]*)'));
+                    return m ? decodeURIComponent(m[1]) : '';
+                };
                 const headers = {
-                    credentials: 'include',
                     'Accept': 'application/json, text/plain, */*',
                     'X-Requested-With': 'XMLHttpRequest',
                 };
-                if (token) headers['token'] = token;
-                const response = await fetch(url, headers);
+                const bst = readCookie('bst');
+                if (bst) headers['zp_token'] = bst;
+                const response = await fetch(url, {credentials: 'include', headers});
                 const text = await response.text();
                 return {status: response.status, text};
             } catch (err) {
                 return {status: -1, text: '', error: String(err)};
             }
         }"""
-        token = await self._read_token()
+        # zp_token 在页面内从 document.cookie 现读，不需要 Python 侧传 token。
+        # （旧的 _read_token/_cached_token 走 window._PAGE.token，该对象在当前前端
+        # 版本已不存在，且前端真实请求从不发 token 头——见上方注释②。）
         for attempt in range(1, attempts + 1):
             if self.request_count >= self.config.max_requests_per_run:
                 raise RiskControlStop(
                     f"已达单次运行请求上限 {self.config.max_requests_per_run}，主动停止。"
                 )
+            self._check_daily_budget()
             self.request_count += 1
+            self._count_request(url)
             try:
-                return await self.page.evaluate(script, {"url": url, "token": token})
+                return await self.page.evaluate(script, {"url": url})
             except PlaywrightError as exc:
                 if "Execution context was destroyed" not in str(exc) or attempt == attempts:
                     raise
                 await self._settle_on_origin()
-                # 页面刷新后 token 可能要重新读
-                token = await self._read_token()
                 await asyncio.sleep(random.uniform(1.5, 3.0))
         raise RuntimeError("同源请求重试耗尽")  # pragma: no cover
 
@@ -261,52 +354,151 @@ class BossCollector(Collector):
             ts = str(zp.get("ts") or "")
             if seed and name and ts:
                 self._dump_risk_body(path, status, raw_text)
+                self.code37_count += 1
+                print(f"  [code=37] 第 {self.code37_count} 次重算 stoken（高频会封号）", flush=True)
                 await self._recover_code37(seed, name, ts)
                 result = await self._evaluate_fetch(
                     f"{ORIGIN}{path}" if path.startswith("/") else path
                 )
                 status = int(result.get("status", 0))
                 raw_text = result.get("text") or ""
-        if any(token in raw_text for token in RISK_TEXTS):
-            # 2026-07-30 实测：节流响应是 HTTP 200 + {"code": 0, "message": "访问频繁，请稍后再试"}。
-            # 注意 code 是 0，所以下面所有基于 code 的判断都会放过它，这段关键字检查
-            # 是唯一的防线。正文不是验证页 HTML，没有滑块可过，只能等窗口恢复。
-            # 仍然落盘，因为平台改文案时这里是唯一能看到原始正文的地方。
-            self._dump_risk_body(path, status, raw_text)
-            raise RiskControlStop(f"响应命中风控关键字，HTTP {status}，正文已存 {RISK_DUMP_DIR}")
         try:
             body = json.loads(raw_text or "{}")
         except json.JSONDecodeError as exc:
+            # 非 JSON 正文 = 验证页 HTML（滑块/验证码），按风控停机。只在解析失败时扫全文，
+            # 避免 JSON 里的 JD 正文误报（如爬虫岗 JD 会提到「滑块」）。
+            if any(token in raw_text for token in RISK_TEXTS):
+                self._dump_risk_body(path, status, raw_text)
+                raise RiskControlStop(f"响应命中风控关键字，HTTP {status}，正文已存 {RISK_DUMP_DIR}")
             raise RuntimeError(f"BOSS 接口返回非 JSON，HTTP {status}") from exc
         code = body.get("code")
         message = str(body.get("message") or "")
+        # 2026-07-30 实测：节流响应是 HTTP 200 + {"code": 0, "message": "访问频繁，请稍后再试"}。
+        # 注意 code 是 0，所以下面所有基于 code 的判断都会放过它，这段 message 关键字检查
+        # 是唯一的防线。只查 message 字段不查全文——JD 正文里的「滑块」「安全校验」等是
+        # 正常内容（尤其爬虫/安全岗），扫全文会误报丢弃好数据。正文不是验证页 HTML，
+        # 没有滑块可过，只能等窗口恢复。仍然落盘，因为平台改文案时这里是唯一能看到原始正文的地方。
+        if any(token in message for token in RISK_TEXTS):
+            self._dump_risk_body(path, status, raw_text)
+            self._mark_outcome("throttled", 0)
+            raise RiskControlStop(f"响应命中风控关键字，HTTP {status}，正文已存 {RISK_DUMP_DIR}")
         if status in (401, 403, 429) or code in RISK_CODES:
+            self._mark_outcome("risk", code if isinstance(code, int) else None)
             raise RiskControlStop(f"命中平台风控 HTTP {status} code={code}: {message}")
         if code not in (None, 0):
             raise RuntimeError(f"BOSS 接口错误 code={code}: {message}")
         return body
+
+    def _mark_outcome(self, outcome: str, code: int | None) -> None:
+        """把账本里最后一条记录改判为风控结果。
+
+        记账发生在请求**发出前**（否则请求发了但进程崩掉就漏账），此时还不知道
+        响应是什么，所以风控结论只能事后回填到刚写的那一行。
+        """
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.conn.execute(
+                "UPDATE request_log SET outcome = ?, code = ? "
+                "WHERE id = (SELECT MAX(id) FROM request_log)",
+                (outcome, code),
+            )
+            self.ledger.conn.commit()
+        except Exception:
+            pass
 
     async def _recover_code37(self, seed: str, name: str, ts: str) -> None:
         """让真实浏览器访问 security-check.html 重算 __zp_stoken__。
 
         实测（2026-08-01）：导航到 security-check 页后页面 JS 约 3-6 秒自动生成
         新 stoken，回搜索页后重试原请求即成功。参考 BossAutomation 项目验证。
+        2026-08-03 优化：不固定等 6s，改轮询 __zp_stoken__ cookie 直到刷新即回，
+        每批省约 4s（通常是 2-5s 而非 6s）。
         """
-        assert self.page is not None
+        assert self.page is not None and self.context is not None
         sec_url = (
             f"{ORIGIN}/web/common/security-check.html?"
             f"{urlencode({'seed': seed, 'name': name, 'ts': ts, 'callbackUrl': '/web/geek/jobs'})}"
         )
+        # 重算本身要发两次导航（security-check + 回搜索页），都是真实请求且都消耗
+        # 信用——封禁页原文「请勿频繁提交刷新请求」印证刷新也算。旧代码只数 fetch，
+        # 于是重算的开销在账上完全隐形，"今天发了多少"被系统性低估。
+        self._count_request(sec_url, outcome="code37_recover", code=37)
         await self.page.goto(sec_url, wait_until="domcontentloaded",
                              timeout=self.config.browser.navigation_timeout_ms)
-        await self.page.wait_for_timeout(6000)  # 等页面 JS 生成新 stoken
+        # 轮询新 stoken 就绪（HttpOnly，须用 context.cookies()），比固定等待快
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            await self.page.wait_for_timeout(500)
+            try:
+                cookies = await self.context.cookies()
+                st = next((c for c in cookies if c["name"] == "__zp_stoken__"), None)
+                if st and st.get("value"):
+                    break
+            except Exception:
+                pass
         # 回搜索页，恢复 fetch 所需的 zhipin 域环境
         await self.page.goto(
             f"{SEARCH_BASE}?query=AI%20Agent&city=101210100",
             wait_until="domcontentloaded",
             timeout=self.config.browser.navigation_timeout_ms,
         )
-        await self.page.wait_for_timeout(4000)
+        await self.page.wait_for_timeout(2000)
+        self._cached_token = ""  # 重算后页面刷新，token 需重读
+
+    async def _forge_stoken(self) -> bool:
+        """主动铸造 __zp_stoken__（不等 code=37 触发），重置详情配额窗口。
+
+        BossAutomation 实测（2026-08-03 调研）：用硬编码 seed/name + 新 ts 导航
+        security-check.html，页面 JS 会自动生成新 stoken，无需先触发 code=37。
+        这能把「耗尽才重铸」改成「每批主动补」，彻底堵住配额洞。
+        __zp_stoken__ 是 HttpOnly，须用 context.cookies() 读（document.cookie 读不到）。
+        铸造后等 ≥1.5s 再发请求（Vampxgg 实测 <1.2s 会 37）。
+
+        返回是否铸造成功。失败时调用方回退到被动 _recover_code37。
+        """
+        assert self.page is not None and self.context is not None
+        import time as _time
+
+        # 2026-08-03 调研：BossAutomation 验证有效的硬编码 seed/name（每日 0-1 点轮换，
+        # 若失效则 fallback 到被动触发拿真实 seed）
+        seed = "ttttZij2JIIK+xUw73+6ZmzsaYKTbDQuIH6OR6Bm54o="
+        name = "e331459e"
+        ts = int(_time.time() * 1000)
+        sec_url = (
+            f"{ORIGIN}/web/common/security-check.html?"
+            f"{urlencode({'seed': seed, 'name': name, 'ts': ts, 'callbackUrl': '/web/geek/jobs'})}"
+        )
+        try:
+            await self.page.goto(sec_url, wait_until="domcontentloaded",
+                                 timeout=self.config.browser.navigation_timeout_ms)
+            # 轮询 cookie 直到出现新 __zp_stoken__（最长 120s，参考 BossKit）
+            deadline = _time.monotonic() + 120
+            forged = False
+            while _time.monotonic() < deadline:
+                await self.page.wait_for_timeout(2000)
+                try:
+                    cookies = await self.context.cookies()
+                    st = next((c for c in cookies if c["name"] == "__zp_stoken__"), None)
+                    if st and st.get("value"):
+                        forged = True
+                        break
+                except Exception:
+                    pass
+            # 回搜索页，恢复 fetch 所需的 zhipin 域环境
+            await self.page.goto(
+                f"{SEARCH_BASE}?query=AI%20Agent&city=101210100",
+                wait_until="domcontentloaded",
+                timeout=self.config.browser.navigation_timeout_ms,
+            )
+            await self.page.wait_for_timeout(3000)
+            self._cached_token = ""  # 页面刷新后 token 需重读
+            if forged:
+                await asyncio.sleep(1.5)  # 铸造后冷却，避免过短间隔触发 37
+            return forged
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forge] 主动铸造异常: {str(exc)[:60]}")
+            return False
 
     def _parse_api_job(self, raw: dict, keyword: str, rank: int) -> JobRecord:
         encrypt_job_id = str(raw.get("encryptJobId") or "")
@@ -459,7 +651,12 @@ class BossCollector(Collector):
             job.raw["securityId"] = str(zp["securityId"])
         if zp.get("lid"):
             job.raw["lid"] = str(zp["lid"])
-        await asyncio.sleep(random.uniform(*self.config.detail_delay_seconds))
+        # 记录详情成功获取的时间戳（活跃度是时效字段，抓完 30 天后就无意义了）
+        from datetime import datetime, timezone
+        job.detail_fetched_at = datetime.now(timezone.utc).isoformat()
+        # 条内延迟用高斯分布（比 uniform 更像真人：有时快有时慢），2026-08-03 拟人化
+        lo, hi = self.config.detail_delay_seconds
+        await asyncio.sleep(gaussian(lo, hi))
         return job
 
     async def _maybe_chat(self, job: JobRecord) -> str:
@@ -530,12 +727,41 @@ class BossCollector(Collector):
                 break
             for rank, raw in enumerate(raw_jobs, start=1):
                 job = self._parse_api_job(raw, keyword, rank)
-                if not self._should_keep(job):
+                # 全保留分层：无效岗位跳过；画像外岗位也入库标 sample（去重样本），
+                # 不再过滤丢弃，保证下次增量采集能识别为已见而 UPDATE 而非 INSERT。
+                if not job.title or not job.job_url:
                     continue
-                if self.config.collect_details and detailed < detail_limit:
+                job.retention_status = "active" if self._should_keep(job) else "sample"
+                # 去重前置：库里已有 JD 的岗位不再抓详情。13 个关键词的搜索结果
+                # 大量交叉重叠，原先同一岗位每被搜到一次就重抓一次详情，白烧配额。
+                already = job.canonical_key() in self.skip_detail_ids
+                if already:
+                    self.detail_skipped += 1
+                if (
+                    self.config.collect_details
+                    and detailed < detail_limit
+                    and job.retention_status == "active"
+                    and not already
+                ):
+                    # 熔断（2026-08-10 补齐）：backfill 路径一直有 code37_limit=35，
+                    # collect 路径完全没有——同一个 collector 类两条调用路径安全等级
+                    # 不对称。code=37 本身可恢复，但每次重算都消耗信用，累积会升到
+                    # code=32 封禁（实测：156 条仅 1 次 code37 就触发过 32）。
+                    if self.code37_count >= self.code37_limit:
+                        raise RiskControlStop(
+                            f"code=37 重算 {self.code37_count} 次超阈值 "
+                            f"{self.code37_limit}，主动停止防封禁"
+                        )
                     try:
                         job = await self._collect_detail(job)
                         detailed += 1
+                        # 本轮内同一岗位也可能再出现（换关键词），记下避免重复
+                        self.skip_detail_ids.add(job.canonical_key())
+                    except RiskControlStop:
+                        # 必须原样上抛。RiskControlStop 继承 RuntimeError，原先被
+                        # 下面的 `except Exception` 吞掉后只写进 detail_error 字段，
+                        # 循环继续往下抓——真封禁时反而会持续撞墙加重惩罚。
+                        raise
                     except Exception as exc:
                         job.raw["detail_error"] = str(exc)
                 chat_status = await self._maybe_chat(job)

@@ -1,4 +1,4 @@
-"""本地数据清理：删除不符合目标画像的记录。
+"""本地数据分层：按画像把不符合的岗位标记为 sample（不再物理删除）。
 
 口径（用户确认）：
 - 经验：在校/应届、经验不限、1年以内、1-3年
@@ -7,87 +7,128 @@
 - 排除：代招(is_proxy_job)、已失效(job_invalid)、日薪(实习)、标题含销售/客服等
 - 排除公司：猎头/劳务派遣/人力资源
 
+被降级为 sample 的记录保留在库中，作为后续增量扩充的去重样本——下次采集
+遇到同一岗位（canonical_id 相同）走 UPDATE 而非 INSERT，避免重复抓取。
+
 用法:
-  python scripts/clean_local_db.py --dry-run   # 只统计，不删
-  python scripts/clean_local_db.py             # 实际删除
+  python scripts/clean_local_db.py --dry-run   # 只统计，不改
+  python scripts/clean_local_db.py             # 把不符合的 active 标记为 sample
+  python scripts/clean_local_db.py --purge     # 物理删除所有 sample 记录
 """
 from __future__ import annotations
 
+import argparse
 import sqlite3
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from job_radar import profile as P  # noqa: E402
 
 DB = "data/hangzhou_agent.sqlite3"
 
-ALLOW_EXP = {"在校/应届", "经验不限", "1年以内", "1-3年"}
-ALLOW_DEG = {"本科", "大专", "学历不限", "中专/中技", "高中", "初中及以下"}
-EXCLUDE_TITLE = ["销售", "主播", "客服", "电话", "猎头", "劳务派遣"]
-EXCLUDE_COMPANY = ["猎头", "劳务派遣", "人力资源"]
-DAILY_MARKERS = ["元/天", "元/日"]
-HIGH_SALARY_MIN = 20.0
 
+def should_demote(r) -> tuple[bool, str]:
+    """画像判定。阈值/名单全部来自 job_radar.profile 单一真源。
 
-def is_daily(salary: str) -> bool:
-    return any(m in (salary or "") for m in DAILY_MARKERS)
-
-
-def should_delete(r) -> tuple[bool, str]:
-    exp = r["experience"] or ""
-    deg = r["education"] or ""
-    title = (r["title"] or "").lower()
-    company = (r["company_name"] or "").lower()
-    salary = r["salary_text"] or ""
-
+    2026-08-10 修复：标题/公司黑名单两个分支原先写成
+    `if any(kw in title for kw in EXCLUDE_TITLE): return True, f"标题[{kw}]"`,
+    生成器的 kw 不泄漏到外层作用域 → NameError，这两条判定从未真正生效过
+    （降级原因分布里从来只有 高薪/代招/已失效，外包公司名单一次都没命中）。
+    """
     if r["job_invalid"]:
         return True, "已失效"
+    if "关闭" in (r["job_status_desc"] or ""):
+        return True, "已关闭"
     if r["is_proxy_job"]:
         return True, "代招"
-    if r["salary_min_k"] is not None and r["salary_min_k"] > HIGH_SALARY_MIN:
+    if not P.city_allowed(r["city"] or ""):
+        return True, f"非目标城市[{r['city']}]"
+    if r["salary_min_k"] is not None and r["salary_min_k"] > P.SALARY_DROP_MIN_ABOVE:
         return True, f"高薪(下限{r['salary_min_k']:.0f}K)"
-    if is_daily(salary):
+    if P.is_daily_salary(r["salary_text"] or ""):
         return True, "日薪(实习)"
-    if exp not in ALLOW_EXP:
+    exp = r["experience"] or ""
+    if exp not in P.ALLOW_EXP:
         return True, f"经验[{exp}]"
-    if deg not in ALLOW_DEG:
+    deg = r["education"] or ""
+    if deg not in P.ALLOW_DEG:
         return True, f"学历[{deg}]"
-    if any(kw in title for kw in EXCLUDE_TITLE):
+    kw = P.match_keyword(r["title"] or "", P.EXCLUDE_TITLE)
+    if kw:
         return True, f"标题[{kw}]"
-    if any(kw in company for kw in EXCLUDE_COMPANY):
+    kw = P.match_keyword(r["company_name"] or "", P.EXCLUDE_COMPANY)
+    if kw:
         return True, f"公司[{kw}]"
+    kw = P.match_keyword(r["recruiter_title"] or "", P.EXCLUDE_RECRUITER_TITLE)
+    if kw:
+        return True, f"猎头发布[{kw}]"
     return False, ""
 
 
 def main() -> None:
-    dry = "--dry-run" in sys.argv
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true", help="只统计，不改")
+    parser.add_argument("--purge", action="store_true", help="物理删除所有 sample 记录")
+    args = parser.parse_args()
+
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
 
-    rows = con.execute("SELECT * FROM jobs").fetchall()
-    total = len(rows)
-    to_delete = []
-    reasons: dict[str, int] = {}
-    for r in rows:
-        del_flag, reason = should_delete(r)
-        if del_flag:
-            to_delete.append((r["canonical_id"], r["title"] or "", reason))
-            reasons[reason] = reasons.get(reason, 0) + 1
-
-    print(f"总量: {total}")
-    print(f"将删除: {len(to_delete)} 条，保留: {total - len(to_delete)} 条")
-    print(f"\n删除原因分布:")
-    for reason, n in sorted(reasons.items(), key=lambda x: -x[1]):
-        print(f"  {reason}: {n}")
-
-    if dry:
-        print("\n[DRY-RUN] 未执行删除。加 --dry-run 参数移除即实际删除")
-        print("\n删除样例（前 20 条）:")
-        for cid, title, reason in to_delete[:20]:
-            print(f"  [{reason}] {title[:36]}")
-    else:
-        con.execute("BEGIN")
-        for cid, _t, _r in to_delete:
-            con.execute("DELETE FROM jobs WHERE canonical_id = ?", (cid,))
+    if args.purge:
+        # 保住 bookmarked 的样本：那是用户手工浏览/投递过的岗位，物理删掉就找不回了
+        n = con.execute(
+            "DELETE FROM jobs WHERE retention_status = 'sample' AND bookmarked = 0"
+        ).rowcount
         con.commit()
-        print(f"\n已删除 {len(to_delete)} 条")
+        print(f"已物理清理 {n} 条 sample 记录")
+    else:
+        # bookmarked=1 是用户手工判断（浏览/投递过），豁免自动降级
+        rows = con.execute(
+            "SELECT * FROM jobs WHERE retention_status = 'active' AND bookmarked = 0"
+        ).fetchall()
+        total = len(rows)
+        to_demote: list[tuple[str, str, str]] = []
+        reasons: dict[str, int] = {}
+        for r in rows:
+            del_flag, reason = should_demote(r)
+            if del_flag:
+                to_demote.append((r["canonical_id"], r["title"] or "", reason))
+                reasons[reason] = reasons.get(reason, 0) + 1
+
+        print(f"active 总量: {total}")
+        print(f"将降级为 sample: {len(to_demote)}，保留 active: {total - len(to_demote)}")
+        print(f"\n降级原因分布:")
+        for reason, n in sorted(reasons.items(), key=lambda x: -x[1]):
+            print(f"  {reason}: {n}")
+
+        if args.dry_run:
+            print("\n[DRY-RUN] 未执行标记。移除 --dry-run 即实际标记为 sample")
+            print("\n降级样例（前 20 条）:")
+            for cid, title, reason in to_demote[:20]:
+                print(f"  [{reason}] {title[:36]}")
+        else:
+            con.execute("BEGIN")
+            for cid, _t, _r in to_demote:
+                con.execute(
+                    "UPDATE jobs SET retention_status = 'sample' WHERE canonical_id = ?", (cid,)
+                )
+            con.commit()
+            print(f"\n已标记 {len(to_demote)} 条为 sample")
+
+    # 分层统计
+    layers = {}
+    for r in con.execute(
+        "SELECT retention_status, bookmarked, COUNT(*) FROM jobs GROUP BY retention_status, bookmarked"
+    ):
+        key = f"{r[0]}" + (f"+bookmark" if r[1] else "")
+        layers[key] = layers.get(key, 0) + r[2]
+    pool = con.execute(
+        "SELECT COUNT(*) FROM jobs WHERE retention_status = 'active' OR bookmarked = 1"
+    ).fetchone()[0]
+    print(f"\n分层: {layers}")
+    print(f"投递池(active OR bookmarked): {pool}")
 
     con.close()
 

@@ -1,0 +1,20 @@
+{"seq": 1, "round": 1, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "智能体开发"}
+{"seq": 2, "round": 1, "kind": "detail", "code37": 0, "jd_len": 202}
+{"seq": 3, "round": 2, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "Agent应用开发"}
+{"seq": 4, "round": 2, "kind": "detail", "code37": 0, "jd_len": 312}
+{"seq": 5, "round": 3, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "AI应用开发"}
+{"seq": 6, "round": 3, "kind": "detail", "code37": 1, "jd_len": 958}
+{"seq": 7, "round": 4, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "AI算法工程师"}
+{"seq": 8, "round": 4, "kind": "detail", "code37": 0, "jd_len": 292}
+{"seq": 9, "round": 5, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "AI全栈工程师"}
+{"seq": 10, "round": 5, "kind": "detail", "code37": 0, "jd_len": 875}
+{"seq": 11, "round": 6, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "AI后端工程师"}
+{"seq": 12, "round": 6, "kind": "detail", "code37": 1, "jd_len": 269}
+{"seq": 13, "round": 7, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "langgraph"}
+{"seq": 14, "round": 7, "kind": "detail", "code37": 0, "jd_len": 857}
+{"seq": 15, "round": 8, "kind": "list", "code37": 0, "n_jobs": 0, "keyword": "opencode"}
+{"seq": 16, "round": 8, "kind": "detail", "code37": 0, "jd_len": 335}
+{"seq": 17, "round": 9, "kind": "list", "code37": 1, "n_jobs": 30, "keyword": "python"}
+{"seq": 18, "round": 9, "kind": "detail", "code37": 0, "jd_len": 2430}
+{"seq": 19, "round": 10, "kind": "list", "code37": 0, "n_jobs": 30, "keyword": "RAG"}
+{"seq": 20, "round": 10, "kind": "detail", "code37": 0, "jd_len": 1366}

@@ -49,6 +49,16 @@ async def run_collection(config: CollectionConfig) -> CollectionStats:
     with JobStore(config.database_path) as store:
         for platform in config.platforms:
             collector = make_collector(platform, config)
+            # 去重前置：把库里已有 JD 的岗位灌给采集器，详情配额不浪费在重复岗位上
+            if hasattr(collector, "skip_detail_ids"):
+                collector.skip_detail_ids = store.detailed_ids()
+                console.print(f"[dim]已有详情 {len(collector.skip_detail_ids)} 条，本轮跳过其详情请求[/]")
+            # 注入请求账本：单日累计上限跨进程生效（封禁按累计量算，不是频率）
+            if hasattr(collector, "ledger"):
+                collector.ledger = store
+                collector.ledger_script = "runner"
+                console.print(f"[dim]今日账本 {store.request_counts()}"
+                              f"，单日上限 {config.max_requests_per_day}[/]")
             await collector.start()
             try:
                 for city in config.cities:
@@ -74,5 +84,8 @@ async def run_collection(config: CollectionConfig) -> CollectionStats:
             finally:
                 # finally 在 return 之前执行，风控提前返回时这里同样会记上用量。
                 stats.requests_used += getattr(collector, "request_count", 0)
+                skipped = getattr(collector, "detail_skipped", 0)
+                if skipped:
+                    console.print(f"[dim]详情去重跳过 {skipped} 次（省下同等数量的详情请求）[/]")
                 await collector.close()
     return stats

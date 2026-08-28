@@ -54,3 +54,14 @@ data/targets_*.json
 
 # 风控响应正文可能含账号相关信息，不入库不上传
 data/risk_dumps/
+.browser-profile-reg/
+
+# Local run variants and probe pools (machine-specific, not for the public repo)
+config.aggressive.yaml
+config.cities3.yaml
+config.steady.yaml
+config.trial.yaml
+config.smoke.yaml
+proxies.*.txt
+HANDOFF.md
+job-market-radar-v*/

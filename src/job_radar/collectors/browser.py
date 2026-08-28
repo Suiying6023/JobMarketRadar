@@ -49,7 +49,8 @@ class BrowserSession:
             headless=self.config.headless,
             slow_mo=self.config.slow_mo_ms,
             no_viewport=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            # 离屏定位避免抢焦点（--start-minimized 会被 profile 窗口状态覆盖）
+            args=["--disable-blink-features=AutomationControlled", "--window-position=-32000,-32000"],
             ignore_default_args=["--enable-automation"],
         )
         self.context.set_default_timeout(self.config.navigation_timeout_ms)

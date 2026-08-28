@@ -9,6 +9,9 @@ description = "国内 AI 岗位聚合、筛选与可选自动开聊的本地工�
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  # patchright 是 playwright 的反检测分支，collectors/boss.py 直接 import 它。
+  # 缺它 CLI 会在 import 阶段就崩（ModuleNotFoundError），2026-08-26 重建环境时暴露。
+  "patchright>=1.50",
   "playwright>=1.50",
   "pydantic>=2.8",
   "PyYAML>=6.0",
