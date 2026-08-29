@@ -20,12 +20,17 @@ import random
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from job_radar.collectors.boss import SEARCH_BASE, BossCollector, RiskControlStop  # noqa: E402
 from job_radar.config import load_config  # noqa: E402
 from job_radar.models import JobRecord, SearchFilters  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
+
+# 投递池判定的唯一实现。这里复用它而不是另写一套，否则两份阈值会各自漂移。
+from clean_local_db import should_demote  # noqa: E402
 
 
 def _row_to_job(row) -> JobRecord:
@@ -92,12 +97,35 @@ async def main() -> None:
     cfg = load_config(args.config)
     with JobStore(cfg.database_path) as store:
         status_filter = "" if args.include_sample else "AND retention_status = 'active' "
-        rows = store.conn.execute(
+        # 多取一些候选，因为下面要按投递池判定过滤掉注定被降级的，
+        # 命中率未知（实测存量里约 4 成注定降级），少取会凑不满 --limit。
+        candidates = store.conn.execute(
             "SELECT * FROM jobs WHERE job_description = '' "
             f"AND raw_json != '{{}}' AND job_invalid = 0 {status_filter}"
-            "ORDER BY canonical_id LIMIT ?",
-            (args.limit,),
+            "ORDER BY canonical_id",
         ).fetchall()
+
+        # ⚠️ 先按投递池判定筛一遍，再花配额。
+        # 这些记录是**存量**，进库时的采集侧 `_should_keep` 拦不到它们
+        # （那个只在列表阶段跑，而这里直接读库）。实测 5054 条待补详情里
+        # 2167 条注定被 clean_local_db 降级（匿名公司 856、薪资超纲 2368，
+        # 两者重叠 743）—— 一条详情一次请求，全跑完等于白花 120% 的日线额度。
+        rows = []
+        skipped: dict[str, int] = {}
+        for r in candidates:
+            demote, why = should_demote(r)
+            if demote:
+                key = why.split("(")[0].split("[")[0]
+                skipped[key] = skipped.get(key, 0) + 1
+                continue
+            rows.append(r)
+            if len(rows) >= args.limit:
+                break
+
+        if skipped:
+            total_skipped = sum(skipped.values())
+            print(f"跳过注定降级 {total_skipped} 条（省下同样次数的请求）："
+                  f"{dict(sorted(skipped.items(), key=lambda kv: -kv[1]))}")
         print(f"待补详情：{len(rows)} 条")
         if not rows:
             return

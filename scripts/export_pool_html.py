@@ -60,6 +60,9 @@ td:nth-child(7){max-width:280px}
 td:nth-child(8){max-width:180px}
 .salary{font-weight:600;color:#b91c1c}
 .muted{color:#9ca3af}
+/* 数据时效：黄=超7天未核实，红=超30天（很可能已下架或活跃度失真） */
+.stale-warn{color:#d97706;font-weight:600}
+.stale-bad{color:#dc2626;font-weight:600}
 details{margin:0}
 .jd{font-size:12px;line-height:1.7;max-height:280px;overflow-y:auto;margin-top:6px;padding:8px;background:#f9fafb;border-radius:6px}
 .demote{padding:3px 10px;border-radius:6px;border:1px solid #fca5a5;background:#fef2f2;color:#dc2626;font-size:12px;cursor:pointer;white-space:nowrap}
@@ -97,12 +100,23 @@ function render(){
     <td>${r.tags}</td>
     <td><details><summary class="muted">JD (${r.detail.length>0?Math.round(r.detail.length/2):0}字)</summary><div class="jd">${r.detail}</div></details>
         <span class="muted">首见${r.firstSeen}${r.seen>1?` · 在架${r.seen}次`:''}</span></td>
+    <td><span class="${r.actAge>=30?'stale-bad':r.actAge>=7?'stale-warn':''}"
+        title="最后一次核实这条数据（采集或刷新）的日期">${r.lastSeen||'—'}</span>
+        ${r.actAge!=null?`<br><span class="muted">${r.actAge}天前</span>`:''}</td>
     <td>${r.appliedAt?`<span class="badge" style="background:#16a34a">已投 ${r.appliedAt}</span>`
         :`<button onclick="apply(this,'${r.id}')">投递</button>`}
         <button class="demote" onclick="demote(this,'${r.id}')">排除</button>
         <button onclick="addNote(this,'${r.id}')" title="${r.note||'加备注'}">${r.note?'📝':'✎'}</button></td>
   </tr>`).join('');
-  document.getElementById('stats').textContent=`显示 ${rows.length} / ${ALL.length} 条`;
+  // 时效概览：让「这批数据有多旧」在打开页面第一眼就能看到，
+  // 而不是逐行去看「最后核实」列。
+  const fresh=rows.filter(r=>r.actAge!=null&&r.actAge<7).length;
+  const stale=rows.filter(r=>r.actAge!=null&&r.actAge>=30).length;
+  const newest=rows.map(r=>r.lastSeen).filter(Boolean).sort().pop()||'—';
+  document.getElementById('stats').innerHTML=
+    `显示 ${rows.length} / ${ALL.length} 条 · 最新核实 ${newest}`
+    + ` · <span class="stale-warn">7天内 ${fresh}</span>`
+    + ` · <span class="stale-bad">超30天 ${stale}</span>`;
 }
 function sortBy(k){if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=-1;}render();}
 async function demote(btn, id){
@@ -167,27 +181,21 @@ def extract_capital(intro: str) -> str:
 
 
 def observed_days_ago(r) -> int | None:
-    """活跃度这个数据是多少天前观测到的。
+    """活跃度是多少天前观测到的。
 
-    `recruiter_active_status` 是抓详情那一刻的快照，不随时间衰减。一条 07-30
-    记录的「刚刚活跃」到今天其实是"11 天前活跃过"，但页面照旧显示「刚刚活跃」
-    并据此判 P0 —— 这是 P0 页可信度的根本问题（models.py 的注释早就预见了
-    「活跃度是时效字段」，只是导出层没落实）。
+    `recruiter_active_status` 是抓详情那一刻的快照，不随时间衰减——一条 30 天前
+    记录的「刚刚活跃」今天仍显示「刚刚活跃」并据此判 P0。所以展示与排序都必须
+    带上这个年龄（见 P.stale_penalty）。
 
-    基准取 `max(last_seen_at, detail_fetched_at)`：不能只用 last_seen_at，
-    历史上有 144 行因 upsert 把旧 collected_at 往回写而使 last_seen 早于
-    detail_fetched（storage.py 已修，但存量数据仍是错的）。
+    基准是 `last_verified()`（采集与详情刷新取较新者）。None = 从未观测。
     """
-    stamps = [s for s in ((r["last_seen_at"] or ""), (r["detail_fetched_at"] or ""))
-              if s]
-    if not stamps:
+    newest = last_verified(r)
+    if not newest:
         return None
     try:
-        newest = max(stamps)[:10]
-        seen = date.fromisoformat(newest)
+        return max(0, (date.today() - date.fromisoformat(newest)).days)
     except (ValueError, TypeError):
         return None
-    return max(0, (date.today() - seen).days)
 
 
 def parse_reg(r) -> dict:
@@ -196,6 +204,25 @@ def parse_reg(r) -> dict:
         return json.loads(r["company_reg_json"] or "{}")
     except Exception:
         return {}
+
+
+def raw_of(r) -> dict:
+    """列表接口原始响应。解析失败返回空字典，让调用方回退到字段兜底判断。"""
+    try:
+        return json.loads(r["raw_json"] or "{}")
+    except Exception:
+        return {}
+
+
+def last_verified(r) -> str:
+    """最后一次核实这条数据的日期（YYYY-MM-DD），取采集与详情刷新的较新者。
+
+    不能只看 last_seen_at：存量数据里有 144 行因旧版 upsert 把 collected_at
+    往回写，使 last_seen 早于 detail_fetched（storage.py 已修，历史数据仍错）。
+    """
+    stamps = [s for s in ((r["last_seen_at"] or ""), (r["detail_fetched_at"] or ""))
+              if s]
+    return max(stamps)[:10] if stamps else ""
 
 
 def status_color(status: str) -> str:
@@ -280,20 +307,21 @@ def salary_mid(r):
 
 
 def job_score(r) -> float:
-    """综合评分。权重见 profile.py。
+    """综合评分。所有权重取自 profile.py。
 
-    与原版的差异：
-    1. tech_match 从「集合精确交集」改「子串计数分级」——阶跃返回的 tech_req 是整句
-       （如「熟悉python、java、go等至少一种后端语言」），精确交集只命中 126/537，
-       子串命中 424/537，原先 77% 的岗位白丢 2 分，排序被活跃度和规模主导。
-    2. 活跃度权重从 3.0 降到 1.0——它已经用于 P0/P1/P2 分页，页内所有岗位活跃度
-       同质，再给最大权重等于在无区分度的维度上放最大砝码。
-    3. 新增：BOSS 结构化 skills_json 交集、薪资项、应届友好度、销售/未认证负分。
+    构成：技术栈匹配（最高权重，唯一反映对不对口）+ BOSS 结构化技能交集
+    + 活跃度微调 + 公司规模/融资阶段 + 薪资档内位置 + 应届友好 + 城市偏好
+    - 销售性质 - 招聘者未认证 - 数据陈旧。
+
+    技术栈用**子串**匹配而非集合交集：LLM 抽的 tech_req 是整句
+    （「熟悉python、java、go等至少一种后端语言」），精确交集只命中 126/537，
+    子串命中 424/537。标签缺失时回退 JD 正文，否则每轮新采的岗位
+    （有 JD 无标签）会系统性拿 0 分排到最后。
     """
     g = json.loads(r["glm_tags_json"] or "{}")
 
-    # 技术栈：阶跃抽的 tech_req（长句，子串匹配）。
-    # ⚠️ 标签未提取时**回退到 JD 正文**，不能静默给 0 分：阶跃提取滞后于采集，
+    # 技术栈：LLM 抽的 tech_req（长句，子串匹配）。
+    # ⚠️ 标签未提取时**回退到 JD 正文**，不能静默给 0 分：标签提取滞后于采集，
     # 每轮新岗位都是「有 JD 但无标签」状态（2026-08-11 实测 133 条），
     # 静默给 0 会让最新鲜的岗位系统性排在最后——既进不了风险页也上不了榜首。
     tech_blob = " ".join(str(t) for t in _as_list(g.get("tech_req"))).lower()
@@ -308,7 +336,10 @@ def job_score(r) -> float:
         skills = set()
     skill_hit = min(len(skills & set(P.AI_TECH)) * 0.5, P.W_SKILLS_MAX)
 
-    act = P.ACT_SCORE.get(r["recruiter_active_status"], 0.0)
+    # 活跃度按快照年龄衰减：19 天前的「在线」不能证明现在在线，也不能证明
+    # 不在线 —— 它是无信息（×0），不该按满分参与排序。
+    act = (P.ACT_SCORE.get(r["recruiter_active_status"], 0.0)
+           * P.freshness(observed_days_ago(r)))
     size = P.SIZE_SCORE.get(r["company_size"], P.SIZE_DEFAULT)
     stage = P.STAGE_SCORE.get(r["financing_stage"], P.STAGE_DEFAULT)
 
@@ -322,17 +353,24 @@ def job_score(r) -> float:
     # 应届友好：要求「1-3年」的岗位对应届生成功率低于「经验不限/在校应届」
     exp_ok = P.W_EXP_FRIENDLY if (r["experience"] or "") in ("经验不限", "在校/应届") else 0.0
 
+    # 城市偏好：白名单决定能否进池，这里决定池内排序（杭州 > 上海 > 深圳）
+    city = P.city_score(r["city"] or "") * P.W_CITY_MAX
+
     penalty = 0.0
     if any(m in (r["welfare_json"] or "") for m in P.SALES_WELFARE_MARKS):
         penalty += P.W_SALES_PENALTY
     if not r["recruiter_certificated"]:
         penalty += P.W_UNCERT_PENALTY
+    # 下架风险扣分。与上面 act 的衰减是两件事：那里让过期活跃度退化成无信息，
+    # 这里扣的是「久未核实、可能已经招满」的风险。
+    penalty += P.stale_penalty(observed_days_ago(r))
 
-    return round(tech + skill_hit + act + size + stage + sal + exp_ok + penalty, 1)
+    return round(tech + skill_hit + act + size + stage + sal + exp_ok
+                 + city + penalty, 1)
 
 
 def is_cv_job(r) -> bool:
-    """要求 CV/图像算法技能的岗位剔除（标题直给 或 阶跃 tech_req 明确要求）。
+    """要求 CV/图像算法技能的岗位剔除（标题直给 或 LLM tech_req 明确要求）。
     裸「cv」只精确匹配独立技能项（如 tech_req=['CV']），不匹配「NLP/CV」这类备选列表；
     图像生成(AIGC)不算图像算法，不在此列。"""
     if P.match_keyword(r["title"] or "", P.CV_TITLE_KW):
@@ -367,7 +405,7 @@ def hard_drop(r) -> str:
         return "已关闭"
     if not P.city_allowed(r["city"] or ""):
         return f"非目标城市[{r['city']}]"
-    if P.ANON_MARK in (r["company_name"] or ""):
+    if P.is_anonymous(raw_of(r), r["company_name"] or ""):
         return "匿名公司"
     if P.match_keyword(r["recruiter_title"] or "", P.EXCLUDE_RECRUITER_TITLE):
         return "猎头发布"
@@ -445,6 +483,9 @@ def build_page(title: str, subtitle: str, rows) -> str:
             "actAge": act_age,
             "seen": r["seen_count"] or 0,
             "firstSeen": (r["first_seen_at"] or "")[:10],
+            # 最后一次真正核实这条数据的时刻（采集或刷新，取较新者）。
+            # 这是判断「岗位是否还在挂着」的唯一依据，必须上页面并可排序。
+            "lastSeen": last_verified(r),
             "appliedAt": (r["applied_at"] or "")[:10],
             "note": esc(r["note"] or ""),
         })
@@ -459,7 +500,7 @@ def build_page(title: str, subtitle: str, rows) -> str:
 <div class="stats" id="stats"></div></header>
 <table><thead><tr>
 <th>#</th><th onclick="sortBy('score')">分</th><th>岗位</th><th onclick="sortBy('company')">公司</th>
-<th onclick="sortBy('salary_mid')">薪资</th><th onclick="sortBy('actDays')">活跃度</th><th>区域</th><th>类型</th><th>技术/经验</th><th>岗位详情</th><th>操作</th>
+<th onclick="sortBy('salary_mid')">薪资</th><th onclick="sortBy('actDays')">活跃度</th><th>区域</th><th>类型</th><th>技术/经验</th><th>岗位详情</th><th onclick="sortBy('actAge')">最后核实</th><th>操作</th>
 </tr></thead><tbody id="tbody"></tbody></table>
 <script>const ALL={json.dumps(data, ensure_ascii=False)};{JS}render();</script>
 <p class="muted" style="padding:12px">{esc(subtitle)}</p>
@@ -486,10 +527,10 @@ def dedupe(rows: list) -> tuple[list, int]:
 def salary_bucket(r) -> str:
     """薪资四桶，互斥且穷尽。
 
-    原先 p0_high 在「起薪>20K 剔除」之前算出，导致 28 条起薪>20K 的岗位
-    （蚂蚁/小红书 40-65K 等）出现在高薪页，与页面副标题「起薪>20K 已去除」矛盾。
+    「超纲」必须先判：否则高于上限的岗位会先被归进高薪页，
+    与页面副标题声明的口径自相矛盾。
     """
-    if (r["salary_min_k"] or 0) > P.SALARY_DROP_MIN_ABOVE:
+    if P.salary_out_of_range(r["salary_min_k"], r["salary_max_k"], r["salary_months"]):
         return "over"
     mid = salary_mid(r)
     if (mid or 99) <= P.SALARY_LOW_MID_MAX:
@@ -544,9 +585,12 @@ def main() -> None:
     over_rows = con.execute(
         f"SELECT j.*, a.applied_at, a.note FROM jobs j {JOIN_ACTIONS}"
         "WHERE j.retention_status='sample' AND j.bookmarked=0 "
-        "AND j.job_description != '' AND j.salary_min_k > ? "
-        "AND j.job_invalid = 0",
-        (P.SALARY_DROP_MIN_ABOVE,),
+        "AND j.job_description != '' AND j.job_invalid = 0 "
+        # 与 P.salary_out_of_range 同口径：按区间均值折算 12 薪，不按起薪
+        "AND j.salary_min_k IS NOT NULL AND j.salary_max_k IS NOT NULL "
+        "AND (j.salary_min_k + j.salary_max_k) / 2.0 "
+        "    * COALESCE(j.salary_months, 12) / 12 > ?",
+        (P.SALARY_DROP_MID_ABOVE,),
     ).fetchall()
 
     # 1) 硬过滤
@@ -587,7 +631,10 @@ def main() -> None:
 
     out = Path("output")
     out.mkdir(exist_ok=True)
-    today = "2026-08-10"
+    # 导出日期取当天。原先写死 "2026-08-10"，于是之后每次重导出，页面副标题
+    # 都仍声称数据是 08-10 的——而活跃度是抓详情那刻的快照，页面上这个日期
+    # 正是读者判断「这个活跃度还新鲜吗」的唯一依据，写死等于持续误导。
+    today = date.today().isoformat()
     pages = [
         ("投递池_P0优先.html", "杭州 AI/Agent 投递池 · P0 优先投递",
          f"核心薪资档(7-15K) 且 3日内活跃；按综合分排序。硬过滤 {sum(drops.values())} 条、"
@@ -597,12 +644,15 @@ def main() -> None:
         ("投递池_P2冷池.html", "杭州 AI/Agent 投递池 · P2 冷池（活跃度较低）",
          f"核心薪资档，招聘者最后活跃超过 {P.ACTIVE_P0_MAX_DAYS} 天，按活跃天数升序。"
          f"原先这批在任何页面都不出现；数据 {today}", tiers["p2"]),
-        ("投递池_高薪.html", "投递池 · 高薪岗位（中点>15K，12薪折算）",
-         f"起薪未超 {P.SALARY_DROP_MIN_ABOVE:.0f}K，含 ·13薪+ 折算；数据 {today}", buckets["high"]),
+        ("投递池_高薪.html",
+         f"投递池 · 高薪岗位（中点>{P.SALARY_HIGH_MID_MIN:.0f}K，12薪折算）",
+         f"均值未超 {P.SALARY_DROP_MID_ABOVE:.0f}K，含 ·13薪+ 折算；数据 {today}",
+         buckets["high"]),
         ("投递池_低薪.html", f"投递池 · 低薪岗位（中点≤{P.SALARY_LOW_MID_MAX:.0f}K）",
          f"薪资中点偏低，已从核心池移出；数据 {today}", buckets["low"]),
-        ("投递池_超纲.html", f"投递池 · 起薪>{P.SALARY_DROP_MIN_ABOVE:.0f}K（自评实力不足）",
-         f"起薪门槛过高，仅留档参考；数据 {today}", buckets["over"]),
+        ("投递池_超纲.html",
+         f"投递池 · 薪资均值>{P.SALARY_DROP_MID_ABOVE:.0f}K（超出可达范围）",
+         f"按区间均值折算 12 薪判定，仅留档参考；数据 {today}", buckets["over"]),
         ("投递池_风险公司.html", "投递池 · 风险公司岗位（互斥）",
          f"低资本<{P.RISK_MIN_CAPITAL_WAN:.0f}万 / 成立<{P.RISK_MIN_AGE_MONTHS}月 / "
          f"非公司主体 / 工商未知；多重风险置顶；数据 {today}", risk_jobs),
