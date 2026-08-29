@@ -350,12 +350,49 @@ def test_missing_financing_stage_is_not_worst_score():
     assert P.STAGE_SCORE.get("", P.STAGE_DEFAULT) > P.STAGE_SCORE["未融资"]
 
 
-def test_sales_welfare_is_penalty_not_hard_filter():
-    """「底薪加提成」多为公司统一勾选的福利模板（实测 67 条含浙大/大厂，
-    JD 无销售内容者居多），所以只降分、不剔除。"""
+def test_sales_welfare_never_hard_filters():
+    """「底薪加提成」是公司统一勾选的福利模板，绝不能硬过滤。
+
+    2026-08-29 起它连**弱负分**也取消了（`W_SALES_PENALTY=0`）：
+    388 条带标记的岗位 demote 率 63.1% vs 基线 53.4%，偏差 +9.8pt，
+    按本项目的判据（不足 16pt 视为无区分度）够不上权重；
+    而实测代价是让 193 条平均下沉 82 个排名位，受害者包括
+    `大模型算法工程师`（纯算法岗）、`AI Agent 算法工程师（应届毕业生）`。
+    真正相关的是"福利勾得多"（吃罚的平均勾 11.7 项 vs 干净的 6.0 项），
+    不是"岗位是销售岗"。
+
+    这条测试守的是**不硬过滤**这条底线 —— 那部分永远成立。
+    权重取值由 test_retired_weights_stay_at_zero 单独守。
+    """
     r = row(welfare_json='["五险一金", "底薪加提成"]')
     assert E.hard_drop(r) == ""
-    assert E.job_score(r) < E.job_score(row())
+    assert E.job_score(r) == E.job_score(row()), "已取消权重，不该再影响分数"
+
+
+def test_retired_weights_stay_at_zero():
+    """两个被否决的权重要留在 0，别被"看着像漏填"而重新填上。
+
+    保留常量而非删除，是为了让"评估过并否决"留在代码里；
+    但那也意味着下一个人可能以为是漏填。用测试固定住这个决定。
+    """
+    assert P.W_SALES_PENALTY == 0.0, "见 SALES_WELFARE_MARKS 注释：偏差仅 +9.8pt"
+    assert P.W_UNCERT_PENALTY == 0.0, "827 条 active+有JD 里只有 6 条未认证"
+
+
+def test_act_score_covers_every_status_phrase():
+    """活跃度文案必须全覆盖，缺档一律得 0 分 = 让「本周活跃」等于「半年前活跃」。
+
+    实测（2026-08-29）库里 active+有 JD 的 14 种文案，原表只有 4 种，
+    263 条（31.8%）落进裂缝。这是 export_pool_html 记过的「中间档落进裂缝」
+    那个 bug 的打分侧残留 —— 分页早已按天数判，打分还在按文案查表。
+    """
+    for phrase in ("在线", "刚刚活跃", "今日活跃", "3日内活跃", "本周活跃",
+                   "2周内活跃", "本月活跃", "2月内活跃", "3月内活跃",
+                   "4月内活跃", "5月内活跃", "近半年活跃", "半年前活跃"):
+        assert phrase in P.ACT_SCORE, f"活跃度文案 {phrase!r} 未覆盖，会被判 0 分"
+    # 必须单调不增：越久越低，且中间档要严格高于一个月以上
+    assert P.ACT_SCORE["本周活跃"] > P.ACT_SCORE["半年前活跃"]
+    assert P.ACT_SCORE["3日内活跃"] > P.ACT_SCORE["本周活跃"]
 
 
 # ---------- 硬过滤 ----------

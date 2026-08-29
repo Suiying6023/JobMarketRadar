@@ -278,6 +278,37 @@ def test_jd_peek_skips_boilerplate_headers():
     assert "body.length?body:lines" in body, "全是标题行时要退回原文，别返回空白"
 
 
+def test_ties_are_broken_deterministically_not_by_sql_order():
+    """同分必须有确定次序，否则榜首是谁取决于 SQL 返回顺序。
+
+    实测：综合分只有约 76 个可达值（各维度都走 0.5 步长）而池子近 800 条，
+    **99.2% 的岗位与他人同分，最大同分组 22 条**。JS 的 Array.sort 是稳定排序，
+    所以同分组内的相对顺序就是数据数组的顺序 —— 与岗位质量完全无关。
+    """
+    js = T.JS
+    body = js.split("rows.sort(")[1].split("return rows")[0]
+    assert "techN" in body, "缺技术栈命中数作为二级键"
+    assert "actDays" in body, "缺活跃天数作为三级键"
+    assert "verified" in body, "缺最后核实日期作为四级键"
+
+
+def test_record_carries_the_untruncated_tech_hit_count():
+    """`techN` 必须是**未截断**的命中数，否则区分不了撞上限的那批。
+
+    `job_score` 里技术栈 ×0.5 后撞 `W_TECH_MAX`，实测 17.3% 顶在上限上，
+    命中 6 个词和 12 个词总分相同 —— 二级键取截断后的值就等于没有二级键。
+    """
+    recs, _ = E.collect()
+    assert recs, "投递池为空，无法验证"
+    assert all(isinstance(r["techN"], int) for r in recs[:50])
+    # 必须有超过上限对应命中数（W_TECH_MAX/0.5）的记录，否则证明不了它未截断
+    cap_hits = int(L.P.W_TECH_MAX / 0.5)
+    assert any(r["techN"] > cap_hits for r in recs), \
+        f"没有 techN > {cap_hits} 的记录，无法确认它未被截断"
+    # 与 job_score 同源：不能在两处各写一套匹配逻辑
+    assert hasattr(L, "tech_hits")
+
+
 def test_tab_counts_use_per_view_exclusions():
     """标签计数必须按各自视图的排除规则算。
 

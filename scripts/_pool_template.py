@@ -306,7 +306,16 @@ function current(){
       return String(x||'').localeCompare(String(y||''),'zh')*dir;
     // null 一律排最后，不参与大小比较（否则"未核实"会冒到顶部）
     if(x==null) return 1; if(y==null) return -1;
-    return (x-y)*dir;
+    if(x!==y) return (x-y)*dir;
+    // 同分必须有确定的次序。实测综合分只有约 76 个可达值（各维度都走 0.5 步长）
+    // 而池子近 800 条 —— **99.2% 的岗位与他人同分，最大同分组 22 条**。
+    // 稳定排序会让这些的相对顺序等于 SQL 返回顺序，与岗位质量无关：
+    // 榜首是谁纯属运气。二级键按信息量递减：
+    //   技术栈原始命中数（未截断，能区分撞 3.0 上限的那 17%）
+    //   → 活跃天数升序（越新越前）→ 最后核实日期降序（快照越新越可信）
+    return (b.techN||0)-(a.techN||0)
+        || (a.actDays==null?1e9:a.actDays)-(b.actDays==null?1e9:b.actDays)
+        || String(b.verified||'').localeCompare(String(a.verified||''));
   });
   return rows;
 }

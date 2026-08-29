@@ -235,6 +235,9 @@ def row_to_record(r, bucket: str, tier: str, risky: bool) -> dict:
         "sal": r["salary_text"] or "",
         "mid": round(L.salary_mid(r) or 0, 1),
         "score": L.job_score(r),
+        # 技术栈原始命中数：同分排序的二级键。总分只有约 76 个可达值而池子近 800 条，
+        # 99% 的岗位与他人同分 —— 没有二级键的话同分组内顺序等于 SQL 返回顺序。
+        "techN": L.tech_hits(r),
         "jt": g.get("job_type") or "?",
         "size": r["company_size"] or "",
         "stage": r["financing_stage"] or "",

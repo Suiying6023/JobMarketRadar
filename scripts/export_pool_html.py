@@ -306,6 +306,24 @@ def salary_mid(r):
     return (a + b) / 2 * months / 12
 
 
+def tech_hits(r) -> int:
+    """技术栈命中的**原始个数**（不截断、不乘权重）。
+
+    存在的理由是同分排序：`job_score` 里技术栈项 `×0.5` 后撞 `W_TECH_MAX` 上限，
+    实测 17.3% 的岗位顶在上限上（top50 里 40 条），命中 6 个词和命中 12 个词
+    在总分上不可区分。把原始个数作为二级排序键，能在不改总分口径的前提下
+    把同分组内的顺序从"SQL 返回顺序"换成"对口程度"。
+
+    与 `job_score` 共用同一份匹配逻辑（含 tech_req 为空时回退 JD 正文），
+    **不要在别处重写** —— 两份会各自漂移。
+    """
+    g = json.loads(r["glm_tags_json"] or "{}")
+    blob = " ".join(str(t) for t in _as_list(g.get("tech_req"))).lower()
+    if not blob.strip():
+        blob = (r["job_description"] or "").lower()
+    return sum(1 for k in P.AI_TECH if k in blob)
+
+
 def job_score(r) -> float:
     """综合评分。所有权重取自 profile.py。
 
@@ -324,10 +342,7 @@ def job_score(r) -> float:
     # ⚠️ 标签未提取时**回退到 JD 正文**，不能静默给 0 分：标签提取滞后于采集，
     # 每轮新岗位都是「有 JD 但无标签」状态（2026-08-11 实测 133 条），
     # 静默给 0 会让最新鲜的岗位系统性排在最后——既进不了风险页也上不了榜首。
-    tech_blob = " ".join(str(t) for t in _as_list(g.get("tech_req"))).lower()
-    if not tech_blob.strip():
-        tech_blob = (r["job_description"] or "").lower()
-    tech = min(sum(1 for k in P.AI_TECH if k in tech_blob) * 0.5, P.W_TECH_MAX)
+    tech = min(tech_hits(r) * 0.5, P.W_TECH_MAX)
 
     # BOSS 结构化技能词（短词，精确交集——比 LLM 抽的更干净）
     try:
