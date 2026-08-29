@@ -63,6 +63,33 @@ RISK_DUMP_DIR = Path("data/risk_dumps")
 class RiskControlStop(RuntimeError):
     """命中平台风控。必须立刻停止整轮采集，不重试。"""
 
+
+# 浏览器对 DNS / 连接 / TLS 失败的统一报法。**与账号状态无关**，重试即可自愈。
+# 风控走的是另一条路（HTTP 200 + 验证页正文 → _dump_risk_body → RiskControlStop），
+# 永远不会命中这里，所以在这里重试不会掩盖风控信号。
+_TRANSIENT_FETCH_ERRORS = (
+    "Failed to fetch",        # Chromium：连接失败的通用报法
+    "NetworkError",           # 部分场景下的等价报法
+    "Load failed",            # WebKit 同义
+    "ERR_NETWORK_CHANGED",    # 切网/IP 变化
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_NAME_NOT_RESOLVED",  # DNS 抖动（TUN 环境下常见）
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_TIMED_OUT",
+)
+
+
+def _is_transient_fetch_error(result: dict) -> bool:
+    """页面内 fetch 是否因**瞬时网络问题**失败（可重试），而非风控或业务错误。
+
+    判据只看 `error` 字段：有 error 说明 fetch 抛了异常、连响应都没拿到。
+    风控与业务错误都是正常响应（有 status 和 text），不会走到这里。
+    """
+    err = str(result.get("error") or "")
+    return bool(err) and any(sig in err for sig in _TRANSIENT_FETCH_ERRORS)
+
+
 FILTER_CODES = {
     "salary": {
         "3K以下": "402", "3-5K": "403", "5-10K": "404", "10-20K": "405",
@@ -289,12 +316,22 @@ class BossCollector(Collector):
             self.request_count += 1
             self._count_request(url)
             try:
-                return await self.page.evaluate(script, {"url": url})
+                result = await self.page.evaluate(script, {"url": url})
             except PlaywrightError as exc:
                 if "Execution context was destroyed" not in str(exc) or attempt == attempts:
                     raise
                 await self._settle_on_origin()
                 await asyncio.sleep(random.uniform(1.5, 3.0))
+                continue
+            # 页面内 fetch 抛异常时 evaluate 本身是**成功**的（回一个带 error 的对象），
+            # 所以这类失败不会走上面的 except —— 必须在这里单独判，否则网络抖一下
+            # 就永久放弃这条岗位。2026-08-29 实测：一次波动连废 12 条，
+            # 每条都已记账、JD 没拿到、还留在待补队列里等下一轮再花一次配额。
+            if _is_transient_fetch_error(result) and attempt < attempts:
+                await self._settle_on_origin()
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+                continue
+            return result
         raise RuntimeError("同源请求重试耗尽")  # pragma: no cover
 
     @staticmethod
