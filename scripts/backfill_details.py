@@ -152,6 +152,9 @@ async def main() -> None:
         print(f"已导航到搜索页: {collector.page.url[:80]}")
         done = 0
         failed = 0
+        # 抓之前重判时跳掉的（与选行阶段的 skipped 分开记：这些是跑的过程中
+        # 状态发生变化的，量大说明库在被并发改动，值得知道）
+        stale_skipped: dict[str, int] = {}
         # 拟人化速率方案（2026-08-03）：
         # - 条内延迟高斯（boss.py），批次大小随机 4-6（打破固定模式）
         # - 批间大多短休 8-15s，每 2-4 批插入一次长停顿 25-50s + 拟人心跳（滚动页面保鲜）
@@ -191,6 +194,29 @@ async def main() -> None:
                     print(f"\n[批次] 下批 {batch_size} 条（{idx}/{len(rows)}）", flush=True)
                 within += 1
 
+                # ⚠️ 花请求之前**重新核对一次**。候选列表是启动时一次性取完的，
+                # 而 1000 条要跑 3.5 小时——这期间库里的状态完全可能已经变：
+                # 另一个进程跑了 clean_local_db、或列表轮次更新了薪资/城市。
+                # 实测 2026-08-29 本轮 273 条里 45 条注定被降级（其中 27 条的
+                # 薪资/城市在列表阶段就已知），而选行那一刻它们还是 active。
+                # 重读一行的开销是微秒级，一次详情请求是 3-5 秒且不可退——
+                # 这个比价决定了该在每条前面重判，而不是只在选行时判一次。
+                fresh = store.conn.execute(
+                    "SELECT * FROM jobs WHERE canonical_id = ?",
+                    (row["canonical_id"],),
+                ).fetchone()
+                if fresh is not None:
+                    if fresh["job_description"]:
+                        # 已被别的进程补过，别重复花配额
+                        stale_skipped["已有JD"] = stale_skipped.get("已有JD", 0) + 1
+                        continue
+                    demote, why = should_demote(fresh)
+                    if demote:
+                        key = why.split("(")[0].split("[")[0]
+                        stale_skipped[key] = stale_skipped.get(key, 0) + 1
+                        continue
+                    row = fresh
+
                 job = _row_to_job(row)
                 try:
                     job = await collector._collect_detail(job)
@@ -214,6 +240,9 @@ async def main() -> None:
             print(f"命中风控，停止：{exc}")
         finally:
             print(f"完成 {done} 条，失败 {failed} 条，共发起请求 {collector.request_count} 次，code=37 重算 {collector.code37_count} 次")
+            if stale_skipped:
+                print(f"抓前重判跳过 {sum(stale_skipped.values())} 条"
+                      f"（选行后状态变了，省下同样次数的请求）：{stale_skipped}")
             await collector.close()
 
 

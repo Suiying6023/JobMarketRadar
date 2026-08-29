@@ -75,3 +75,33 @@ def test_off_whitelist_city_row_is_skipped_before_spending_quota():
     """非目标城市（实测 129 条）同样注定降级。"""
     demote, why = should_demote(row(city="北京"))
     assert demote and "非目标城市" in why
+
+
+def test_rechecks_each_row_immediately_before_spending_the_request():
+    """每条抓取前必须重读该行再判一次，且重判要在发请求**之前**。
+
+    候选列表是启动时一次性取完的，而 1000 条要跑 3.5 小时 —— 这期间库里的
+    状态完全可能已经变（另一进程跑了 clean_local_db、列表轮次更新了薪资/城市）。
+    实测 2026-08-29 本轮 273 条里 45 条注定被降级，其中 27 条的薪资和城市
+    在列表阶段就已知，而选行那一刻它们还是 active。
+
+    顺序错了不会报错，只是保护静默失效 —— 所以这里按源码位置钉死。
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "scripts" / "backfill_details.py").read_text(encoding="utf-8")
+    recheck = src.index("should_demote(fresh)")
+    request = src.index("await collector._collect_detail(job)")
+    assert recheck < request, "重判必须在发详情请求之前，否则配额已经花掉了"
+    # 重读的必须是当前那一行，不能沿用启动时的快照
+    assert "WHERE canonical_id = ?" in src
+
+
+def test_skips_rows_another_process_already_filled():
+    """别的进程已补上 JD 的行要跳过，不重复花配额。
+
+    两个补详情进程会串行（Chrome SingletonLock），但 sustained_run 的交替模式
+    和手工重跑都可能让同一行被排进两轮的候选里。
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "scripts" / "backfill_details.py").read_text(encoding="utf-8")
+    assert 'fresh["job_description"]' in src
