@@ -113,9 +113,12 @@ def test_tech_tags_are_extracted_words_not_truncated_sentences():
         "理解大模型应用的基本原理，了解 Prompt、RAG、Function Calling",
         "LangChain、LangGraph等主流Agent开发框架",
     ])
-    assert "Python" in out and "Java" in out
-    assert "RAG" in out and "LangChain" in out
-    # 每个标签都必须短到能一眼读完，且不含句读
+    # 只断言"提取出了词"，不指定是哪几个 —— 上限只有 _MAX_TECH 个位置，
+    # 断言某个特定词必须入选会和上限调整互相打架（实测踩到：上限从 6 降到 5
+    # 后 LangChain 被挤掉，那是刻意取舍，不是缺陷）。
+    assert len(out) == E._MAX_TECH
+    assert "Python" in out and "Java" in out       # 第一句就出现，必然入选
+    # 每个标签都必须短到能一眼读完，且不含句读 —— 这才是这个测试真正要守的
     for t in out:
         assert len(t) <= 18, f"{t!r} 太长，说明是句子不是词"
         assert not any(c in t for c in "，。、（）"), f"{t!r} 含句读，是截断的句子"
@@ -178,17 +181,17 @@ def test_tech_tag_count_fits_one_line():
     assert len(E.dedupe_tech(many)) <= 5
 
 
-def test_three_column_layout_with_ops_column():
-    """三列：岗位信息 | LLM 标签 | 操作。
+def test_four_column_layout_absorbs_spare_width_with_jd_peek():
+    """四列：岗位信息 | LLM 标签 | JD 摘要 | 操作。
 
     左列必须有**宽度上限**，不能用 1fr 独占剩余空间：实测 1fr 下左列分到
     1014px，而真实内容最宽只有 481px、中位 302px —— 在岗位列和标签列之间
     留出 533px 空白，眼睛要横跨半个屏幕才能把一条岗位和它的标签对上。
-    富余宽度要由**最后一列**吸收，空白留在最右边的页边距里。
+    富余宽度由 JD 摘要列吸收（1fr），那比空着有用。
     """
     css = T.CSS
-    assert "grid-template-columns:minmax(0,560px) 340px minmax(122px,1fr)" in css, \
-        "左列要设上限、末列吸收富余；标签列固定宽否则长标签会把它撑变形"
+    cols = "grid-template-columns:minmax(0,520px) 340px minmax(0,1fr) 118px"
+    assert cols in css, "左列要设上限、JD 摘要列吸收富余、标签与操作列定宽"
     assert ".ops{display:flex;gap:4px" in css, "操作按钮横排（竖排会把卡撑高一倍）"
     # 容器不设 max-width：那会让卡片居中留白而顶栏全宽，两者对不齐
     assert "main{padding:10px 16px 64px}" in css
@@ -197,16 +200,55 @@ def test_three_column_layout_with_ops_column():
         assert f'data-act="{act}"' in js, f"缺少操作按钮 {act}"
 
 
-def test_demote_redraws_the_undo_entry():
-    """降级后必须重绘 chips —— 撤回入口是按 HIDDEN.size 生成的。
+def test_demote_has_no_confirm_dialog_but_stays_undoable():
+    """降级不弹确认框，改用事后可撤。
 
-    实测过的 bug：只 render() 不 drawChips()，误点降级后没有任何撤回入口，
-    而降级已经写进数据库了。
+    降级是高频动作（筛池子时一路往下刷），每次确认会让人养成盲点「确定」的
+    习惯 —— 那时确认框只剩摩擦、不剩保护。安全网换成两处撤回入口：
+    toast 上的按钮 + 顶栏常驻「恢复本页隐藏的 N 条」。
     """
     js = T.JS
-    demote_body = js.split("async function demote(r){")[1].split("\n}")[0]
-    assert "drawChips()" in demote_body, "降级后没重绘撤回入口"
-    assert "confirm(" in demote_body, "降级是写库操作，要先确认"
+    body = js.split("async function demote(r){")[1].split("\n}\n")[0]
+    assert "confirm(" not in body, "降级不该弹确认框"
+    # 撤回必须同时还原视图和数据库
+    assert "'/restore'" in body or '"/restore"' in body, "撤回要让服务把它撤回 active"
+    assert "HIDDEN.delete" in body, "撤回要恢复本页显示"
+    # 实测过的 bug：只 render() 不 drawChips()，顶栏撤回入口不出现
+    assert "drawChips()" in body, "降级后没重绘顶栏撤回入口"
+    assert "undo" in body, "toast 要带撤回动作"
+
+
+def test_toast_can_carry_an_action():
+    """toast 要能承载撤回按钮 —— 它替代了确认框做安全网，不能只是一条消息。"""
+    js = T.JS
+    body = js.split("function toast(msg,bad,undo){")[1].split("\n}\n")[0]
+    assert "tundo" in body and "onclick" in body
+    # 带动作的 toast 要停留更久，否则来不及点
+    assert "undo?6000:3200" in body
+
+
+def test_jd_peek_fills_the_spare_width_without_growing_the_card():
+    """JD 摘要占用富余宽度，但**不能**撑高卡片。
+
+    实测 1366-1920px 下第三列富余 265-819px，与其空着不如放 JD 开头 ——
+    那是判断"这岗位到底做什么"最快的信息源，而标签只给技术栈和门槛。
+    关键是单行滚动而非换行：卡片高度实测仍是 58px。
+    """
+    css = T.CSS
+    assert "white-space:nowrap" in css.split(".peek{")[1].split("}")[0], \
+        "JD 摘要必须单行，换行会把卡片撑高、抵消密度收益"
+    assert "overflow-x:auto" in css.split(".peek{")[1].split("}")[0], "要能横向滚动继续读"
+    # 窄屏优先牺牲它：它是"顺便看到"的信息，标签和操作是必需的
+    assert ".peek{display:none}" in css
+
+
+def test_jd_peek_skips_boilerplate_headers():
+    """JD 开头常是「岗位职责：」这类小标题，直接截会得到一屏标题没有内容。"""
+    js = T.JS
+    assert "_HDR" in js and "岗位职责" in js
+    body = js.split("function peek(jd){")[1].split("\n}")[0]
+    assert "filter" in body, "要过滤掉纯标题行"
+    assert "body.length?body:lines" in body, "全是标题行时要退回原文，别返回空白"
 
 
 def test_tab_counts_use_per_view_exclusions():

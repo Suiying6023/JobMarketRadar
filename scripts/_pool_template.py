@@ -68,12 +68,14 @@ main{padding:10px 16px 64px}
    （分到 1014px 而真实内容最宽只有 481px、中位仅 302px），在岗位列和标签列
    之间留出 533px 空白，眼睛要横跨半个屏幕才能把一条岗位和它的标签对上。
    上限 560 = 实测最宽内容 481 + 余量；minmax 让窄屏时还能压缩。
-   最后一列用 1fr 吸收富余宽度 —— 空白留在最右边（那里是页边距，
-   不影响阅读），而不是塞在两列之间。 */
+   第四列（JD 摘要）用 1fr 吸收富余宽度：实测 1366-1920px 下富余 265-819px，
+   与其空着不如放 JD 开头 —— 那是判断"这岗位到底做什么"最快的信息源。
+   ⚠️ 它必须单行不换行（见 .peek），否则会把卡片撑高、抵消掉密度收益。 */
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
   padding:6px 11px;margin-bottom:4px;transition:.12s;
-  display:grid;grid-template-columns:minmax(0,560px) 340px minmax(122px,1fr);
-  gap:16px;align-items:center}
+  display:grid;
+  grid-template-columns:minmax(0,520px) 340px minmax(0,1fr) 118px;
+  gap:14px;align-items:center}
 .card:hover{border-color:#3b4252}
 .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
 .card.done{opacity:.4}
@@ -108,17 +110,31 @@ main{padding:10px 16px 64px}
 .age.w{color:var(--warn)} .age.b{color:var(--bad)}
 .stale{text-decoration:line-through;opacity:.55}    /* 过期的活跃度 */
 
-/* ---- 右列：操作。**横排**——竖排会把每张卡撑到 76px 高，一屏只剩 8 条，
-   而卡片内容本身只有两行。按钮左对齐（不用 flex-end）：这一列会吸收富余宽度，
-   右对齐会让按钮随窗口宽度漂移，位置就不固定了，也就没法盲点。 ---- */
-.ops{display:flex;gap:4px;align-items:flex-start;justify-content:flex-start}
+/* ---- 第三列：JD 摘要（滑动窗口）----
+   原先这块宽度是空的。放 JD 开头能直接回答"这岗位到底做什么"，
+   而标签只给技术栈和门槛，答不了这个。
+   `white-space:nowrap` + `overflow-x:auto` 是关键：单行滚动而非换行，
+   卡片高度完全不受它影响（实测仍是 58px）。鼠标横向滚可以往后读，
+   要读全文点 JD 按钮展开。 */
+.peek{min-width:0;color:var(--dim2);font-size:11.5px;line-height:1.5;
+  white-space:nowrap;overflow-x:auto;overflow-y:hidden;
+  scrollbar-width:none;-ms-overflow-style:none;
+  mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);
+  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent)}
+.peek::-webkit-scrollbar{height:0}
+.card:hover .peek{color:var(--dim)}
+
+/* ---- 末列：操作。**横排**——竖排会把每张卡撑到 76px 高，一屏只剩 8 条，
+   而卡片内容本身只有两行。 ---- */
+.ops{display:flex;gap:4px;align-items:flex-start;justify-content:flex-end}
 .ops .btn{padding:2px 7px;font-size:11px}
 .btn.on{color:var(--ok);border-color:#1e4032;background:#0d2019}
 .btn.warn:hover{color:var(--bad);border-color:#4a2626;background:#2a1414}
 /* 窄屏时左列改成可压缩（minmax），否则 560px 定宽会溢出横向滚动 */
-@media(max-width:1100px){
-  main{max-width:none}
-  .card{grid-template-columns:minmax(0,1fr) 300px 118px;gap:12px}
+/* 窄屏优先牺牲 JD 摘要：它是"顺便看到"的信息，而标签和操作是必需的。 */
+@media(max-width:1400px){
+  .card{grid-template-columns:minmax(0,1fr) 320px 118px;gap:12px}
+  .peek{display:none}
   .tag{max-width:130px}
 }
 @media(max-width:860px){
@@ -208,14 +224,34 @@ async function markApplied(r,on){
     if(!j.ok) toast('写库失败: '+(j.err||'未知'),true);
   }catch(e){ toast('写库失败（服务未运行？）本次仅存本地',true); }
 }
-function toast(msg,bad){
+// `undo` 传入时 toast 带一个撤回按钮。降级去掉了确认框，撤回入口就是
+// 它的安全网 —— 所以这里必须能承载动作，不能只是一条消息。
+function toast(msg,bad,undo){
   let el=document.getElementById('toast');
   if(!el){ el=document.createElement('div'); el.id='toast'; document.body.appendChild(el); }
-  el.textContent=msg;
+  el.innerHTML=esc(msg)+(undo?' <button id="tundo">撤回</button>':'');
   el.style.cssText='position:fixed;left:50%;bottom:34px;transform:translateX(-50%);'+
     'background:'+(bad?'#7f1d1d':'#14532d')+';color:#fff;padding:7px 14px;'+
-    'border-radius:6px;font-size:13px;z-index:99;box-shadow:0 4px 14px rgba(0,0,0,.4)';
-  clearTimeout(el._t); el._t=setTimeout(()=>el.remove(),3200);
+    'border-radius:6px;font-size:13px;z-index:99;box-shadow:0 4px 14px rgba(0,0,0,.4);'+
+    'display:flex;gap:10px;align-items:center';
+  if(undo){
+    const btn=el.querySelector('#tundo');
+    btn.style.cssText='background:rgba(255,255,255,.16);border:0;color:#fff;'+
+      'border-radius:4px;padding:2px 9px;font-size:12px;cursor:pointer';
+    btn.onclick=()=>{ undo(); el.remove(); };
+  }
+  clearTimeout(el._t); el._t=setTimeout(()=>el.remove(),undo?6000:3200);
+}
+
+// JD 摘要：压成单行。JD 开头常是「岗位职责：」「一、工作内容」这类小标题，
+// 直接截会得到一屏的标题而没有内容 —— 所以跳过纯标题行，从第一句实质内容开始。
+const _HDR=/^[\s\d一二三四五六七八九十、.,，：:（）()【】\[\]-]*(岗位职责|工作职责|职位描述|岗位描述|工作内容|职责描述|岗位要求|任职要求|任职资格|职位要求|我们希望你|你将负责|工作地点)?[\s：:，,、]*$/;
+function peek(jd){
+  if(!jd) return '';
+  const lines=jd.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  const body=lines.filter(s=>!_HDR.test(s));
+  // 全是标题行时退回原文，别返回空白（那样这一列就白占了）
+  return ((body.length?body:lines).join(' · ')).slice(0,600);
 }
 
 function ageCls(a){ if(a==null) return 'b'; if(a<=T.staleFresh) return ''; return a>=T.staleFull?'b':'w'; }
@@ -299,6 +335,7 @@ function card(r,i){
         ? `<div class="tgroup">${blockers.join('')}${perks.join('')}</div>`:''}
       ${techs.length?`<div class="tgroup">${techs.join('')}</div>`:''}
     </div>
+    <div class="peek" title="横向滚动可继续阅读；点 JD 看全文">${esc(peek(r.jd))}</div>
     <div class="ops">
       <button class="btn" data-act="jd">JD</button>
       <button class="btn ${isApplied(r)?'on':''}" data-act="ap">${isApplied(r)?'★ 已收':'收藏'}</button>
@@ -326,21 +363,32 @@ function render(){
 // 本地隐藏集：降级后立刻从视图消失。跑服务时数据库也真的改了，
 // 但页面不会自己重载，所以要有前端侧的即时反馈。
 const HIDDEN=new Set(JSON.parse(localStorage.getItem('pool.demoted.v1')||'[]'));
+// 不弹确认框：降级是高频动作（筛池子时一路往下刷），每次确认反而让人
+// 养成盲点「确定」的习惯，那时确认框就只剩摩擦、不剩保护。
+// 安全网改成事后可撤：toast 给撤回入口 + 顶栏常驻「恢复本页隐藏的 N 条」。
 async function demote(r){
-  if(!confirm(`降级「${r.t}」？\n\n跑服务时会写数据库（retention_status=sample），\n它将从投递池移出。`)) return;
   HIDDEN.add(r.id);
   localStorage.setItem('pool.demoted.v1',JSON.stringify([...HIDDEN]));
   // 必须重绘 chips：「恢复本页隐藏的 N 条」那个入口是按 HIDDEN.size 生成的，
   // 只 render() 不 drawChips() 会让误点降级后**没有撤回入口**。
   sel=-1; drawChips(); render();
-  if(!LIVE){ toast('已在本页隐藏（未跑服务，数据库未改）'); return; }
+  // 撤回：本页恢复显示，并让服务把它撤回 active（/restore 会同时打 bookmarked，
+  // 使后续清理脚本不再自动降它 —— 手工判断优先于脚本判断）
+  const undo=async()=>{
+    HIDDEN.delete(r.id);
+    localStorage.setItem('pool.demoted.v1',JSON.stringify([...HIDDEN]));
+    drawChips(); render();
+    if(LIVE) try{ await fetch('/restore',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:r.id})}); }catch(e){}
+  };
+  if(!LIVE){ toast(`已隐藏「${r.t.slice(0,14)}」（未跑服务，库未改）`,false,undo); return; }
   try{
     const res=await fetch('/demote',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify({id:r.id})});
     const j=await res.json();
-    if(j.ok) toast('已降级并写库');
-    else toast('写库失败: '+(j.err||'未知'),true);
-  }catch(e){ toast('写库失败（服务未运行？）本次仅本页隐藏',true); }
+    if(j.ok) toast(`已降级「${r.t.slice(0,14)}」`,false,undo);
+    else toast('写库失败: '+(j.err||'未知'),true,undo);
+  }catch(e){ toast('写库失败（服务未运行？）本次仅本页隐藏',true,undo); }
 }
 
 function toggleCard(i,what){
