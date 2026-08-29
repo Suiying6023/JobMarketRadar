@@ -53,52 +53,65 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
 .chip.on{border-color:var(--ok);color:var(--ok)}
 .chip.off{opacity:.5;text-decoration:line-through}
 
-/* ---- 卡片列表：三列固定网格 ----
-   原先所有信息挤在两行 flex 里自动换行，行宽随内容变化，
-   眼睛没有可依赖的对齐基准，扫一列（比如"哪些有名校门槛"）必须逐条读。
-   改成固定三列：左=评分，中=岗位主体，右=标签区。列宽固定后可以纵向扫。 */
-main{padding:12px 16px 64px;max-width:1400px;margin:0 auto}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;
-  padding:10px 12px;margin-bottom:7px;transition:.12s;
-  display:grid;grid-template-columns:42px minmax(0,1fr) 300px;gap:12px;align-items:start}
+/* ---- 卡片：三列固定网格 = 岗位信息 | LLM 标签 | 操作 ----
+   列宽写死（不用 auto/fr 让内容决定），因为一旦某条标签长一点，
+   整列就变宽、上下行对不齐，纵向扫标签的能力就没了 —— 而那正是分列的目的。
+   标签本身也在导出侧压成了短词（门槛 ≤9 字、技术栈 ≤16 字），
+   两侧一起保证列宽稳定。 */
+main{padding:10px 16px 64px;max-width:1560px;margin:0 auto}
+/* 高度构成（实测）：两行内容 44px + 上下内边距 + 外边距。
+   标签列只占 21px 一行，不是撑高的原因。压内边距是唯一还能省的地方。 */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:6px 11px;margin-bottom:4px;transition:.12s;
+  display:grid;grid-template-columns:minmax(0,1fr) 340px 122px;
+  gap:14px;align-items:center}
 .card:hover{border-color:#3b4252}
 .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
-.card.done{opacity:.42}
-/* 有真门槛的卡片带一道左侧色条：不写「无门槛」三个字（那会在每张干净的卡上
-   重复一次噪音），而是让**有**门槛的能被扫到。红=硬挡（不接受应届/风险公司），
-   黄=需留意（年限/名校/硕博）。 */
-.card.gate{border-left:3px solid var(--warn);padding-left:10px}
-.card.block{border-left:3px solid var(--bad);padding-left:10px}
-.sc{font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent);
-  font-size:17px;text-align:right;padding-top:1px}
+.card.done{opacity:.4}
+/* 左侧色条标注**有**门槛的（不写「无门槛」——那会在每张干净的卡上重复噪音）。
+   红=硬挡（明确不招应届/公司有风险），黄=需留意（年限/名校/硕博）。 */
+.card.gate{border-left:3px solid var(--warn);padding-left:9px}
+.card.block{border-left:3px solid var(--bad);padding-left:9px}
+
+/* ---- 左列：岗位信息 ---- */
 .mid{min-width:0}
 .r1{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.sc{font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent);font-size:15px}
 .ti{font-size:14.5px;font-weight:600;color:var(--fg)}
 .co{color:var(--dim);font-size:13px}
 .sa{color:var(--ok);font-weight:600;font-variant-numeric:tabular-nums;font-size:13.5px}
-.r2{margin-top:4px;display:flex;gap:9px;flex-wrap:wrap;align-items:center;
-  color:var(--dim2);font-size:12px}
-/* ---- 右列：标签区。门槛在上、技术栈在下，两组之间留白，
-       因为它们回答的是两个不同问题（能不能投 / 对不对口）。
-   ⚠️ 左对齐而非右对齐：右对齐时换行的第二行起点会缩到右边，
-   每行起点都不同，纵向扫标签列就失效了 —— 而"扫一列"正是分列的目的。 ---- */
-.side{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.r2{margin-top:3px;display:flex;gap:9px;flex-wrap:wrap;align-items:center;
+  color:var(--dim2);font-size:11.5px}
+
+/* ---- 中列：LLM 提取的标签。门槛一行、技术栈一行 ----
+   两组分行是因为它们回答不同问题（能不能投 / 对不对口）。
+   固定 340px 且标签 nowrap：宁可换行也不让单个标签拉宽整列。 ---- */
+.side{display:flex;flex-direction:column;gap:3px;align-items:flex-start;min-width:0}
 .tgroup{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-start}
 .tag{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
-  padding:1px 7px;font-size:11px;color:var(--dim);white-space:nowrap;
-  max-width:290px;overflow:hidden;text-overflow:ellipsis}
+  padding:1px 6px;font-size:11px;color:var(--dim);white-space:nowrap;
+  max-width:160px;overflow:hidden;text-overflow:ellipsis}
 .tag.g{color:var(--warn);border-color:#4a3f22;background:#241f0f}  /* 门槛：挡人的 */
 .tag.t{color:#7dd3fc;border-color:#1e3a4a;background:#0e1f2a}      /* 技术栈：对口度 */
 .tag.r{color:var(--bad);border-color:#4a2626;background:#2a1414}   /* 公司风险 */
 .tag.ok{color:var(--ok);border-color:#1e4032;background:#0d2019}   /* 正面：双休等 */
-.none{color:#4b5563;font-size:11px}
 .age{font-variant-numeric:tabular-nums}
 .age.w{color:var(--warn)} .age.b{color:var(--bad)}
 .stale{text-decoration:line-through;opacity:.55}    /* 过期的活跃度 */
-@media(max-width:900px){
-  .card{grid-template-columns:38px minmax(0,1fr)}
-  .side{grid-column:2;align-items:flex-start;margin-top:5px}
-  .tgroup{justify-content:flex-start}
+
+/* ---- 右列：操作。**横排**——竖排会把每张卡撑到 76px 高，一屏只剩 8 条，
+   而卡片内容本身只有两行。按钮位置在每张卡上完全一致，横排同样能盲点。 ---- */
+.ops{display:flex;gap:4px;align-items:flex-start;justify-content:flex-end}
+.ops .btn{padding:2px 7px;font-size:11px}
+.btn.on{color:var(--ok);border-color:#1e4032;background:#0d2019}
+.btn.warn:hover{color:var(--bad);border-color:#4a2626;background:#2a1414}
+@media(max-width:1240px){
+  .card{grid-template-columns:minmax(0,1fr) 250px 118px}
+  .tag{max-width:120px}
+}
+@media(max-width:860px){
+  .card{grid-template-columns:minmax(0,1fr) 118px}
+  .side{grid-column:1;margin-top:5px}
 }
 .why{margin-top:6px;color:var(--dim2);font-size:12px;border-left:2px solid var(--warn);
   padding-left:8px;display:none}
@@ -139,7 +152,7 @@ BODY = """
 <footer>
   <span><kbd>/</kbd> 搜索</span><span><kbd>j</kbd>/<kbd>k</kbd> 移动</span>
   <span><kbd>Enter</kbd> 打开岗位</span><span><kbd>Space</kbd> 展开 JD</span>
-  <span><kbd>a</kbd> 标记已投</span><span><kbd>Esc</kbd> 清搜索</span>
+  <span><kbd>a</kbd> 收藏</span><span><kbd>x</kbd> 降级</span><span><kbd>Esc</kbd> 清搜索</span>
   <span class="grow"></span><span id="thr"></span>
 </footer>
 """
@@ -204,6 +217,7 @@ function ageTxt(a){ return a==null?'未核实':(a===0?'今天':a+'天前'); }
 function pool(vk){
   const seesRisk = (vk==='risk' || vk==='all');
   return DATA.filter(r=>{
+    if(HIDDEN.has(r.id)) return false;           // 已手工降级的
     if(EX.risk && r.risk.length && !seesRisk) return false;
     if(EX.applied && isApplied(r)) return false;
     if(EX.stale && r.age!=null && r.age>=T.staleFull) return false;
@@ -250,9 +264,9 @@ function card(r,i){
   const hard=r.fresh==='不接受应届'||r.risk.length>0;
   const cls=hard?'block':(r.gates.length||r.fresh?'gate':'');
   return `<div class="card ${cls} ${i===sel?'sel':''} ${isApplied(r)?'done':''}" data-i="${i}">
-    <div class="sc" title="综合分">${r.score}</div>
     <div class="mid">
       <div class="r1">
+        <span class="sc" title="综合分">${r.score}</span>
         <a class="ti" href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.t)}</a>
         <span class="sa">${esc(r.sal)}</span>
         <span class="co">${esc(r.co)}</span>
@@ -264,10 +278,6 @@ function card(r,i){
         <span class="age ${ageCls(r.age)}">核实 ${ageTxt(r.age)}</span>
         ${r.size?`<span>${esc(r.size)}</span>`:''}
         ${r.stage?`<span>${esc(r.stage)}</span>`:''}
-        <span class="acts">
-          <button class="btn" data-act="jd">JD</button>
-          <button class="btn" data-act="ap">${isApplied(r)?'撤销':'已投'}</button>
-        </span>
       </div>
       ${r.why?`<div class="why">${esc(r.why)}</div>`:''}
       <div class="jd">${esc(r.jd)}</div>
@@ -276,6 +286,11 @@ function card(r,i){
       ${blockers.length||perks.length
         ? `<div class="tgroup">${blockers.join('')}${perks.join('')}</div>`:''}
       ${techs.length?`<div class="tgroup">${techs.join('')}</div>`:''}
+    </div>
+    <div class="ops">
+      <button class="btn" data-act="jd">JD</button>
+      <button class="btn ${isApplied(r)?'on':''}" data-act="ap">${isApplied(r)?'★ 已收':'收藏'}</button>
+      <button class="btn warn" data-act="dm">降级</button>
     </div>
   </div>`;
 }
@@ -296,24 +311,44 @@ function render(){
   window.__rows=rows;
 }
 
+// 本地隐藏集：降级后立刻从视图消失。跑服务时数据库也真的改了，
+// 但页面不会自己重载，所以要有前端侧的即时反馈。
+const HIDDEN=new Set(JSON.parse(localStorage.getItem('pool.demoted.v1')||'[]'));
+async function demote(r){
+  if(!confirm(`降级「${r.t}」？\n\n跑服务时会写数据库（retention_status=sample），\n它将从投递池移出。`)) return;
+  HIDDEN.add(r.id);
+  localStorage.setItem('pool.demoted.v1',JSON.stringify([...HIDDEN]));
+  // 必须重绘 chips：「恢复本页隐藏的 N 条」那个入口是按 HIDDEN.size 生成的，
+  // 只 render() 不 drawChips() 会让误点降级后**没有撤回入口**。
+  sel=-1; drawChips(); render();
+  if(!LIVE){ toast('已在本页隐藏（未跑服务，数据库未改）'); return; }
+  try{
+    const res=await fetch('/demote',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:r.id})});
+    const j=await res.json();
+    if(j.ok) toast('已降级并写库');
+    else toast('写库失败: '+(j.err||'未知'),true);
+  }catch(e){ toast('写库失败（服务未运行？）本次仅本页隐藏',true); }
+}
+
 function toggleCard(i,what){
-  const el=document.querySelector(`.card[data-i="${i}"]`);
-  if(!el) return;
-  if(what==='ap'){
-    const r=window.__rows[i];
-    const on=!isApplied(r);
-    markApplied(r,on);
-    render();
-    return;
-  }
-  el.classList.toggle('open');
+  const r=window.__rows[i];
+  if(!r) return;
+  if(what==='ap'){ markApplied(r,!isApplied(r)); render(); return; }
+  if(what==='dm'){ demote(r); return; }
+  document.querySelector(`.card[data-i="${i}"]`)?.classList.toggle('open');
 }
 
 document.addEventListener('click',e=>{
   const tab=e.target.closest('.tab');
   if(tab){ view=tab.dataset.v; sel=-1; render(); return; }
+  if(e.target.closest('#unhide')){
+    HIDDEN.clear(); localStorage.removeItem('pool.demoted.v1');
+    toast('已恢复本页隐藏的条目（数据库里已降级的仍需重跑导出）');
+    drawChips(); render(); return;
+  }
   const chip=e.target.closest('.chip');
-  if(chip){ EX[chip.dataset.ex]=!EX[chip.dataset.ex]; drawChips(); render(); return; }
+  if(chip&&chip.dataset.ex){ EX[chip.dataset.ex]=!EX[chip.dataset.ex]; drawChips(); render(); return; }
   const btn=e.target.closest('.btn');
   if(btn){ toggleCard(+btn.closest('.card').dataset.i, btn.dataset.act); return; }
 });
@@ -336,17 +371,23 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='Enter'&&rows[sel]){window.open(rows[sel].url,'_blank');return;}
   else if(e.key===' '&&sel>=0){e.preventDefault();toggleCard(sel,'jd');return;}
   else if(e.key==='a'&&rows[sel]){toggleCard(sel,'ap');return;}
+  else if(e.key==='x'&&rows[sel]){toggleCard(sel,'dm');return;}
   else return;
   render();
   document.querySelector('.card.sel')?.scrollIntoView({block:'nearest'});
 });
 
 function drawChips(){
-  const defs=[['risk','隐藏风险公司'],['applied','隐藏已投'],['stale',`隐藏超${T.staleFull}天未核实`]];
-  $('#chips').innerHTML=defs.map(([k,n])=>
-    `<span class="chip ${EX[k]?'on':'off'}" data-ex="${k}">${EX[k]?'✓':'○'} ${n}</span>`).join('')
-    + `<span class="chip" style="cursor:default;border:0">城市 ${T.cities.join('/')}`
-    + ` · 薪资上限均值 ${T.salaryDropMid}K · 硬过滤 ${S.dropped} 条 · 去重 ${S.dup} 条</span>`;
+  const defs=[['risk','隐藏风险公司'],['applied','隐藏已收藏'],['stale',`隐藏超${T.staleFull}天未核实`]];
+  let h=defs.map(([k,n])=>
+    `<span class="chip ${EX[k]?'on':'off'}" data-ex="${k}">${EX[k]?'✓':'○'} ${n}</span>`).join('');
+  // 误点降级要能撤回。只清本页隐藏——数据库那边的 retention_status 需要
+  // 用页面上的「撤销」或重跑脚本恢复，这里说清楚，不要让人以为全撤了。
+  if(HIDDEN.size) h+=`<span class="chip" id="unhide" style="border-color:#4a3f22;color:var(--warn)">`
+    +`↺ 恢复本页隐藏的 ${HIDDEN.size} 条</span>`;
+  h+=`<span class="chip" style="cursor:default;border:0">城市 ${T.cities.join('/')}`
+    +` · 薪资上限均值 ${T.salaryDropMid}K · 硬过滤 ${S.dropped} 条 · 去重 ${S.dup} 条</span>`;
+  $('#chips').innerHTML=h;
 }
 $('#thr').textContent=`P0≤${T.p0Days}天活跃 · 核心档 ${T.lowMax}–${T.highMin}K · 超纲留档 ${S.overArchive} 条`;
 drawChips(); render();

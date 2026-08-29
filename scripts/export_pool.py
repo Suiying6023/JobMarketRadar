@@ -76,11 +76,39 @@ def is_noise(v: str) -> bool:
     return (not v) or v in _NOISE or bool(_SATISFIED.match(v))
 
 
+# 从整句里抠出门槛的**核心短语**。LLM 抽的 gates 是整句（实测中位 14 字、
+# 89 条超 20 字、最长 40 字），铺上页面会把标签列撑变形——而句子里真正是门槛的
+# 只有开头几个字：「1-3年真实Python开发经验，有内部业务系统…」的门槛是「1-3年」。
+_G_YEARS = re.compile(
+    r"(\d+\s*[-~–]\s*\d+|\d+)\s*年(?:半)?(?:以上|及以上|或以上|左右)?"
+    r"|至少\s*(\d+)\s*年|(?:一|两|二|三|四|五|六|十)年(?:以上|及以上)?"
+)
+_G_SCHOOL = re.compile(r"985/?211|985|211|双一流|QS\s*前?\d*|名校|知名院校|重点院校|重点高校")
+_G_MASTER = re.compile(r"硕士(?:及以上|以上)?|研究生(?:及以上|以上)?|博士")
+
+
+def gate_label(v: str) -> str | None:
+    """把一句门槛压成 ≤10 字的短标签。识别不出核心短语就返回 None。
+
+    宁可丢掉也不铺整句：整句会撑破列宽，而完整原文在 JD 里一键可看。
+    """
+    m = _G_MASTER.search(v)
+    if m:
+        return m.group(0)[:8]
+    m = _G_SCHOOL.search(v)
+    if m:
+        return m.group(0)[:10]
+    m = _G_YEARS.search(v)
+    if m:
+        return m.group(0).replace(" ", "")[:8] + "经验"
+    return None
+
+
 def real_gates(g: dict) -> list[str]:
-    """只留**真门槛**：经验年限、名校、硕博。
+    """只留**真门槛**，且压成短标签：经验年限、名校、硕博。
 
     判据是这三类会让人投不进去，而「本科及以上」「经验不限」是已满足的条件。
-    顺序按严重性：年限最常见（实测 259 条）也最硬，名校次之，学历第三。
+    顺序按严重性：硕博与名校是绝对门槛，年限有时可放宽。
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -89,13 +117,11 @@ def real_gates(g: dict) -> list[str]:
             v = (v or "").strip()
             if is_noise(v):
                 continue
-            if not (_YEARS.search(v) or _SCHOOL.search(v) or _MASTER.search(v)):
+            label = gate_label(v)
+            if not label or label in seen:
                 continue
-            k = v[:24]
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(v[:40])
+            seen.add(label)
+            out.append(label)
     return out[:3]
 
 
@@ -143,7 +169,10 @@ _TECH_GENERIC = frozenset({
     "大模型", "llm", "agent", "智能体", "深度学习", "机器学习", "多模态",
     "prompt", "分布式", "高并发", "微服务", "云原生", "中间件", "sql", "linux", "git",
 })
-_MAX_TECH = 6
+# 标签列宽 340px 装得下几个标签：实测按字符宽估算，6 个有 31% 会换行、
+# 5 个降到 11%、4 个几乎为 0。换行会把卡片高度从 ~44px 撑到 64px，
+# 一屏少看三四条。取 5 —— 4 个丢的信息太多，5 个只有那些标签特别长的才换行。
+_MAX_TECH = 5
 
 
 def dedupe_tech(items) -> list[str]:

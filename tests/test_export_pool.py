@@ -151,6 +151,56 @@ def test_page_is_self_contained_single_file():
         assert bad not in html, f"页面引用了外部资源: {bad}"
 
 
+def test_gate_labels_are_short_enough_for_a_fixed_width_column():
+    """门槛必须压成短标签，不能铺整句。
+
+    实测原始 gates 值中位 14 字、89 条超 20 字、最长 40 字（LLM 抽的是整句）。
+    整句会把固定宽的标签列撑变形，而句子里真正是门槛的只有开头几个字：
+    「1-3年真实Python开发经验，有内部业务系统…」的门槛就是「1-3年」。
+    """
+    assert E.gate_label("1-3年真实Python开发经验，有内部业务系统交付经历") == "1-3年经验"
+    assert E.gate_label("本科 3 年以上相关工作经验，硕士 1 年以上") == "硕士"
+    assert E.gate_label("统招985/211重点院校毕业生优先") == "985/211"
+    assert E.gate_label("熟悉分布式系统设计") is None      # 不是门槛
+    for v in ("2年以上开发经验", "5年以上产品经理或解决方案经验，有至少 10 个案例"):
+        lab = E.gate_label(v)
+        assert lab and len(lab) <= 10, f"{v!r} → {lab!r} 太长"
+
+
+def test_tech_tag_count_fits_one_line():
+    """标签数上限要让绝大多数条目只占一行。
+
+    实测 340px 列宽下：6 个标签 31% 换行、5 个 11%、4 个近 0。
+    换行会把卡片从 ~44px 撑到 64px，一屏少看三四条。取 5 是这个权衡的结果。
+    """
+    assert E._MAX_TECH == 5
+    many = ["Python", "Java", "Go", "React", "Vue", "Redis", "Kafka", "Docker"]
+    assert len(E.dedupe_tech(many)) <= 5
+
+
+def test_three_column_layout_with_ops_column():
+    """三列：岗位信息 | LLM 标签 | 操作。列宽写死，不让内容决定。"""
+    css = T.CSS
+    assert "grid-template-columns:minmax(0,1fr) 340px 122px" in css, \
+        "列宽必须固定 —— 用 auto/fr 会让长标签把整列撑宽，上下行对不齐"
+    assert ".ops{display:flex;gap:4px" in css, "操作按钮横排（竖排会把卡撑高一倍）"
+    js = T.JS
+    for act in ("jd", "ap", "dm"):
+        assert f'data-act="{act}"' in js, f"缺少操作按钮 {act}"
+
+
+def test_demote_redraws_the_undo_entry():
+    """降级后必须重绘 chips —— 撤回入口是按 HIDDEN.size 生成的。
+
+    实测过的 bug：只 render() 不 drawChips()，误点降级后没有任何撤回入口，
+    而降级已经写进数据库了。
+    """
+    js = T.JS
+    demote_body = js.split("async function demote(r){")[1].split("\n}")[0]
+    assert "drawChips()" in demote_body, "降级后没重绘撤回入口"
+    assert "confirm(" in demote_body, "降级是写库操作，要先确认"
+
+
 def test_tab_counts_use_per_view_exclusions():
     """标签计数必须按各自视图的排除规则算。
 
