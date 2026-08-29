@@ -317,11 +317,7 @@ def tech_hits(r) -> int:
     与 `job_score` 共用同一份匹配逻辑（含 tech_req 为空时回退 JD 正文），
     **不要在别处重写** —— 两份会各自漂移。
     """
-    g = json.loads(r["glm_tags_json"] or "{}")
-    blob = " ".join(str(t) for t in _as_list(g.get("tech_req"))).lower()
-    if not blob.strip():
-        blob = (r["job_description"] or "").lower()
-    return sum(1 for k in P.AI_TECH if k in blob)
+    return sum(1 for k in P.AI_TECH if k in _tech_blob(r))
 
 
 def job_score(r) -> float:
@@ -384,17 +380,58 @@ def job_score(r) -> float:
                  + city + penalty, 1)
 
 
-def is_cv_job(r) -> bool:
-    """要求 CV/图像算法技能的岗位剔除（标题直给 或 LLM tech_req 明确要求）。
-    裸「cv」只精确匹配独立技能项（如 tech_req=['CV']），不匹配「NLP/CV」这类备选列表；
-    图像生成(AIGC)不算图像算法，不在此列。"""
-    if P.match_keyword(r["title"] or "", P.CV_TITLE_KW):
-        return True
+def _tech_blob(r) -> str:
+    """技术要求文本：优先 LLM 抽的 tech_req，为空时回退 JD 正文。
+
+    与 `tech_hits` / `job_score` 同一口径，别在别处重写。
+    """
     g = json.loads(r["glm_tags_json"] or "{}")
-    tech = [str(t).strip().lower() for t in _as_list(g.get("tech_req"))]
-    if any(k in t for t in tech for k in P.CV_TECH_KW):
-        return True
-    return any(t == "cv" for t in tech)
+    blob = " ".join(str(t) for t in _as_list(g.get("tech_req"))).lower()
+    return blob if blob.strip() else (r["job_description"] or "").lower()
+
+
+def is_cv_job(r) -> bool:
+    """岗位主体是否是 CV/图像算法。
+
+    ⚠️ 判据是 **CV 词数 > AI/Agent 词数**，不是"出现 CV 词即命中"。
+    原先按 `any` 判，实测 48 条被拦的岗位里 **27 条 AI 词多于 CV 词**，
+    最极端的 `AI工程师（视觉与大模型方向）` 是 cv=1 vs **ai=12** ——
+    它的 tech_req 里写满 LangChain/CrewAI/Function Calling/LoRA，
+    是个 YOLO + LLM/Agent 联合系统岗，被单个"目标检测"一票否决。
+    这违反了本项目自己的边界：弱信号只配排序，不配当门槛。
+
+    标题路径保留 `any`：标题是平台方写的岗位定位，`视觉算法工程师` 就是
+    CV 岗，实测那 15 条零误杀。但标题命中时仍要看 AI 词是否压倒性更多，
+    否则 `AI工程师（视觉与大模型方向）` 这类联合岗还是会被标题拦掉。
+    """
+    blob = _tech_blob(r)
+    n_cv = sum(1 for k in P.CV_TECH_KW if k in blob)
+    n_ai = sum(1 for k in P.AI_TECH if k in blob)
+    if P.match_keyword(r["title"] or "", P.CV_TITLE_KW):
+        # 标题直标 CV，除非内容压倒性偏 AI（差 3 个词以上）
+        return n_ai < n_cv + 3
+    if any(t.strip().lower() == "cv" for t in
+           _as_list(json.loads(r["glm_tags_json"] or "{}").get("tech_req"))):
+        return n_ai <= n_cv
+    return n_cv > 0 and n_cv >= n_ai
+
+
+# 设计/美术/内容运营岗的降级判定**不在这里**，在 apply_glm_filters.classify()
+# 里按 LLM 的 job_type 判（设计岗/内容岗/运营岗/市场岗）。
+#
+# 2026-08-29 曾在此加一个 is_nondev_role() 按 JD 关键词计数判，**实测失败并撤回**：
+# 17 条被拦的里 16 条是真正的 Agent/大模型开发岗（job_type 全是开发岗、
+# LLM 全判 keep），例如 `多智能体应用研发工程师（AI 短剧 Agent）`
+# —— 它的 JD 写着"搭建编剧、导演、分镜、素材处理多 Agent 协作系统"。
+# 根因：**那些词描述的是 Agent 要自动化的业务对象，不是岗位要人做的事**。
+# 做内容生产 Agent 的开发岗，JD 里必然出现剪辑/素材/分镜。
+# 而我筛词的样本只有"标题含 AIGC 的 233 条"，这类岗在样本里几乎不存在 ——
+# **筛词的样本没有覆盖判据将要作用的全体**，所以那个区分度是假的。
+#
+# 实测支撑"交给 LLM 就够了"：库里 296 条设计/内容/运营/市场岗
+# **全部已在 sample，active 里 0 条**，LLM 判过的 74 条全是 demote、零例外。
+# 所以这里不需要再加一层 —— 加了就是一条从未生效却看着像在防的规则，
+# 而且与 apply_glm_filters 构成两份会各自漂移的判定。
 
 
 def is_future_cohort(r) -> bool:

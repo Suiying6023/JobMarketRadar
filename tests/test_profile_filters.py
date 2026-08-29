@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -51,8 +52,11 @@ def test_match_keyword_returns_the_hit_not_nameerror():
 
 
 def test_match_keyword_is_case_insensitive():
-    assert P.match_keyword("AIGC设计师", P.EXCLUDE_TITLE) == "AIGC"
-    assert P.match_keyword("aigc设计师", P.EXCLUDE_TITLE) == "AIGC"
+    """大小写不敏感。用公司黑名单里的英文词做用例 —— 原先用 `AIGC`，
+    但它已从标题黑名单移出（改按 JD 内容判设计岗），那不是这条测试要守的事。"""
+    assert P.match_keyword("外企德科数字技术", P.EXCLUDE_COMPANY) == "外企德科"
+    assert P.match_keyword("PYTHON开发（外包驻场）", P.EXCLUDE_TITLE) == "外包"
+    assert P.match_keyword("python开发（外包驻场）", P.EXCLUDE_TITLE) == "外包"
 
 
 # ---------- OD（华为外包标记）必须按词边界判，否则吃掉 Coding ----------
@@ -405,6 +409,59 @@ def test_hard_drop_catches_what_previously_leaked_into_p0():
     # 日薪按**数值**判，不按文案：salary_text 里从来没有「元/天」（全库 0 条）
     assert E.hard_drop(row(salary_min_k=0.2, salary_max_k=0.3)) == "日薪(实习)"
     assert E.hard_drop(row()) == ""
+
+
+def test_cv_rule_compares_word_counts_instead_of_any_hit():
+    """CV 判定看 **CV 词数 vs AI 词数**，不是"出现 CV 词即命中"。
+
+    原先按 `any` 判，实测 48 条被拦的岗位里 27 条 AI 词多于 CV 词。
+    最极端的 `AI工程师（视觉与大模型方向）` 是 cv=1 vs **ai=12** ——
+    tech_req 里写满 LangChain/CrewAI/Function Calling/LoRA，是 YOLO+Agent
+    联合系统岗，被单个"目标检测"一票否决。弱信号不该当门槛。
+    """
+    # AI 压倒性更多 → 放行（真实案例形态）
+    joint = row(title="AI工程师（视觉与大模型方向）", glm_tags_json=json.dumps({
+        "tech_req": ["目标检测", "LangChain、LlamaIndex、AutoGPT、CrewAI、Dify",
+                     "Function Calling / Tool Call 机制，具备Agent架构设计能力",
+                     "SFT/LoRA 微调", "RAG 知识库", "python", "大模型"]}))
+    assert not E.is_cv_job(joint), "AI 词远多于 CV 词，不该判 CV 岗"
+    # 纯 CV 工程 → 仍然拦（真实案例：OCR 岗，"大模型"只出现在 OCR大模型 里）
+    ocr = row(title="初级算法工程师（计算机视觉+大模型）", glm_tags_json=json.dumps({
+        "tech_req": ["精通numpy、OpenCV、PIL等主流图像处理工具库",
+                     "熟悉计算机视觉、文本检测识别基础算法原理",
+                     "熟练掌握Python编程语言", "OCR大模型等开源框架"]}))
+    assert E.is_cv_job(ocr), "CV 词多于 AI 词，应判 CV 岗"
+
+
+def test_aigc_title_is_not_hard_dropped_and_content_words_never_filter():
+    """`AIGC` 不按标题硬删；且**不能**改用 JD 关键词计数来替代。
+
+    第一段：AIGC 进 EXCLUDE_TITLE 时拦对 199 条内容/设计/运营岗，但同时吃掉
+    22 条开发/算法/产品岗，且硬删发生在打标签之前 —— 那 22 条 LLM `match`
+    全是 None，连"该不该降"都没判过。
+
+    第二段（更重要，这是撤回过的方案）：改成按 JD 里"创意/剪辑/素材/分镜"
+    等词计数判，实测 17 条被拦的里 **16 条是真 Agent 开发岗**，例如
+    `多智能体应用研发工程师（AI 短剧 Agent）`——JD 写着"搭建编剧、导演、
+    分镜、素材处理多 Agent 协作系统"。那些词描述的是 **Agent 要自动化的
+    业务对象**，不是岗位要人做的事。岗位性质交给读过全文的 LLM 判
+    （apply_glm_filters 按 job_type 降级），关键词只适合判标题直标的确定信号。
+    """
+    assert "AIGC" not in P.EXCLUDE_TITLE, "AIGC 不该按标题硬删"
+    # 内容领域的 Agent 开发岗：JD 里必然出现剪辑/素材/分镜，绝不能因此被拦
+    agent_dev = row(
+        title="多智能体应用研发工程师（AI 短剧 Agent）",
+        job_description="搭建编剧、导演、分镜、素材处理多 Agent 协作应用系统，"
+                        "把剧本创作、分镜拆解、素材调度等业务流程自动化落地",
+        glm_tags_json=json.dumps({"job_type": "开发岗", "match": "keep"}))
+    assert E.hard_drop(agent_dev) == "", "内容领域的 Agent 开发岗不该被硬过滤"
+    # 标题带 AIGC 的开发岗同样放行
+    aigc_dev = row(title="AIGC agent应用工程师",
+                   glm_tags_json=json.dumps({"job_type": "开发岗"}))
+    assert E.hard_drop(aigc_dev) == ""
+    # 硬过滤层不该有基于内容词计数的岗位性质判定
+    assert not hasattr(P, "NONDEV_ROLE_KW"), \
+        "撤回过的方案：内容词计数会误杀内容领域的 Agent 开发岗"
 
 
 def test_hard_drop_also_catches_od_so_the_over_bucket_cannot_leak_it():
