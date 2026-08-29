@@ -316,10 +316,16 @@ def main() -> None:
             parsed, err, attempts = fut.result()
             done += 1
             if parsed is not None:
+                # ⚠️ 必须 `time.gmtime()`。原先是 `time.strftime("...%SZ")` 不带第二个
+                # 参数——那用的是**本地时间**，却硬编码了 `Z` 后缀，等于把 UTC+8 的
+                # 时刻标成 UTC。库里其余时间字段（collected_at/detail_fetched_at）
+                # 都是真 UTC，所以任何跨字段的时序比较都会偏 8 小时，
+                # 而且不报错、只给出看似合理的错误结论（2026-08-29 我据此把本轮
+                # 抓的行误判成上一轮抓的）。
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 con.execute(
                     "UPDATE jobs SET glm_tags_json = ?, glm_tags_updated_at = ? WHERE canonical_id = ?",
-                    (json.dumps(parsed, ensure_ascii=False), time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                     r["canonical_id"]),
+                    (json.dumps(parsed, ensure_ascii=False), stamp, r["canonical_id"]),
                 )
                 con.commit()
                 ok_count += 1
