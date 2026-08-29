@@ -190,9 +190,21 @@ def test_four_column_layout_absorbs_spare_width_with_jd_peek():
     富余宽度由 JD 摘要列吸收（1fr），那比空着有用。
     """
     css = T.CSS
-    cols = "grid-template-columns:minmax(0,520px) 340px minmax(0,1fr) 118px"
-    assert cols in css, "左列要设上限、JD 摘要列吸收富余、标签与操作列定宽"
-    assert ".ops{display:flex;gap:4px" in css, "操作按钮横排（竖排会把卡撑高一倍）"
+    # 断言结构性质而非整串字面量：像素值会随排版微调而变，
+    # 会守的是「左列有上限、JD 列吸收富余、另两列定宽」这三件事。
+    cols = css.split("grid-template-columns:", 1)[1].split(";")[0].strip()
+    parts = cols.split()
+    assert len(parts) == 4, f"应为四列，实际 {cols!r}"
+    assert parts[0].startswith("minmax(0,") and parts[0].endswith("px)"), \
+        f"左列要设上限，不能用 1fr 独占剩余空间：{parts[0]}"
+    assert parts[1].endswith("px"), f"标签列要定宽，否则长标签会撑变形：{parts[1]}"
+    assert parts[2] == "minmax(0,1fr)", f"JD 摘要列吸收富余宽度：{parts[2]}"
+    assert parts[3].endswith("px"), f"操作列要定宽，位置才固定可盲点：{parts[3]}"
+    # 按钮竖排：卡片高度由 JD 窗口固定（108px），竖排不再额外撑高，
+    # 而横排时三个按钮挤在 128px 里每个只有 38px 宽、点击目标太小。
+    ops = css.split(".ops{")[1].split("}")[0]
+    assert "flex-direction:column" in ops
+    assert "align-items:stretch" in ops, "按钮要占满整列宽，点击目标才够大"
     # 容器不设 max-width：那会让卡片居中留白而顶栏全宽，两者对不齐
     assert "main{padding:10px 16px 64px}" in css
     js = T.JS
@@ -227,19 +239,34 @@ def test_toast_can_carry_an_action():
     assert "undo?6000:3200" in body
 
 
-def test_jd_peek_fills_the_spare_width_without_growing_the_card():
-    """JD 摘要占用富余宽度，但**不能**撑高卡片。
+def test_jd_peek_scrolls_vertically_with_a_fixed_height():
+    """JD 摘要纵向滚动，高度写死。
 
-    实测 1366-1920px 下第三列富余 265-819px，与其空着不如放 JD 开头 ——
-    那是判断"这岗位到底做什么"最快的信息源，而标签只给技术栈和门槛。
-    关键是单行滚动而非换行：卡片高度实测仍是 58px。
+    单行只能显示约 73 字 = JD 中位长度（592 字）的 12%，4 行能到约 30%，
+    多数岗位的核心职责就在这个范围里。高度写死让每张卡一样高（实测 108px），
+    列表节奏稳定 —— 若让 JD 决定高度，长短不一会让滚动时失去参照。
     """
-    css = T.CSS
-    assert "white-space:nowrap" in css.split(".peek{")[1].split("}")[0], \
-        "JD 摘要必须单行，换行会把卡片撑高、抵消密度收益"
-    assert "overflow-x:auto" in css.split(".peek{")[1].split("}")[0], "要能横向滚动继续读"
+    peek = T.CSS.split(".peek{")[1].split("}")[0]
+    assert "overflow-y:auto" in peek, "JD 要能纵向滚动读完"
+    assert "height:78px" in peek, "高度写死，否则每张卡高度不一"
+    assert "white-space:nowrap" not in peek, "已改纵向，不该再限制换行"
     # 窄屏优先牺牲它：它是"顺便看到"的信息，标签和操作是必需的
-    assert ".peek{display:none}" in css
+    assert ".peek{display:none}" in T.CSS
+
+
+def test_left_column_uses_three_rows():
+    """左列三行：岗位 / 岗位属性 / 公司属性。
+
+    卡片高度由 JD 窗口决定（108px），左列只有两行时下方会空一片。
+    拆出第三行既填上空间，又让"岗位属性"（决定投不投）和"公司属性"
+    （决定值不值得投）分开。
+    """
+    assert ".r3{" in T.CSS
+    js = T.JS
+    assert 'class="r3"' in js
+    # 公司背景字段要真的用上，否则第三行还是空的
+    for f in ("r.size", "r.stage", "r.cap", "r.found", "r.regStatus"):
+        assert f in js, f"第三行没用到 {f}"
 
 
 def test_jd_peek_skips_boilerplate_headers():

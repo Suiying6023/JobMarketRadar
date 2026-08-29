@@ -20,7 +20,8 @@ CSS = """
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);
-  font:14px/1.55 -apple-system,"Segoe UI",system-ui,"Microsoft YaHei",sans-serif}
+  font:14.5px/1.6 -apple-system,"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 
@@ -28,8 +29,8 @@ a:hover{text-decoration:underline}
 header{position:sticky;top:0;z-index:20;background:rgba(15,17,21,.96);
   backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:10px 16px 8px}
 .hrow{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-h1{margin:0;font-size:16px;font-weight:600;letter-spacing:.2px}
-.meta{color:var(--dim);font-size:12px}
+h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.3px}
+.meta{color:var(--dim);font-size:12.5px}
 .meta b{color:var(--fg);font-weight:600}
 .grow{flex:1}
 input[type=search],select{background:var(--panel2);color:var(--fg);
@@ -42,7 +43,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
 /* ---- 视图切换：原先是七个文件，现在是七个按钮 ---- */
 .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .tab{background:var(--panel);border:1px solid var(--line);color:var(--dim);
-  border-radius:999px;padding:4px 12px;font-size:12.5px;cursor:pointer;
+  border-radius:999px;padding:5px 14px;font-size:13px;cursor:pointer;
   display:flex;gap:6px;align-items:center;transition:.12s}
 .tab:hover{border-color:var(--accent);color:var(--fg)}
 .tab.on{background:var(--accent);border-color:var(--accent);color:#0b1220;font-weight:600}
@@ -71,11 +72,11 @@ main{padding:10px 16px 64px}
    第四列（JD 摘要）用 1fr 吸收富余宽度：实测 1366-1920px 下富余 265-819px，
    与其空着不如放 JD 开头 —— 那是判断"这岗位到底做什么"最快的信息源。
    ⚠️ 它必须单行不换行（见 .peek），否则会把卡片撑高、抵消掉密度收益。 */
-.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-  padding:6px 11px;margin-bottom:4px;transition:.12s;
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+  padding:10px 13px;margin-bottom:7px;transition:.12s;
   display:grid;
-  grid-template-columns:minmax(0,520px) 340px minmax(0,1fr) 118px;
-  gap:14px;align-items:center}
+  grid-template-columns:minmax(0,520px) 340px minmax(0,1fr) 128px;
+  gap:16px;align-items:center}
 .card:hover{border-color:#3b4252}
 .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
 .card.done{opacity:.4}
@@ -84,23 +85,31 @@ main{padding:10px 16px 64px}
 .card.gate{border-left:3px solid var(--warn);padding-left:9px}
 .card.block{border-left:3px solid var(--bad);padding-left:9px}
 
-/* ---- 左列：岗位信息 ---- */
+/* ---- 左列：岗位信息。字号拉开层级：标题 > 薪资 > 公司 > 元信息，
+   这样扫列表时眼睛先落在岗位名上，而不是在同样大小的文字里找。 ---- */
 .mid{min-width:0}
-.r1{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
-.sc{font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent);font-size:15px}
-.ti{font-size:14.5px;font-weight:600;color:var(--fg)}
-.co{color:var(--dim);font-size:13px}
-.sa{color:var(--ok);font-weight:600;font-variant-numeric:tabular-nums;font-size:13.5px}
-.r2{margin-top:3px;display:flex;gap:9px;flex-wrap:wrap;align-items:center;
-  color:var(--dim2);font-size:11.5px}
+.r1{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap}
+.sc{font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent);font-size:17px}
+.ti{font-size:16px;font-weight:600;color:var(--fg);letter-spacing:.2px}
+.co{color:var(--dim);font-size:13.5px}
+.sa{color:var(--ok);font-weight:700;font-variant-numeric:tabular-nums;font-size:15px}
+.r2{margin-top:6px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+  color:var(--dim2);font-size:12.5px}
+/* 第三行：公司背景。卡片高度由 JD 窗口决定（108px），左列只有两行时
+   下方会空一片。把原本挤在第二行的公司信息拆出来单独一行，
+   既填上空间又让"岗位属性"和"公司属性"分开 —— 前者决定投不投，
+   后者决定值不值得投。 */
+.r3{margin-top:5px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+  color:#5b6472;font-size:12px}
+.r3 b{color:var(--dim);font-weight:500}
 
 /* ---- 中列：LLM 提取的标签。门槛一行、技术栈一行 ----
    两组分行是因为它们回答不同问题（能不能投 / 对不对口）。
    固定 340px 且标签 nowrap：宁可换行也不让单个标签拉宽整列。 ---- */
-.side{display:flex;flex-direction:column;gap:3px;align-items:flex-start;min-width:0}
-.tgroup{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-start}
-.tag{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
-  padding:1px 6px;font-size:11px;color:var(--dim);white-space:nowrap;
+.side{display:flex;flex-direction:column;gap:5px;align-items:flex-start;min-width:0}
+.tgroup{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-start}
+.tag{background:var(--panel2);border:1px solid var(--line);border-radius:5px;
+  padding:2px 8px;font-size:12px;color:var(--dim);white-space:nowrap;
   max-width:160px;overflow:hidden;text-overflow:ellipsis}
 .tag.g{color:var(--warn);border-color:#4a3f22;background:#241f0f}  /* 门槛：挡人的 */
 .tag.t{color:#7dd3fc;border-color:#1e3a4a;background:#0e1f2a}      /* 技术栈：对口度 */
@@ -110,36 +119,42 @@ main{padding:10px 16px 64px}
 .age.w{color:var(--warn)} .age.b{color:var(--bad)}
 .stale{text-decoration:line-through;opacity:.55}    /* 过期的活跃度 */
 
-/* ---- 第三列：JD 摘要（滑动窗口）----
-   原先这块宽度是空的。放 JD 开头能直接回答"这岗位到底做什么"，
-   而标签只给技术栈和门槛，答不了这个。
-   `white-space:nowrap` + `overflow-x:auto` 是关键：单行滚动而非换行，
-   卡片高度完全不受它影响（实测仍是 58px）。鼠标横向滚可以往后读，
-   要读全文点 JD 按钮展开。 */
-.peek{min-width:0;color:var(--dim2);font-size:11.5px;line-height:1.5;
-  white-space:nowrap;overflow-x:auto;overflow-y:hidden;
-  scrollbar-width:none;-ms-overflow-style:none;
-  mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);
-  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent)}
-.peek::-webkit-scrollbar{height:0}
-.card:hover .peek{color:var(--dim)}
+/* ---- 第三列：JD 摘要（纵向滚动窗口）----
+   放 JD 开头能直接回答"这岗位到底做什么"，而标签只给技术栈和门槛，答不了这个。
+   改纵向：单行只能显示约 73 字 = JD 中位长度（592 字）的 12%，
+   4 行能到约 30%，多数岗位的核心职责就在这个范围里。
+   高度写死 4 行（78px）—— 这也是卡片高度的下限，所以每张卡都一样高，
+   列表节奏稳定；内容更长的部分靠鼠标滚轮在这个窗口里读，或点 JD 看全文。 */
+.peek{min-width:0;color:var(--dim);font-size:12.5px;line-height:1.62;
+  height:78px;overflow-y:auto;overflow-x:hidden;padding-right:6px;
+  scrollbar-width:thin;scrollbar-color:#3a4150 transparent;
+  mask-image:linear-gradient(to bottom,#000 calc(100% - 14px),transparent);
+  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 14px),transparent)}
+.peek::-webkit-scrollbar{width:7px}
+.peek::-webkit-scrollbar-thumb{background:#3a4150;border-radius:4px}
+.peek::-webkit-scrollbar-track{background:transparent}
+.card:hover .peek{color:var(--fg)}
 
 /* ---- 末列：操作。**横排**——竖排会把每张卡撑到 76px 高，一屏只剩 8 条，
    而卡片内容本身只有两行。 ---- */
-.ops{display:flex;gap:4px;align-items:flex-start;justify-content:flex-end}
-.ops .btn{padding:2px 7px;font-size:11px}
+/* 卡片高了以后按钮改竖排：横排时三个按钮挤在 128px 里每个只有 38px 宽，
+   点击目标太小。竖排每个都是整列宽，且卡片高度由 JD 窗口决定（78px），
+   竖排不再额外撑高。 */
+.ops{display:flex;flex-direction:column;gap:5px;align-items:stretch}
+.ops .btn{padding:4px 0;font-size:12.5px;text-align:center;font-weight:500}
 .btn.on{color:var(--ok);border-color:#1e4032;background:#0d2019}
 .btn.warn:hover{color:var(--bad);border-color:#4a2626;background:#2a1414}
-/* 窄屏时左列改成可压缩（minmax），否则 560px 定宽会溢出横向滚动 */
-/* 窄屏优先牺牲 JD 摘要：它是"顺便看到"的信息，而标签和操作是必需的。 */
+/* 窄屏优先牺牲 JD 摘要：它是"顺便看到"的信息，而标签和操作是必需的。
+   ⚠️ 隐藏 .peek 后卡片就没有了那个 78px 的高度锚，会塌回两行的高度 ——
+   所以这里同时把左列放开为 1fr，让它自己撑起排版。 */
 @media(max-width:1400px){
-  .card{grid-template-columns:minmax(0,1fr) 320px 118px;gap:12px}
+  .card{grid-template-columns:minmax(0,1fr) 320px 128px;gap:13px}
   .peek{display:none}
   .tag{max-width:130px}
 }
 @media(max-width:860px){
-  .card{grid-template-columns:minmax(0,1fr) 118px}
-  .side{grid-column:1;margin-top:5px}
+  .card{grid-template-columns:minmax(0,1fr) 128px}
+  .side{grid-column:1;margin-top:6px}
 }
 .why{margin-top:6px;color:var(--dim2);font-size:12px;border-left:2px solid var(--warn);
   padding-left:8px;display:none}
@@ -150,8 +165,9 @@ main{padding:10px 16px 64px}
 .card.open .jd{display:block}
 .acts{display:flex;gap:5px;margin-left:4px}
 .btn{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-  border-radius:5px;padding:1px 8px;font-size:11.5px;cursor:pointer}
-.btn:hover{color:var(--fg);border-color:var(--accent)}
+  border-radius:5px;padding:3px 10px;font-size:12.5px;cursor:pointer;
+  transition:.12s}
+.btn:hover{color:var(--fg);border-color:var(--accent);background:#232838}
 .empty{color:var(--dim);text-align:center;padding:48px 0}
 footer{position:fixed;bottom:0;left:0;right:0;background:rgba(15,17,21,.96);
   border-top:1px solid var(--line);padding:5px 16px;font-size:11.5px;color:var(--dim2);
@@ -324,8 +340,13 @@ function card(r,i){
         <span>${esc(r.jt)}</span>
         ${act}
         <span class="age ${ageCls(r.age)}">核实 ${ageTxt(r.age)}</span>
+      </div>
+      <div class="r3">
         ${r.size?`<span>${esc(r.size)}</span>`:''}
         ${r.stage?`<span>${esc(r.stage)}</span>`:''}
+        ${r.cap?`<span>注册 <b>${esc(r.cap)}</b></span>`:''}
+        ${r.found?`<span>成立 ${esc(r.found.slice(0,7))}</span>`:''}
+        ${r.regStatus?`<span>${esc(r.regStatus)}</span>`:''}
       </div>
       ${r.why?`<div class="why">${esc(r.why)}</div>`:''}
       <div class="jd">${esc(r.jd)}</div>
