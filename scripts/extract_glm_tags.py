@@ -283,6 +283,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="处理条数上限，0=全部")
     parser.add_argument("--force", action="store_true", help="重跑已提取过的岗位（换新 prompt 后重新提取）")
     parser.add_argument("--db", default="data/hangzhou_agent.sqlite3")
+    # 默认只扫 active 层，因为标签是为投递池服务的。但**降级是单向的**：
+    # 早期版本还没有 match 判定字段，那批岗位只抽了 exp_req/edu_req，
+    # 之后 apply_glm_filters 只扫 active，它们已在 sample 里就永远轮不到重判。
+    # 实测（2026-08-29）有 122 条招聘者当天仍活跃、画像也不该降的岗位卡在这个死角。
+    parser.add_argument("--ids-file",
+                        help="只处理文件里列出的 canonical_id（每行一个），忽略分层限制。"
+                             "用于给 sample 层里从未做过 match 判定的岗位补判。")
     args = parser.parse_args()
 
     env = load_env()
@@ -294,10 +301,25 @@ def main() -> None:
 
     con = sqlite3.connect(args.db)
     con.row_factory = sqlite3.Row
-    where = "WHERE retention_status = 'active' AND job_description != ''"
-    if not args.force:
-        where += " AND glm_tags_updated_at = ''"
-    rows = con.execute(f"SELECT canonical_id, title, company_name, job_description FROM jobs {where}").fetchall()
+    if args.ids_file:
+        ids = [ln.strip() for ln in Path(args.ids_file).read_text(encoding="utf-8").splitlines()
+               if ln.strip()]
+        if not ids:
+            print(f"{args.ids_file} 里没有 id")
+            return
+        # 显式指名的岗位一律重判，不受分层与"已提取过"限制 —— 调用方要的就是覆盖。
+        qs = ",".join("?" * len(ids))
+        rows = con.execute(
+            f"SELECT canonical_id, title, company_name, job_description FROM jobs"
+            f" WHERE canonical_id IN ({qs}) AND job_description != ''", ids).fetchall()
+        print(f"按 id 列表处理 {len(rows)} 条（列表给了 {len(ids)} 个 id）")
+    else:
+        where = "WHERE retention_status = 'active' AND job_description != ''"
+        if not args.force:
+            where += " AND glm_tags_updated_at = ''"
+        rows = con.execute(
+            f"SELECT canonical_id, title, company_name, job_description FROM jobs {where}"
+        ).fetchall()
     if args.limit:
         rows = rows[: args.limit]
     total = len(rows)

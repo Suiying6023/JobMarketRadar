@@ -78,6 +78,28 @@ EXCLUDE_TITLE = (
     "实习",                      # 用户要正式岗
     "AIGC",                      # 2026-08-05：词太宽，带出纯设计/内容岗
 )
+
+# 「OD」是华为体系的外包/外派用工标记（`数据库内核开发工程师（OD）`、
+# `【od】ai软件开发-python`），性质等同上面的「外包/外派」。
+#
+# ⚠️ **必须按词边界匹配，不能进 EXCLUDE_TITLE**（那里走裸子串）：
+# 实测（2026-08-29）裸子串 `OD` 在库里命中 91 条，其中绝大多数是 **Coding**
+# —— `AI Coding Agent 研发工程师`、`Vibe Coding 全栈工程师`、
+# `淘天-AI Agent应用开发工程师-coding方向` …… 那恰恰是求职者最对口的方向。
+# 按词边界则精准命中 20 条，全是华为 OD 岗。
+# 这是「短英文缩写做黑名单」的典型陷阱：词越短，越可能是别的词的一部分。
+#
+# 否定形式要放行：`华为社招-数据库内核研发-非od` 明确说了不是 OD。
+_OD_RE = _re.compile(r"(?<![A-Za-z])OD(?![A-Za-z])", _re.I)
+_NOT_OD_RE = _re.compile(r"非\s*OD", _re.I)
+
+
+def outsourced_od(title: str) -> bool:
+    """标题是否带华为 OD（外包用工）标记。"""
+    t = title or ""
+    if _NOT_OD_RE.search(t):
+        return False
+    return bool(_OD_RE.search(t))
 EXCLUDE_COMPANY = (
     "猎头", "劳务派遣", "人力资源",
     # IT/人力外包服务公司（名称关键词，命中即降级；2026-08-03 确认）

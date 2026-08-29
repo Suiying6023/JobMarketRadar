@@ -55,6 +55,42 @@ def test_match_keyword_is_case_insensitive():
     assert P.match_keyword("aigc设计师", P.EXCLUDE_TITLE) == "AIGC"
 
 
+# ---------- OD（华为外包标记）必须按词边界判，否则吃掉 Coding ----------
+
+def test_od_marker_is_detected():
+    """OD 是华为体系的外包用工标记，性质等同「外包/外派」。"""
+    for t in ("数据库内核开发工程师（OD）", "【od】ai软件开发-python",
+              "OD招聘 华为数据库", "后端开发工程师-华为od",
+              "AI agent/java开发工程师-OD招聘", "数据库管理员(OD)"):
+        assert P.outsourced_od(t), f"未识别 OD 标记: {t}"
+
+
+def test_od_must_not_swallow_coding():
+    """⚠️ 这是这条规则的**全部难点**：裸子串 `OD` 会命中 `Coding`。
+
+    实测（2026-08-29）：库里标题含裸子串 `OD` 的有 91 条，其中绝大多数是
+    `AI Coding Agent 研发工程师`、`Vibe Coding 全栈工程师`、
+    `淘天-AI Agent应用开发工程师-coding方向` 这类 —— 那恰恰是求职者**最对口**
+    的方向。按词边界匹配则精准命中 20 条，全是华为 OD 岗。
+
+    所以 OD 绝不能进 `EXCLUDE_TITLE`（那里走裸子串匹配）。
+    这条测试钉死这个边界：把它改回子串匹配就会红。
+    """
+    for t in ("AI Coding Agent 研发工程师", "Vibe Coding 全栈工程师",
+              "淘天-AI Agent应用开发工程师-coding方向", "AI开发工程师（AI coding）",
+              "全栈开发工程师｜AI Code 方向｜", "Node.js 后端工程师（AI Travel Agent ）",
+              "AI Agent研发工程师-QoderWake"):
+        assert not P.outsourced_od(t), f"误伤对口岗位: {t}"
+    # 也不该进裸子串黑名单 —— 那等于绕过词边界
+    assert "OD" not in P.EXCLUDE_TITLE, "OD 进了裸子串黑名单，会吃掉 Coding"
+
+
+def test_explicit_non_od_is_allowed():
+    """`华为社招-数据库内核研发-非od` 明确说了不是 OD，不该被降。"""
+    assert not P.outsourced_od("华为社招-数据库内核研发-非od")
+    assert not P.outsourced_od("数据库开发（非 OD 正编）")
+
+
 # ---------- 活跃度分档：中间档不再落进裂缝 ----------
 
 def test_online_counts_as_most_active_not_missing():

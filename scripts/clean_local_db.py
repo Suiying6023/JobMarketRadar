@@ -68,6 +68,9 @@ def should_demote(r) -> tuple[bool, str]:
     kw = P.match_keyword(r["title"] or "", P.EXCLUDE_TITLE)
     if kw:
         return True, f"标题[{kw}]"
+    # OD 单独判：它要按词边界匹配，混进 EXCLUDE_TITLE（裸子串）会吃掉 Coding
+    if P.outsourced_od(r["title"] or ""):
+        return True, "外包[OD]"
     kw = P.match_keyword(r["company_name"] or "", P.EXCLUDE_COMPANY)
     if kw:
         return True, f"公司[{kw}]"
