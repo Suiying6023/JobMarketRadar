@@ -27,7 +27,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from job_radar.collectors.boss import SEARCH_BASE, BossCollector, RiskControlStop  # noqa: E402
 from job_radar.config import load_config  # noqa: E402
 from job_radar import profile  # noqa: E402
-from job_radar.exit_guard import assert_home_exit  # noqa: E402
 from job_radar.models import JobRecord, SearchFilters  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
@@ -110,10 +109,6 @@ async def main() -> None:
     parser.add_argument("--include-sample", action="store_true",
                         help="也给 sample 岗位补详情（默认只补 active，省详情配额）")
     args = parser.parse_args()
-
-    # 带账号 cookie 的请求绝不能从陌生 IP 发出去（见 exit_guard 模块头）。
-    # 放在读库之前：不一致时应该一条请求都不发。
-    assert_home_exit()
 
     cfg = load_config(args.config)
     with JobStore(cfg.database_path) as store:

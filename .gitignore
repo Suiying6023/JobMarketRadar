@@ -51,6 +51,8 @@ ROADMAP.md
 data/*.log
 
 # Local run logs / probe artifacts
+# logs/ 里是采集运行日志，含公司名与岗位标题，和 data/ 同级敏感
+logs/
 **/data/*.log
 **/data/probe/
 data/*.sqlite3.bak

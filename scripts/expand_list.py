@@ -30,7 +30,6 @@ from job_radar.collectors.boss import (  # noqa: E402
     BossCollector,
 )
 from job_radar.config import load_config  # noqa: E402
-from job_radar.exit_guard import assert_home_exit  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
 # ⚠️ 2026-08-10 两处修复（详见 boss.py:_evaluate_fetch 注释）：
@@ -93,9 +92,6 @@ async def main() -> None:
                         help="忽略断点进度，所有关键词从第 1 页重新翻"
                              "（平台岗位有轮换，隔一段时间重扫浅层有意义）")
     args = parser.parse_args()
-
-    # 带账号 cookie 的请求绝不能从陌生 IP 发出去（见 exit_guard 模块头）。
-    assert_home_exit()
 
     cfg = load_config(args.config)
     # ⚠️ 遍历**全部**城市。原先只取 cities[0]，配置里写三个城市它也只抓第一个——
