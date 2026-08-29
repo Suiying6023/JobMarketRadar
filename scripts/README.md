@@ -60,7 +60,14 @@
 ## 简历与产出
 
 - `expand_resume.py` / `backfill_resume.py`
-- `export_pool_html.py` + `serve_pool.py` — 投递池导出成 HTML 并起本地服务
+- `export_pool.py` + `serve_pool.py` — **投递池导出成单页 HTML** 并起本地服务。
+  分桶（P0/P1/P2、高/低/超纲薪资、风险公司）是页内筛选而非文件切分，
+  所以能跨桶搜索排序。页面模板在 `_pool_template.py`。
+  跑服务时点「已投」会写库（`chat_actions` + `bookmarked`）；
+  直接双击 HTML 打开则退化用 localStorage。
+- `export_pool_html.py` — 旧的七文件导出，**已被 `export_pool.py` 取代**。
+  保留是因为新脚本复用它的判定函数（`job_score`/`hard_drop`/`salary_bucket`
+  /`active_tier`/`real_risk_tags`），那些口径全部经过实测校准，不重写。
 
 ## 辅助
 

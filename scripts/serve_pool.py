@@ -38,21 +38,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         from urllib.parse import unquote
         path = unquote(self.path.split("?")[0])
+        # 根路径直接给单页投递池。原先是一个链接目录页，指向七个分文件——
+        # 那套已被 export_pool.py 的单页取代（分桶变成页内筛选），
+        # 多一跳目录页只是让人多点一次。旧文件若还在，仍可按文件名直接访问。
         if path in ("/", "/index.html"):
-            body = ('<meta charset="utf-8"><h2>投递池</h2>'
-                    '<h4>核心薪资档（7-15K，按活跃度分）</h4><ul>'
-                    '<li><a href="/投递池_P0优先.html">P0 优先投递（3日内活跃）</a></li>'
-                    '<li><a href="/投递池_P1待确认.html">P1 待确认（平台未返回活跃度）</a></li>'
-                    '<li><a href="/投递池_P2冷池.html">P2 冷池（活跃超 3 天，按天数升序）</a></li></ul>'
-                    '<h4>其他薪资档</h4><ul>'
-                    '<li><a href="/投递池_高薪.html">高薪（中点&gt;15K，含 13薪+ 折算）</a></li>'
-                    '<li><a href="/投递池_低薪.html">低薪（中点≤7K）</a></li>'
-                    '<li><a href="/投递池_超纲.html">超纲（起薪&gt;20K）</a></li></ul>'
-                    '<h4>互斥单列</h4><ul>'
-                    '<li><a href="/投递池_风险公司.html">风险公司（低资本/新成立/非公司主体/工商未知）</a></li>'
-                    '</ul><p>标记按钮会将岗位降级到样本库并自动刷新列表；撤销会同时打上'
-                    ' bookmarked 标记，后续清理脚本不会再把它降级。</p>').encode()
-            self._send(200, body, "text/html; charset=utf-8")
+            page = OUT / "投递池.html"
+            if not page.exists():
+                self._send(200, ('<meta charset="utf-8"><h3>还没有导出投递池</h3>'
+                                 '<p>先跑 <code>uv run python scripts/export_pool.py</code></p>'
+                                 ).encode(), "text/html; charset=utf-8")
+                return
+            self._send(200, page.read_bytes(), "text/html; charset=utf-8")
             return
         # 目录穿越防护：原先直接 `OUT / path.lstrip("/")`，而 path 已经 unquote 过，
         # 所以 `GET /../.env` 和 `/..%2F.env` 都能读到项目根的 .env（含 API key）。
@@ -121,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"ok": False, "err": err}).encode(), "application/json")
                 return
             # 重新生成 HTML，保持页面与 DB 同步
-            subprocess.run([sys.executable, str(ROOT / "scripts" / "export_pool_html.py")],
+            subprocess.run([sys.executable, str(ROOT / "scripts" / "export_pool.py")],
                            capture_output=True)
             self._send(200, json.dumps({"ok": True}).encode(), "application/json")
         except Exception as exc:
