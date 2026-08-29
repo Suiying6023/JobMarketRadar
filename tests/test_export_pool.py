@@ -66,6 +66,70 @@ def test_every_view_in_template_is_reachable():
     assert not empty, f"这些视图没有任何记录: {empty}"
 
 
+def test_noise_values_never_reach_the_page():
+    """「未提及」和求职者已满足的条件不该占标签位。
+
+    实测：工作制字段 956 条是「未提及」（LLM 对"JD 没写"的正常输出），
+    gates 里 506 条是「本科及以上」「经验不限」—— 求职者是统招全日制本科
+    应届生，这些他已满足。两者加起来让页面满屏零信息量标签，
+    把真正该看的经验年限门槛淹掉。
+    """
+    assert E.is_noise("未提及")
+    assert E.is_noise("本科及以上")
+    assert E.is_noise("统招本科及以上学历")
+    assert E.is_noise("经验不限")
+    assert E.is_noise("学历不限")
+    assert E.is_noise("")
+    # 真门槛不能被当噪音滤掉
+    assert not E.is_noise("硕士及以上")
+    assert not E.is_noise("985/211")
+    assert not E.is_noise("3年以上开发经验")
+    assert not E.is_noise("双休")
+
+
+def test_real_gates_keeps_only_blockers():
+    """gates 只留会挡人的：经验年限、名校、硕博。"""
+    g = {"exp_req": ["3年以上后端开发经验", "经验不限"],
+         "edu_req": ["本科及以上学历", "硕士及以上"],
+         "school_req": ["985/211"], "other_req": ["未提及"]}
+    out = E.real_gates(g)
+    assert any("3年以上" in x for x in out)
+    assert any("硕士" in x for x in out)
+    assert any("985" in x for x in out)
+    assert not any("本科及以上" in x for x in out)
+    assert not any("经验不限" in x for x in out)
+    assert not any("未提及" in x for x in out)
+
+
+def test_tech_tags_are_extracted_words_not_truncated_sentences():
+    """技术栈必须是**提取出的短词**，不是截断的整句。
+
+    实测 tech_req 的值 28% 超过 18 字（中位 10、最长 250），截断会产出
+    「深度学习框架（如TensorFlow」这种断句 —— 读不懂且长短不齐，
+    标签列没法纵向扫，而"能扫一列"正是把标签独立成列的目的。
+    """
+    out = E.dedupe_tech([
+        "熟练掌握 Python、Java 或其他编程语言进行测试脚本或自动化测试开发",
+        "理解大模型应用的基本原理，了解 Prompt、RAG、Function Calling",
+        "LangChain、LangGraph等主流Agent开发框架",
+    ])
+    assert "Python" in out and "Java" in out
+    assert "RAG" in out and "LangChain" in out
+    # 每个标签都必须短到能一眼读完，且不含句读
+    for t in out:
+        assert len(t) <= 18, f"{t!r} 太长，说明是句子不是词"
+        assert not any(c in t for c in "，。、（）"), f"{t!r} 含句读，是截断的句子"
+
+
+def test_tech_vocabulary_covers_the_profile_scoring_words():
+    """展示用词表必须含画像评分用的那 27 个词 —— 页面上看到的技术栈
+    应当和评分依据一致，否则"分数高但标签看不出为什么"。"""
+    import job_radar.profile as P
+    vocab = {t.lower() for t in E._TECH_VOCAB}
+    missing = [t for t in P.AI_TECH if t.lower() not in vocab]
+    assert not missing, f"词表缺少画像评分词: {missing}"
+
+
 def test_jd_text_is_included_because_gates_live_there():
     """JD 正文必须带上：所有硬门槛（经验年限、名校、双休、外包）都在正文里，
     接口字段只能粗筛。它占 65% 体积，但砍掉就等于砍掉页面的核心价值。"""

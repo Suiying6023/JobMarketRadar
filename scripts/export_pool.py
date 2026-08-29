@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 import webbrowser
@@ -54,6 +55,132 @@ JOIN_ACTIONS = (
 )
 
 
+# 求职者本人是**统招全日制本科（双非）、2026 届应届**，所以这些要求他已经满足，
+# 显示出来只是噪音。实测全库 gates 值里 506 条属于这一类（占一半），
+# 满屏「本科及以上」会把真正该看的经验年限门槛淹掉。
+_SATISFIED = re.compile(
+    r"^(?:统招|全日制)?(?:本科|大专|专科|学历)(?:及以上|以上)?(?:学历)?$"
+    r"|^经验不限$|^不限$|^学历不限$|^(?:接受)?应届|^在校"
+)
+# 「未提及」是 LLM 对"JD 没写这一项"的正常输出，不是标签。实测工作制字段
+# 956 条都是它 —— 渲染出来等于满屏三个字的零信息量噪音。
+_NOISE = ("未提及", "无", "不限", "未明确", "未说明", "-", "—")
+_YEARS = re.compile(r"\d+\s*年|\d+\s*\+|至少\s*\d|以上经验")
+_SCHOOL = re.compile(r"985|211|双一流|名校|知名院校|重点院校|重点高校|海外知名|QS")
+_MASTER = re.compile(r"硕士|研究生|博士")
+
+
+def is_noise(v: str) -> bool:
+    """这个值是否不该出现在页面上（零信息量，或求职者已满足）。"""
+    v = (v or "").strip()
+    return (not v) or v in _NOISE or bool(_SATISFIED.match(v))
+
+
+def real_gates(g: dict) -> list[str]:
+    """只留**真门槛**：经验年限、名校、硕博。
+
+    判据是这三类会让人投不进去，而「本科及以上」「经验不限」是已满足的条件。
+    顺序按严重性：年限最常见（实测 259 条）也最硬，名校次之，学历第三。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in ("exp_req", "school_req", "edu_req", "other_req"):
+        for v in L._as_list(g.get(key)):
+            v = (v or "").strip()
+            if is_noise(v):
+                continue
+            if not (_YEARS.search(v) or _SCHOOL.search(v) or _MASTER.search(v)):
+                continue
+            k = v[:24]
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(v[:40])
+    return out[:3]
+
+
+# 技术词表：从 LLM 抽的整句里**提取**已知技术词，而不是截断句子。
+# 实测 `tech_req` 的值有 28% 超过 18 字（中位 10、最长 250），直接截断会产出
+# 「深度学习框架（如TensorFlow」「保通用的编程语言能力，包括Pytho」这种
+# 断句 —— 既读不懂又长短不齐，标签列没法纵向扫。
+#
+# 以 profile.AI_TECH 为核心（那 27 个词是画像评分在用的，必须一致），
+# 再补通用技术栈：它们不参与评分，但决定"这岗位是什么技术方向"，
+# 而那正是扫标签列时想知道的事。
+_TECH_EXTRA = (
+    "Java", "Go", "Golang", "C++", "TypeScript", "JavaScript", "Rust", "Kotlin",
+    "React", "Vue", "Node.js", "Django", "Flask", "Spring Boot", "Spring Cloud",
+    "MySQL", "PostgreSQL", "Redis", "MongoDB", "Elasticsearch", "Kafka",
+    "Docker", "Kubernetes", "K8s", "Linux", "Git", "Nginx", "SQL",
+    "TensorFlow", "Kubeflow", "HuggingFace", "Ollama", "vLLM", "Milvus",
+    "Qdrant", "Chroma", "Faiss", "Pinecone", "LlamaIndex", "AutoGen", "CrewAI",
+    "n8n", "Airflow", "Spark", "Flink", "Hadoop", "Pandas", "NumPy",
+    "SSE", "WebSocket", "gRPC", "GraphQL", "RESTful", "OAuth",
+    "Function Calling", "Tool Use", "ReAct", "CoT", "思维链", "知识图谱",
+    "工作流", "多智能体", "强化学习", "SFT", "LoRA", "RLHF", "量化", "蒸馏",
+    "爬虫", "分布式", "高并发", "微服务", "中间件", "云原生",
+)
+# 长词优先匹配，否则 "Spring" 会先命中而吃掉 "Spring Boot"。
+_TECH_VOCAB = sorted(
+    {*(t for t in _TECH_EXTRA), *(t for t in P.AI_TECH)},
+    key=lambda s: -len(s),
+)
+# 展示时的规范写法（画像词表是小写的，直接上页面不好看）
+_TECH_CANON = {
+    "python": "Python", "llm": "LLM", "agent": "Agent", "rag": "RAG",
+    "pytorch": "PyTorch", "langgraph": "LangGraph", "langchain": "LangChain",
+    "fastapi": "FastAPI", "openai": "OpenAI", "transformer": "Transformer",
+    "mcp": "MCP", "dify": "Dify", "coze": "Coze", "vllm": "vLLM",
+    "milvus": "Milvus", "aigc": "AIGC", "function calling": "Function Calling",
+    "prompt": "Prompt", "k8s": "K8s", "golang": "Go", "sql": "SQL",
+}
+
+
+# 泛词：出现频率高但区分度低。「大模型」几乎每条 AI 岗都有，而
+# 「LangGraph」「Milvus」直接说明技术选型。标签位只有 6 个，
+# 满了就要挤掉谁 —— 挤掉泛词，留下具体框架。
+_TECH_GENERIC = frozenset({
+    "大模型", "llm", "agent", "智能体", "深度学习", "机器学习", "多模态",
+    "prompt", "分布式", "高并发", "微服务", "云原生", "中间件", "sql", "linux", "git",
+})
+_MAX_TECH = 6
+
+
+def dedupe_tech(items) -> list[str]:
+    """从整句里提取技术词，去重后返回短标签。
+
+    只认词表里的词。代价是词表外的技术（冷门框架）不会显示，
+    收益是每个标签都是**可读的短词**、长度一致、能纵向扫。
+    在"完整"和"可读"之间选可读 —— 完整信息在 JD 正文里，一键可展开。
+
+    ⚠️ 按信息量排序后再截断，不能按出现顺序截。原先边扫边截，
+    结果第二句就填满 6 个位，`LangChain`/`LangGraph` 这类**框架名永远轮不到**
+    （测试抓到的）—— 而它们比「大模型」这种泛词有用得多。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for v in items:
+        if not isinstance(v, str):
+            continue
+        low = v.lower()
+        for term in _TECH_VOCAB:
+            tl = term.lower()
+            if tl not in low:
+                continue
+            canon = _TECH_CANON.get(tl, term)
+            k = canon.lower()
+            if k in seen:
+                continue
+            # 只防完全包含（Go 被 Golang 覆盖），不合并不同概念
+            if any(k != s and (k in s.split() or (len(k) <= 3 and k in s)) for s in seen):
+                continue
+            seen.add(k)
+            found.append(canon)
+    # 具体框架优先于泛词；同档内保持原顺序（越靠前说明 JD 越强调）
+    found.sort(key=lambda t: t.lower() in _TECH_GENERIC)
+    return found[:_MAX_TECH]
+
+
 def row_to_record(r, bucket: str, tier: str, risky: bool) -> dict:
     """一条岗位 → 前端记录。字段名短是刻意的（1656 条 × 每个键都要重复一次）。
 
@@ -66,9 +193,8 @@ def row_to_record(r, bucket: str, tier: str, risky: bool) -> dict:
     act_days = r["recruiter_active_days"]
     if act_days is None:
         act_days = active_days_from_desc(act)
-    tech = L._as_list(g.get("tech_req"))[:6]
-    gates = (L._as_list(g.get("exp_req"))[:2] + L._as_list(g.get("edu_req"))[:1]
-             + L._as_list(g.get("school_req"))[:1])
+    tech = dedupe_tech(L._as_list(g.get("tech_req")))
+    gates = real_gates(g)
     risks = L.real_risk_tags(reg)
     return {
         "id": r["canonical_id"],
@@ -91,8 +217,14 @@ def row_to_record(r, bucket: str, tier: str, risky: bool) -> dict:
         "gates": gates,
         "why": (g.get("match_reason") or "")[:300],
         "match": g.get("match") or "",
-        "sched": g.get("work_schedule") or "",
-        "fresh": g.get("fresh_grad") or "",
+        # 工作制只在 JD 真写了的时候才有意义：实测 956 条是「未提及」，
+        # 渲染出来是满屏零信息量。双休是正面信号，非双休是负面，两者都要留；
+        # 「未提及」丢掉 —— 它等于"这条 JD 没说"，不该占一个标签位。
+        "sched": "" if is_noise(g.get("work_schedule") or "") else (g.get("work_schedule") or "")[:8],
+        # 应届友好度同理：「接受应届」是默认预期（774 条），不值一个标签；
+        # 只有「不接受」和「可放宽」才需要提示。
+        "fresh": (lambda v: v if v and v != "接受应届" and not is_noise(v) else "")(
+            g.get("fresh_grad") or ""),
         # 活跃度 + 它的快照年龄（"刚刚活跃"若是 20 天前记的就不可信）
         "act": act,
         "actDays": act_days,

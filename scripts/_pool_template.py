@@ -53,40 +53,63 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
 .chip.on{border-color:var(--ok);color:var(--ok)}
 .chip.off{opacity:.5;text-decoration:line-through}
 
-/* ---- 卡片列表 ---- */
-main{padding:12px 16px 60px;max-width:1180px;margin:0 auto}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-  padding:11px 13px;margin-bottom:9px;transition:.12s}
+/* ---- 卡片列表：三列固定网格 ----
+   原先所有信息挤在两行 flex 里自动换行，行宽随内容变化，
+   眼睛没有可依赖的对齐基准，扫一列（比如"哪些有名校门槛"）必须逐条读。
+   改成固定三列：左=评分，中=岗位主体，右=标签区。列宽固定后可以纵向扫。 */
+main{padding:12px 16px 64px;max-width:1400px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+  padding:10px 12px;margin-bottom:7px;transition:.12s;
+  display:grid;grid-template-columns:42px minmax(0,1fr) 300px;gap:12px;align-items:start}
 .card:hover{border-color:#3b4252}
 .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
-.card.done{opacity:.45}
-.r1{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap}
+.card.done{opacity:.42}
+/* 有真门槛的卡片带一道左侧色条：不写「无门槛」三个字（那会在每张干净的卡上
+   重复一次噪音），而是让**有**门槛的能被扫到。红=硬挡（不接受应届/风险公司），
+   黄=需留意（年限/名校/硕博）。 */
+.card.gate{border-left:3px solid var(--warn);padding-left:10px}
+.card.block{border-left:3px solid var(--bad);padding-left:10px}
 .sc{font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent);
-  min-width:34px;font-size:15px}
-.ti{font-size:15px;font-weight:600}
-.co{color:var(--dim)}
-.sa{color:var(--ok);font-weight:600;font-variant-numeric:tabular-nums}
-.r2{margin-top:5px;display:flex;gap:7px;flex-wrap:wrap;align-items:center;
-  color:var(--dim);font-size:12.5px}
+  font-size:17px;text-align:right;padding-top:1px}
+.mid{min-width:0}
+.r1{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.ti{font-size:14.5px;font-weight:600;color:var(--fg)}
+.co{color:var(--dim);font-size:13px}
+.sa{color:var(--ok);font-weight:600;font-variant-numeric:tabular-nums;font-size:13.5px}
+.r2{margin-top:4px;display:flex;gap:9px;flex-wrap:wrap;align-items:center;
+  color:var(--dim2);font-size:12px}
+/* ---- 右列：标签区。门槛在上、技术栈在下，两组之间留白，
+       因为它们回答的是两个不同问题（能不能投 / 对不对口）。
+   ⚠️ 左对齐而非右对齐：右对齐时换行的第二行起点会缩到右边，
+   每行起点都不同，纵向扫标签列就失效了 —— 而"扫一列"正是分列的目的。 ---- */
+.side{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.tgroup{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-start}
 .tag{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
-  padding:1px 7px;font-size:11.5px;color:var(--dim)}
-.tag.g{color:var(--warn);border-color:#4a3f22}      /* 门槛：要注意的 */
-.tag.t{color:#7dd3fc;border-color:#1e3a4a}          /* 技术栈 */
-.tag.r{color:var(--bad);border-color:#4a2626}       /* 风险 */
-.dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+  padding:1px 7px;font-size:11px;color:var(--dim);white-space:nowrap;
+  max-width:290px;overflow:hidden;text-overflow:ellipsis}
+.tag.g{color:var(--warn);border-color:#4a3f22;background:#241f0f}  /* 门槛：挡人的 */
+.tag.t{color:#7dd3fc;border-color:#1e3a4a;background:#0e1f2a}      /* 技术栈：对口度 */
+.tag.r{color:var(--bad);border-color:#4a2626;background:#2a1414}   /* 公司风险 */
+.tag.ok{color:var(--ok);border-color:#1e4032;background:#0d2019}   /* 正面：双休等 */
+.none{color:#4b5563;font-size:11px}
 .age{font-variant-numeric:tabular-nums}
 .age.w{color:var(--warn)} .age.b{color:var(--bad)}
-.stale{text-decoration:line-through;opacity:.6}     /* 过期的活跃度 */
-.why{margin-top:6px;color:var(--dim2);font-size:12px;border-left:2px solid var(--line);
+.stale{text-decoration:line-through;opacity:.55}    /* 过期的活跃度 */
+@media(max-width:900px){
+  .card{grid-template-columns:38px minmax(0,1fr)}
+  .side{grid-column:2;align-items:flex-start;margin-top:5px}
+  .tgroup{justify-content:flex-start}
+}
+.why{margin-top:6px;color:var(--dim2);font-size:12px;border-left:2px solid var(--warn);
   padding-left:8px;display:none}
 .card.open .why{display:block}
-.jd{margin-top:8px;background:var(--panel2);border-radius:6px;padding:9px 11px;
+.jd{margin-top:7px;background:var(--panel2);border-radius:6px;padding:9px 11px;
   white-space:pre-wrap;font-size:12.5px;color:#c3c9d4;max-height:420px;
-  overflow:auto;display:none}
+  overflow:auto;display:none;line-height:1.6}
 .card.open .jd{display:block}
-.acts{margin-left:auto;display:flex;gap:6px}
+.acts{display:flex;gap:5px;margin-left:4px}
 .btn{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-  border-radius:5px;padding:2px 9px;font-size:12px;cursor:pointer}
+  border-radius:5px;padding:1px 8px;font-size:11.5px;cursor:pointer}
 .btn:hover{color:var(--fg);border-color:var(--accent)}
 .empty{color:var(--dim);text-align:center;padding:48px 0}
 footer{position:fixed;bottom:0;left:0;right:0;background:rgba(15,17,21,.96);
@@ -211,38 +234,49 @@ function current(){
 }
 
 function card(r,i){
-  const ac=ageCls(r.age);
   // 活跃度过期就划掉：19 天前记的"在线"既不能证明在线也不能证明不在线
   const staleAct=r.age!=null&&r.age>=T.staleFull;
   const act=r.act?`<span class="${staleAct?'stale':''}">${esc(r.act)}</span>`:'';
-  const tags=[
-    ...r.gates.map(g=>`<span class="tag g">${esc(g.slice(0,26))}</span>`),
-    ...r.tech.slice(0,4).map(t=>`<span class="tag t">${esc(t.slice(0,22))}</span>`),
+  // 门槛组：挡人的东西。r.gates 已在导出侧滤掉"本科及以上""经验不限"这类
+  // 求职者已满足的值和"未提及"，所以这里出现的每一条都值得看一眼。
+  const blockers=[
+    ...r.gates.map(g=>`<span class="tag g" title="${esc(g)}">${esc(g)}</span>`),
+    ...(r.fresh?[`<span class="tag g">${esc(r.fresh)}</span>`]:[]),
     ...r.risk.map(x=>`<span class="tag r">${esc(x)}</span>`),
-  ].join('');
-  return `<div class="card ${i===sel?'sel':''} ${isApplied(r)?'done':''}" data-i="${i}">
-    <div class="r1">
-      <span class="sc">${r.score}</span>
-      <a class="ti" href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.t)}</a>
-      <span class="co">${esc(r.co)}</span>
-      <span class="sa">${esc(r.sal)}</span>
-      <span class="acts">
-        <button class="btn" data-act="jd">JD</button>
-        <button class="btn" data-act="ap">${isApplied(r)?'撤销':'已投'}</button>
-      </span>
+  ];
+  const perks=r.sched?[`<span class="tag ok">${esc(r.sched)}</span>`]:[];
+  const techs=r.tech.map(t=>`<span class="tag t" title="${esc(t)}">${esc(t)}</span>`);
+  // 左侧色条分两档：硬挡（明确不招应届 / 公司有风险）比"需留意"更该先看到
+  const hard=r.fresh==='不接受应届'||r.risk.length>0;
+  const cls=hard?'block':(r.gates.length||r.fresh?'gate':'');
+  return `<div class="card ${cls} ${i===sel?'sel':''} ${isApplied(r)?'done':''}" data-i="${i}">
+    <div class="sc" title="综合分">${r.score}</div>
+    <div class="mid">
+      <div class="r1">
+        <a class="ti" href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.t)}</a>
+        <span class="sa">${esc(r.sal)}</span>
+        <span class="co">${esc(r.co)}</span>
+      </div>
+      <div class="r2">
+        <span>${esc(r.city)}${r.dist?'·'+esc(r.dist):''}</span>
+        <span>${esc(r.jt)}</span>
+        ${act}
+        <span class="age ${ageCls(r.age)}">核实 ${ageTxt(r.age)}</span>
+        ${r.size?`<span>${esc(r.size)}</span>`:''}
+        ${r.stage?`<span>${esc(r.stage)}</span>`:''}
+        <span class="acts">
+          <button class="btn" data-act="jd">JD</button>
+          <button class="btn" data-act="ap">${isApplied(r)?'撤销':'已投'}</button>
+        </span>
+      </div>
+      ${r.why?`<div class="why">${esc(r.why)}</div>`:''}
+      <div class="jd">${esc(r.jd)}</div>
     </div>
-    <div class="r2">
-      <span>${esc(r.city)}${r.dist?'·'+esc(r.dist):''}</span>
-      <span class="tag">${esc(r.jt)}</span>
-      ${act}
-      <span class="age ${ac}">核实 ${ageTxt(r.age)}</span>
-      ${r.size?`<span>${esc(r.size)}</span>`:''}
-      ${r.stage?`<span>${esc(r.stage)}</span>`:''}
-      ${r.sched?`<span class="tag">${esc(r.sched)}</span>`:''}
-      ${tags}
+    <div class="side">
+      ${blockers.length||perks.length
+        ? `<div class="tgroup">${blockers.join('')}${perks.join('')}</div>`:''}
+      ${techs.length?`<div class="tgroup">${techs.join('')}</div>`:''}
     </div>
-    ${r.why?`<div class="why">${esc(r.why)}</div>`:''}
-    <div class="jd">${esc(r.jd)}</div>
   </div>`;
 }
 
