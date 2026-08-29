@@ -45,6 +45,48 @@ def test_code37_limit_wider_than_day_cap(name):
         f"至少需要 {int(cfg.max_requests_per_day / REQUESTS_PER_CODE37) + 1}")
 
 
+# 2026-08-29 实测的封禁触发点与已验证安全值，按**详情条数**计。
+# 此前所有数字都只是"未触边的上界"（跑到 N 没被封 ≠ N 是安全线），
+# 这天第一次拿到真正的触发点。
+BAN_TRIGGERED_DETAILS = 1019    # 08-29：detail 1019 / 请求 1148 → code=36
+VERIFIED_SAFE_DETAILS = 674     # 08-11：detail 674 / 请求 1025 → 零封禁
+# 实测每条详情的请求数（08-29：302 次请求 / 200 条）。按条数换算日线要用它。
+REQUESTS_PER_DETAIL = 1.51
+
+
+@pytest.mark.parametrize("name", ["config.steady.yaml", "config.cities3.yaml"])
+def test_day_cap_stays_under_the_measured_ban_trigger(name):
+    """日常档的日线换算成详情条数后，必须低于已实测的封禁触发点。
+
+    2026-08-29 的事故：日线按**请求数**设成 1800，换算约 1200 条详情，
+    **高于**当天 1019 条就触发 code=36 的实际触发点 —— 这道闸根本没起作用
+    （触发时账本才用到 1148/1800，64%）。
+    单位选错的闸门不会报错，只会在你以为受保护的时候放行。
+
+    aggressive 档豁免：它的语义就是"跑到被封为止"的授权探测。
+    """
+    cfg = load_config(name)
+    details = cfg.max_requests_per_day / REQUESTS_PER_DETAIL
+    assert details < BAN_TRIGGERED_DETAILS, (
+        f"{name}: 日线 {cfg.max_requests_per_day} 次请求 ≈ {details:.0f} 条详情，"
+        f"已达/超过实测触发点 {BAN_TRIGGERED_DETAILS} 条。"
+        f"上限应 < {int(BAN_TRIGGERED_DETAILS * REQUESTS_PER_DETAIL)} 次请求")
+
+
+@pytest.mark.parametrize("name", ["config.steady.yaml", "config.cities3.yaml"])
+def test_day_cap_keeps_margin_below_verified_safe_value(name):
+    """还要留余量：只有 674 条详情是**验证过安全**的，1019 已知触发。
+
+    真实红线在两者之间且位置未知，所以日线不该贴着 674 跑 —— 那等于把
+    唯一已知的安全点当成安全线本身。
+    """
+    cfg = load_config(name)
+    details = cfg.max_requests_per_day / REQUESTS_PER_DETAIL
+    assert details <= VERIFIED_SAFE_DETAILS, (
+        f"{name}: 日线 ≈ {details:.0f} 条详情，超过已验证安全值 "
+        f"{VERIFIED_SAFE_DETAILS} 条 —— 进入了红线位置未知的区间")
+
+
 def test_backfill_details_reads_config_not_hardcoded():
     """回归：backfill_details 里不能再出现硬编码的 code37 阈值。
 
