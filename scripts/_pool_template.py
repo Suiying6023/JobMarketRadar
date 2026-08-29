@@ -58,13 +58,22 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
    整列就变宽、上下行对不齐，纵向扫标签的能力就没了 —— 而那正是分列的目的。
    标签本身也在导出侧压成了短词（门槛 ≤9 字、技术栈 ≤16 字），
    两侧一起保证列宽稳定。 */
-main{padding:10px 16px 64px;max-width:1560px;margin:0 auto}
+/* 不设 max-width：卡片自己靠 grid 定宽（见 .card），容器铺满窗口。
+   原先给容器设 1076px 会让卡片居中、左右各留 250px 空白，
+   而顶栏是全宽的 —— 两者对不齐，页面看起来像没铺开。 */
+main{padding:10px 16px 64px}
 /* 高度构成（实测）：两行内容 44px + 上下内边距 + 外边距。
-   标签列只占 21px 一行，不是撑高的原因。压内边距是唯一还能省的地方。 */
+   标签列只占 21px 一行，不是撑高的原因。压内边距是唯一还能省的地方。
+   ⚠️ 左列用 `minmax(0,560px)` 而**不是 1fr**：实测 1fr 会把剩余宽度全吃掉
+   （分到 1014px 而真实内容最宽只有 481px、中位仅 302px），在岗位列和标签列
+   之间留出 533px 空白，眼睛要横跨半个屏幕才能把一条岗位和它的标签对上。
+   上限 560 = 实测最宽内容 481 + 余量；minmax 让窄屏时还能压缩。
+   最后一列用 1fr 吸收富余宽度 —— 空白留在最右边（那里是页边距，
+   不影响阅读），而不是塞在两列之间。 */
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
   padding:6px 11px;margin-bottom:4px;transition:.12s;
-  display:grid;grid-template-columns:minmax(0,1fr) 340px 122px;
-  gap:14px;align-items:center}
+  display:grid;grid-template-columns:minmax(0,560px) 340px minmax(122px,1fr);
+  gap:16px;align-items:center}
 .card:hover{border-color:#3b4252}
 .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
 .card.done{opacity:.4}
@@ -100,14 +109,17 @@ main{padding:10px 16px 64px;max-width:1560px;margin:0 auto}
 .stale{text-decoration:line-through;opacity:.55}    /* 过期的活跃度 */
 
 /* ---- 右列：操作。**横排**——竖排会把每张卡撑到 76px 高，一屏只剩 8 条，
-   而卡片内容本身只有两行。按钮位置在每张卡上完全一致，横排同样能盲点。 ---- */
-.ops{display:flex;gap:4px;align-items:flex-start;justify-content:flex-end}
+   而卡片内容本身只有两行。按钮左对齐（不用 flex-end）：这一列会吸收富余宽度，
+   右对齐会让按钮随窗口宽度漂移，位置就不固定了，也就没法盲点。 ---- */
+.ops{display:flex;gap:4px;align-items:flex-start;justify-content:flex-start}
 .ops .btn{padding:2px 7px;font-size:11px}
 .btn.on{color:var(--ok);border-color:#1e4032;background:#0d2019}
 .btn.warn:hover{color:var(--bad);border-color:#4a2626;background:#2a1414}
-@media(max-width:1240px){
-  .card{grid-template-columns:minmax(0,1fr) 250px 118px}
-  .tag{max-width:120px}
+/* 窄屏时左列改成可压缩（minmax），否则 560px 定宽会溢出横向滚动 */
+@media(max-width:1100px){
+  main{max-width:none}
+  .card{grid-template-columns:minmax(0,1fr) 300px 118px;gap:12px}
+  .tag{max-width:130px}
 }
 @media(max-width:860px){
   .card{grid-template-columns:minmax(0,1fr) 118px}

@@ -179,11 +179,19 @@ def test_tech_tag_count_fits_one_line():
 
 
 def test_three_column_layout_with_ops_column():
-    """三列：岗位信息 | LLM 标签 | 操作。列宽写死，不让内容决定。"""
+    """三列：岗位信息 | LLM 标签 | 操作。
+
+    左列必须有**宽度上限**，不能用 1fr 独占剩余空间：实测 1fr 下左列分到
+    1014px，而真实内容最宽只有 481px、中位 302px —— 在岗位列和标签列之间
+    留出 533px 空白，眼睛要横跨半个屏幕才能把一条岗位和它的标签对上。
+    富余宽度要由**最后一列**吸收，空白留在最右边的页边距里。
+    """
     css = T.CSS
-    assert "grid-template-columns:minmax(0,1fr) 340px 122px" in css, \
-        "列宽必须固定 —— 用 auto/fr 会让长标签把整列撑宽，上下行对不齐"
+    assert "grid-template-columns:minmax(0,560px) 340px minmax(122px,1fr)" in css, \
+        "左列要设上限、末列吸收富余；标签列固定宽否则长标签会把它撑变形"
     assert ".ops{display:flex;gap:4px" in css, "操作按钮横排（竖排会把卡撑高一倍）"
+    # 容器不设 max-width：那会让卡片居中留白而顶栏全宽，两者对不齐
+    assert "main{padding:10px 16px 64px}" in css
     js = T.JS
     for act in ("jd", "ap", "dm"):
         assert f'data-act="{act}"' in js, f"缺少操作按钮 {act}"
