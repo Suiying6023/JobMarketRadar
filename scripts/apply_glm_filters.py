@@ -75,6 +75,34 @@ OUTSOURCING = ("外包岗位", "本岗位为外包", "岗位外包", "外包性�
                "派遣员工", "外派到", "派驻到", "外包到", "项目外包", "驻场开发")
 
 
+# LLM 的 match_reason 是自由文本，每条都不一样。原因分布必须按**门槛类型**
+# 归类，否则计数器退化成"每条一个桶"——实测 319 条降级打出 200 多行几乎不
+# 重复的输出，人无法从中看出「哪类门槛卡掉最多岗位」。顺序即优先级：
+# 先判具体门槛，「方向不符」放最后兜底（它的措辞最泛，会误吃前面几类）。
+LLM_REASON_PATTERNS = (
+    ("经验年限", re.compile(r"\d\s*年(以上|及以上|以上工作|经验)|至少\s*\d\s*年"
+                            r"|\d\s*年.{0,4}经验|工龄|正式工作经验")),
+    ("届别限制", re.compile(r"不招应届|非应届|不考虑应届|暂不.{0,4}应届"
+                            r"|20\d\d\s*届|应届出口")),
+    ("名校门槛", re.compile(r"985|211|双一流|名校|知名院校|重点高校|海外知名|QS")),
+    ("硕士以上", re.compile(r"硕士|研究生|博士")),
+    ("非双休", re.compile(r"大小周|单休|做六休一|月休|996|轮休")),
+    ("外包驻场", re.compile(r"外包|外派|驻场|派遣|驻地")),
+    ("英语/职称", re.compile(r"英语|四级|六级|职称|中级或副高")),
+    ("JD信息不足", re.compile(r"信息不足|信息极度不足|不完整|无法判断")),
+    ("方向不符", re.compile(r"不符合|不属于|非.{0,6}(开发|编程)岗|范畴|匹配度"
+                            r"|销售|运营|教学|讲师|培训|运维|标注")),
+)
+
+
+def llm_reason_bucket(reason: str) -> str:
+    """把一段 match_reason 归到有限的门槛类别，用于原因分布统计。"""
+    for label, pat in LLM_REASON_PATTERNS:
+        if pat.search(reason):
+            return f"LLM:{label}"
+    return "LLM:其他"
+
+
 def classify(r) -> tuple[str, str]:
     """返回 (是否降级 yes/no, 原因)。
 
@@ -92,8 +120,7 @@ def classify(r) -> tuple[str, str]:
     match = str(g.get("match") or "").strip().lower()
     if match:
         if match == "demote":
-            reason = str(g.get("match_reason") or "LLM判定降级")
-            return "yes", f"LLM:{reason[:40]}"
+            return "yes", llm_reason_bucket(str(g.get("match_reason") or ""))
         return "no", ""
 
     # ---- 未 LLM 判断的岗位：关键词规则兜底 ----
@@ -184,8 +211,10 @@ def main() -> None:
             reason_counter[reason] = reason_counter.get(reason, 0) + 1
 
     print(f"active 岗位: {len(rows)}")
-    print(f"将降级: {len(to_demote)} 条")
-    print("原因分布:", reason_counter)
+    print(f"将降级: {len(to_demote)} 条（保留 {len(rows) - len(to_demote)}）")
+    print("\n原因分布:")
+    for why, n in sorted(reason_counter.items(), key=lambda kv: -kv[1]):
+        print(f"  {why:22} {n:4}  {n / max(len(to_demote), 1):5.1%}")
     print("\n样例:")
     for cid, title in to_demote[:10]:
         print(f"  {title[:36]}")
