@@ -26,12 +26,28 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from job_radar.collectors.boss import SEARCH_BASE, BossCollector, RiskControlStop  # noqa: E402
 from job_radar.config import load_config  # noqa: E402
+from job_radar import profile  # noqa: E402
 from job_radar.exit_guard import assert_home_exit  # noqa: E402
 from job_radar.models import JobRecord, SearchFilters  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
 # 投递池判定的唯一实现。这里复用它而不是另写一套，否则两份阈值会各自漂移。
 from clean_local_db import should_demote  # noqa: E402
+
+
+def _ai_skill_hits(row) -> int:
+    """列表接口 `skills` 里命中了几个 AI 技术词。用于抓取优先级，不用于筛选。
+
+    `skills` 是列表阶段就给的结构化技能词（短词、比 LLM 从 JD 抽的更干净），
+    实测它是**唯一在列表阶段对最终判定有预测力的字段**：命中数越多 keep 率越高
+    （0→65.2%、1→71.4%、2→74.3%、3+→80.3%）。其余列表字段
+    （jobExperience/jobDegree/brandScaleName/jobLabels/welfareList）都无区分度。
+    """
+    try:
+        skills = {str(s).lower() for s in (json.loads(row["raw_json"] or "{}").get("skills") or [])}
+    except (json.JSONDecodeError, TypeError, AttributeError, IndexError, KeyError):
+        return 0
+    return sum(1 for k in profile.AI_TECH if any(k.lower() in s for s in skills))
 
 
 def _row_to_job(row) -> JobRecord:
@@ -115,7 +131,7 @@ async def main() -> None:
         # （那个只在列表阶段跑，而这里直接读库）。实测 5054 条待补详情里
         # 2167 条注定被 clean_local_db 降级（匿名公司 856、薪资超纲 2368，
         # 两者重叠 743）—— 一条详情一次请求，全跑完等于白花 120% 的日线额度。
-        rows = []
+        eligible = []
         skipped: dict[str, int] = {}
         for r in candidates:
             demote, why = should_demote(r)
@@ -123,15 +139,24 @@ async def main() -> None:
                 key = why.split("(")[0].split("[")[0]
                 skipped[key] = skipped.get(key, 0) + 1
                 continue
-            rows.append(r)
-            if len(rows) >= args.limit:
-                break
+            eligible.append(r)
 
         if skipped:
             total_skipped = sum(skipped.values())
             print(f"跳过注定降级 {total_skipped} 条（省下同样次数的请求）："
                   f"{dict(sorted(skipped.items(), key=lambda kv: -kv[1]))}")
-        print(f"待补详情：{len(rows)} 条")
+
+        # 按列表 `skills` 里的 AI 技术词命中数降序抓。
+        # **这不是筛选，没有岗位被丢弃**，只是配额有限时让高命中率的先抓：
+        # 实测 689 条已判定样本里，按命中数分组的 keep 率是
+        # 0 个 65.2% / 1 个 71.4% / 2 个 74.3% / 3+ 个 80.3%，
+        # 取命中数最高的前 30% 其 keep 率 84.0%（不排序是 69.7%）。
+        # 之所以只能"排序"而不能"拦掉"：命中 0 个的那组 keep 率仍有 65.2%，
+        # 拦掉会丢掉大量好岗位——列表字段的预测力够排序，不够当门槛。
+        eligible.sort(key=lambda r: -_ai_skill_hits(r))
+        rows = eligible[: args.limit]
+        print(f"待补详情：{len(rows)} 条（共 {len(eligible)} 条合格，"
+              f"按列表 skills 的 AI 技术词命中数优先）")
         if not rows:
             return
 

@@ -96,6 +96,32 @@ def test_rechecks_each_row_immediately_before_spending_the_request():
     assert "WHERE canonical_id = ?" in src
 
 
+def test_ai_skill_hits_counts_list_stage_skills():
+    """按列表 `skills` 的 AI 技术词命中数排序 —— 那是唯一有预测力的列表字段。"""
+    many = row(raw_json='{"skills": ["Python", "LangChain", "RAG", "Agent"]}')
+    one = row(raw_json='{"skills": ["Python"]}')
+    none = row(raw_json='{"skills": ["Java", "Spring"]}')
+    assert B._ai_skill_hits(many) > B._ai_skill_hits(one) > B._ai_skill_hits(none)
+    # 坏 raw_json 不能让整轮崩掉，返回 0 即可
+    assert B._ai_skill_hits(row(raw_json="not json")) == 0
+    assert B._ai_skill_hits(row(raw_json="")) == 0
+
+
+def test_skill_hits_prioritizes_but_never_filters():
+    """低命中的岗位必须仍然入选，只是排在后面。
+
+    实测命中 0 个的那组 keep 率仍有 65.2%（整体 69.7%），拦掉会丢大量好岗位 ——
+    **列表字段的预测力够排序，不够当门槛**。这条边界很容易在后续"优化"里被
+    误改成过滤，所以钉死：排序键只影响顺序，合格集合的大小不受它影响。
+    """
+    src = (Path(__file__).resolve().parent.parent
+           / "scripts" / "backfill_details.py").read_text(encoding="utf-8")
+    # 合格集先建好，再排序，再截 limit —— 而不是在循环里按命中数 continue
+    assert "eligible.sort(key=lambda r: -_ai_skill_hits(r))" in src
+    assert "_ai_skill_hits" not in src.split("eligible.append(r)")[0].split("for r in candidates")[-1], \
+        "命中数不该参与合格判定，只该参与排序"
+
+
 def test_skips_rows_another_process_already_filled():
     """别的进程已补上 JD 的行要跳过，不重复花配额。
 
