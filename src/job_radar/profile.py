@@ -51,16 +51,28 @@ def city_score(city: str) -> float:
 # ---------- 经验 / 学历 ----------
 # 注意：这里是 **列表接口返回值**（DB 的 experience 字段），不是 BOSS 搜索参数码。
 # 搜索参数写「应届生」，接口返回「在校/应届」——analyze_local_filter.py 曾用错值。
-ALLOW_EXP = {"在校/应届", "经验不限", "1年以内", "1-3年"}
+# ⚠️ 但接口**有时也直接返回「应届生」**（2026-08-29 实测库里有 1 条）。
+# 漏掉它的后果是语义完全反了：「应届生」恰恰是最该保留的值，却被判「经验不符」降级。
+# 这类白名单漏值不会报错，只会安静地降掉最对口的岗位。
+ALLOW_EXP = {"在校/应届", "应届生", "经验不限", "1年以内", "1-3年"}
 ALLOW_DEG = {"本科", "大专", "学历不限", "中专/中技", "高中", "初中及以下"}
 
-# ---------- 薪资（单位 K，均按 12 薪折算后的月均口径比较） ----------
+# ---------- 薪资（单位 K） ----------
 # 门槛按**薪资区间均值**判，不按起薪：起薪只是区间下沿，平台标的范围是给所有
 # 候选人的，卡起薪会把「12-30K」这类实际可投的岗位一并剔掉。
-SALARY_DROP_MID_ABOVE = 25.0   # 区间均值超此值 → 超出可达范围，降级
-SALARY_LOW_MID_MAX = 7.0       # 中点 ≤ 此值 → 低薪页单列
-SALARY_HIGH_MID_MIN = 15.0     # 中点 > 此值 → 高薪页单列
-DAILY_MARKERS = ("元/天", "元/日")   # 日薪 = 实习岗
+#
+# ⚠️ **门槛与排序用不同口径，这是刻意的**（2026-08-29 修）：
+# · 排序/分桶用 12 薪折算（`salary_mid`）—— `15-25K·15薪` 的年薪确实高于
+#   `18-28K·12薪`，忽略月数会把前者当低薪。
+# · **门槛用月基薪**（`salary_raw_mid`）—— "够不着"看的是月薪能不能谈到，
+#   年终奖倍数不改变门槛。
+# 混用的后果实测过：折算把 **475 条** raw≤25 的推过 25 门槛、**反向 0 条**
+# （单向抬升），其中 267 条"超纲"是唯一降级理由。典型是 `15-30K·14薪`
+# （raw 22.5 → 26.2）和 `12-15K·24薪`（raw 13.5 → 27.0）—— 月基薪 12-18K
+# 的岗位因为年终奖厚被判"超出可达范围"，而标题里明写着"26届可投""经验不限"。
+SALARY_DROP_MID_ABOVE = 25.0   # **月基薪**区间均值超此值 → 超出可达范围，降级
+SALARY_LOW_MID_MAX = 7.0       # 中点 ≤ 此值 → 低薪页单列（12 薪折算口径）
+SALARY_HIGH_MID_MIN = 15.0     # 中点 > 此值 → 高薪页单列（12 薪折算口径）
 
 # ---------- 活跃度分档（天） ----------
 ACTIVE_P0_MAX_DAYS = 3         # ≤3 天 → P0 优先；None（平台未给）→ P1 待确认；其余 → P2 冷池
@@ -191,8 +203,18 @@ def risk_cutoff_date(today: date | None = None) -> str:
     return (today - timedelta(days=RISK_MIN_AGE_MONTHS * 30)).isoformat()
 
 
-def is_daily_salary(salary_text: str) -> bool:
-    return any(m in (salary_text or "") for m in DAILY_MARKERS)
+def is_daily_salary(min_k, max_k) -> bool:
+    """是否日薪（实习岗）。
+
+    ⚠️ 原先靠 `salary_text` 里的「元/天」「元/日」判，**全库命中 0 条**：
+    `salary_text` 只有 `N-NK` 和 `N-NK·N薪` 两种形态，没有一条含天或日
+    （2026-08-29 实测 8109 条）。那是一段死代码，而且它写在两层里，
+    看起来像"有在防"实则从未生效。
+    日薪岗在这个库里是以 `3-4K` 这种月薪区间表达的，所以改判数值特征。
+    """
+    if min_k is None or max_k is None:
+        return False
+    return max_k < 1.0
 
 
 def salary_mid(min_k, max_k, months=None) -> float | None:
@@ -206,9 +228,24 @@ def salary_mid(min_k, max_k, months=None) -> float | None:
     return (min_k + max_k) / 2 * (months or 12) / 12
 
 
+def salary_raw_mid(min_k, max_k) -> float | None:
+    """**月基薪**区间均值（K/月），不折算 salary_months。缺值返回 None。
+
+    专供门槛判定。与 `salary_mid`（12 薪折算，供排序分桶）刻意分开 ——
+    见上方 SALARY_DROP_MID_ABOVE 的注释。
+    """
+    if min_k is None or max_k is None:
+        return None
+    return (min_k + max_k) / 2
+
+
 def salary_out_of_range(min_k, max_k, months=None) -> bool:
-    """薪资是否超出可达范围（按区间均值判，不按起薪）。"""
-    mid = salary_mid(min_k, max_k, months)
+    """薪资是否超出可达范围。按**月基薪**区间均值判，不按起薪、不折算月数。
+
+    `months` 保留在签名里只为兼容既有调用点，**刻意不使用** ——
+    年终奖倍数不改变"月薪能不能谈到"这件事。
+    """
+    mid = salary_raw_mid(min_k, max_k)
     return mid is not None and mid > SALARY_DROP_MID_ABOVE
 
 

@@ -412,6 +412,11 @@ def hard_drop(r) -> str:
     kw = P.match_keyword(r["title"] or "", P.EXCLUDE_TITLE)
     if kw:
         return f"标题[{kw}]"
+    # OD 按词边界判（不能进 EXCLUDE_TITLE 的裸子串表，会吃掉 Coding）。
+    # 这里必须有：超纲桶是直接从 sample 读的，只过 hard_drop 不过 should_demote，
+    # 所以画像层刚降的 OD 岗会从超纲页绕回页面（实测漏回 3 条华为 OD）。
+    if P.outsourced_od(r["title"] or ""):
+        return "外包[OD]"
     kw = P.match_keyword(r["company_name"] or "", P.EXCLUDE_COMPANY)
     if kw:
         return f"公司[{kw}]"
@@ -419,7 +424,7 @@ def hard_drop(r) -> str:
         return "CV/图像算法"
     if is_future_cohort(r):
         return "未来届"
-    if P.is_daily_salary(r["salary_text"] or ""):
+    if P.is_daily_salary(r["salary_min_k"], r["salary_max_k"]):
         return "日薪(实习)"
     return ""
 
@@ -586,10 +591,9 @@ def main() -> None:
         f"SELECT j.*, a.applied_at, a.note FROM jobs j {JOIN_ACTIONS}"
         "WHERE j.retention_status='sample' AND j.bookmarked=0 "
         "AND j.job_description != '' AND j.job_invalid = 0 "
-        # 与 P.salary_out_of_range 同口径：按区间均值折算 12 薪，不按起薪
+        # 与 P.salary_out_of_range 同口径：**月基薪**均值，不折算 salary_months
         "AND j.salary_min_k IS NOT NULL AND j.salary_max_k IS NOT NULL "
-        "AND (j.salary_min_k + j.salary_max_k) / 2.0 "
-        "    * COALESCE(j.salary_months, 12) / 12 > ?",
+        "AND (j.salary_min_k + j.salary_max_k) / 2.0 > ?",
         (P.SALARY_DROP_MID_ABOVE,),
     ).fetchall()
 

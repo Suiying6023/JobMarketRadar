@@ -57,7 +57,7 @@ def should_demote(r) -> tuple[bool, str]:
     if P.salary_out_of_range(r["salary_min_k"], r["salary_max_k"], r["salary_months"]):
         mid = P.salary_mid(r["salary_min_k"], r["salary_max_k"], r["salary_months"])
         return True, f"超纲(均值{mid:.0f}K)"
-    if P.is_daily_salary(r["salary_text"] or ""):
+    if P.is_daily_salary(r["salary_min_k"], r["salary_max_k"]):
         return True, "日薪(实习)"
     exp = r["experience"] or ""
     if exp not in P.ALLOW_EXP:

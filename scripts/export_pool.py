@@ -286,9 +286,11 @@ def collect() -> tuple[list[dict], dict]:
         f"SELECT j.*, a.applied_at, a.note FROM jobs j {JOIN_ACTIONS}"
         "WHERE j.retention_status='sample' AND j.bookmarked=0 "
         "AND j.job_description != '' AND j.job_invalid = 0 "
+        # 与 P.salary_out_of_range 同口径：**月基薪**均值，不折算 salary_months。
+        # 折算过的口径会把 `15-30K·14薪`（月基薪 22.5K）算成 26.2K 判超纲 ——
+        # 而"够不着"看的是月薪能不能谈到，年终奖倍数不改变门槛。
         "AND j.salary_min_k IS NOT NULL AND j.salary_max_k IS NOT NULL "
-        "AND (j.salary_min_k + j.salary_max_k) / 2.0 "
-        "    * COALESCE(j.salary_months, 12) / 12 > ?",
+        "AND (j.salary_min_k + j.salary_max_k) / 2.0 > ?",
         (P.SALARY_DROP_MID_ABOVE,),
     ).fetchall()
     con.close()

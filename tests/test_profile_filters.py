@@ -168,10 +168,58 @@ def test_salary_threshold_uses_mid_not_min():
     """按起薪判会把「22-28K」这类实际可投的岗位剔掉，按均值才符合口径。"""
     # 起薪 22K 超旧的 20K 线，但均值 25K 不超新线 → 应保留
     assert P.salary_out_of_range(22.0, 28.0) is False
-    # 起薪 20K 不超旧线，但 ·14薪 折算后均值 26.2K 超新线 → 应剔除
-    assert P.salary_out_of_range(20.0, 25.0, 14) is True
+    # 均值 27.5K 超线 → 应剔除
+    assert P.salary_out_of_range(25.0, 30.0) is True
     # 缺值不判超纲（不能因为平台没给薪资就丢掉）
     assert P.salary_out_of_range(None, None) is False
+
+
+def test_salary_threshold_ignores_extra_months():
+    """⚠️ 门槛用**月基薪**，不折算 salary_months —— 与排序口径刻意不同。
+
+    "够不着"看的是月薪 offer 能不能谈到，年终奖倍数不改变这件事。
+    实测（2026-08-29）混用的代价：折算把 **475 条** raw≤25 的推过门槛、
+    **反向 0 条**（单向抬升），其中 267 条"超纲"是唯一降级理由。
+    典型受害者标题里明写着"26届可投""经验不限"：
+      `15-30K·14薪` 月基薪 22.5K → 折算 26.2K 被判超纲
+      `12-15K·24薪` 月基薪 13.5K → 折算 27.0K 被判超纲
+    """
+    # 月基薪 22.5K 不超线，14 薪也不该让它超
+    assert P.salary_out_of_range(15.0, 30.0, 14) is False
+    # 极端倍数：月基薪 13.5K，24 薪折算 27K —— 仍不该判超纲
+    assert P.salary_out_of_range(12.0, 15.0, 24) is False
+    # months 参数在签名里但不生效，传什么都一样
+    assert (P.salary_out_of_range(20.0, 25.0, 12)
+            == P.salary_out_of_range(20.0, 25.0, 16))
+
+
+def test_ranking_still_folds_in_extra_months():
+    """排序/分桶口径保持折算 —— 两个口径必须都在，别为了统一而砍掉一个。"""
+    assert P.salary_mid(15.0, 30.0, 14) > P.salary_raw_mid(15.0, 30.0)
+    assert P.salary_raw_mid(15.0, 30.0) == 22.5
+    assert P.salary_raw_mid(None, 20.0) is None
+
+
+def test_fresh_grad_experience_value_is_allowed():
+    """接口有时直接返回「应届生」而非「在校/应届」，漏掉它语义就反了。
+
+    实测库里 5 种 experience 取值：1-3年 / 经验不限 / 1年以内 / 在校/应届 / 应届生。
+    最后一个原先不在白名单，会被判「经验不符」降级 —— 而它恰恰最该保留。
+    """
+    for v in ("应届生", "在校/应届", "经验不限", "1年以内", "1-3年"):
+        assert v in P.ALLOW_EXP, f"{v!r} 该在经验白名单里"
+
+
+def test_daily_salary_is_detected_by_value_not_text():
+    """日薪判据改看数值：`salary_text` 里从来没有「元/天」。
+
+    实测全库 8109 条 salary_text 只有 `N-NK` 和 `N-NK·N薪` 两种形态，
+    含「天」或「日」的 **0 条** —— 原来那条判据是死代码，
+    而且写在两层里，看着像"有在防"实则从未生效。
+    """
+    assert P.is_daily_salary(0.3, 0.5) is True      # 300-500 元/天
+    assert P.is_daily_salary(3.0, 4.0) is False     # 3-4K 月薪，低但不是日薪
+    assert P.is_daily_salary(None, None) is False
 
 
 def test_salary_mid_folds_in_extra_months():
@@ -182,9 +230,17 @@ def test_salary_mid_folds_in_extra_months():
 
 
 def test_over_bucket_is_evaluated_before_high():
-    """超纲必须先判，否则超上限的岗位会先落进高薪页，与副标题口径矛盾。"""
-    assert E.salary_bucket(row(salary_min_k=20.0, salary_max_k=25.0,
-                               salary_months=14)) == "over"
+    """超纲必须先判，否则超上限的岗位会先落进高薪页，与副标题口径矛盾。
+
+    用例要挑一个**月基薪**就超线的（均值 27.5K > 25K）：门槛口径已改成不折算
+    月数，原先靠 `·14薪` 把 22.5K 抬到 26.2K 的写法测的是那个已被否决的口径。
+    这条测试守的是**判定顺序**，不是薪资换算 —— 换算由
+    test_salary_threshold_ignores_extra_months 守。
+    """
+    b = E.salary_bucket(row(salary_min_k=25.0, salary_max_k=30.0))
+    assert b == "over", f"月基薪均值 27.5K 应判 over，实际 {b}"
+    # 同一条若只看 high 的条件（mid > 15）也成立，所以顺序错了就会返回 high
+    assert E.salary_mid(row(salary_min_k=25.0, salary_max_k=30.0)) > 15.0
 
 
 # ---------- 数据时效 ----------
@@ -309,8 +365,21 @@ def test_hard_drop_catches_what_previously_leaked_into_p0():
     assert E.hard_drop(row(job_status_desc="职位已关闭")) == "已关闭"
     assert E.hard_drop(row(city="成都")).startswith("非目标城市")
     assert E.hard_drop(row(recruiter_title="猎头顾问")) == "猎头发布"
-    assert E.hard_drop(row(salary_text="200元/天")) == "日薪(实习)"
+    # 日薪按**数值**判，不按文案：salary_text 里从来没有「元/天」（全库 0 条）
+    assert E.hard_drop(row(salary_min_k=0.2, salary_max_k=0.3)) == "日薪(实习)"
     assert E.hard_drop(row()) == ""
+
+
+def test_hard_drop_also_catches_od_so_the_over_bucket_cannot_leak_it():
+    """超纲桶直接从 sample 读、只过 hard_drop —— 它漏什么就会绕回页面。
+
+    实测（2026-08-29）：`should_demote` 加了 OD 判定后，3 条华为 OD 岗
+    仍从超纲页回到了页面，因为 hard_drop 这一层没查。
+    两层规则集不对称本身就是漂移源。
+    """
+    assert E.hard_drop(row(title="AI agent/java开发工程师-OD招聘")) == "外包[OD]"
+    # 词边界：Coding 不能被吃掉（这是 OD 规则的全部难点）
+    assert E.hard_drop(row(title="AI Coding Agent 研发工程师")) == ""
 
 
 def test_whitelisted_cities_pass_hard_drop():
