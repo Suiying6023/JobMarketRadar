@@ -46,11 +46,21 @@ def main() -> None:
         left = max(0, cap - used)
 
         print(f"日期 {day}（本地）")
+        print(f"采集链路（带账号 cookie / 家宽直连）")
         print(f"{'':2}已用 {used} / 上限 {cap}  →  余量 {left}")
         if counts:
             for kind, n in sorted(counts.items()):
-                if kind != "total":
+                if kind != "total" and kind in JobStore.COLLECT_KINDS:
                     print(f"{'':4}{kind:16s} {n}")
+
+        # 刷新链路是另一条独立日线（免登录 + 波尔出口），不占采集额度。
+        # 单列出来，免得看账本时把两条线加在一起自己吓自己。
+        other = {k: n for k, n in counts.items()
+                 if k != "total" and k not in JobStore.COLLECT_KINDS}
+        if other:
+            print(f"状态刷新链路（免登录 / 波尔出口，独立日线，不占上方额度）")
+            for kind, n in sorted(other.items()):
+                print(f"{'':4}{kind:16s} {n}")
 
         # 风控事件（真封禁 vs 可恢复，混在一起看会误判严重度）
         rows = store.conn.execute(

@@ -1,12 +1,13 @@
 """抽取结果校验的判据（`scripts/extract_glm_tags.py` 的 validate_tags）。
 
-为什么值得钉测试：阶跃只提供 `json_object`，**不保证字段齐全或枚举合法**，
+为什么值得钉测试：`json_object` 只保证是合法 JSON，**不保证字段齐全或枚举合法**，
 "能 json.loads"不等于"能用"。而最容易被当成无害而放宽的就是
 「match_reason 为空」—— 它恰恰是漏判的特征信号，见下面 test_empty_reason_* 的注释。
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -127,3 +128,57 @@ def test_prompt_still_lists_all_exclusions():
         assert f"{n}." in SYSTEM_PROMPT or f"  {n}." in SYSTEM_PROMPT
     for kw in ("不招应届", "985", "硕士", "双休", "外包", "电销"):
         assert kw in SYSTEM_PROMPT
+
+
+# ---------- 值内裸引号：唯一实测到的 JSON 解析失败原因 ----------
+
+def test_lenient_json_repairs_unescaped_inner_quotes():
+    """模型逐字摘录 JD 时会吐出值内裸引号，截断字符串导致整条解析失败。
+
+    实测三次抽样全是这个原因，而且**判定内容本身是对的** —— 直接丢掉重试
+    既浪费一次调用，也未必好转（JD 里的引号还在）。所以修好再用。
+    """
+    broken = ('{"match_evidence":"1年以上音视频测试经验。",'
+              '"match_reason":"JD硬性要求"1年以上音视频测试经验"，命中第1条。",'
+              '"match":"demote"}')
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(broken)
+    parsed = _mod._loads_lenient(broken)
+    assert parsed["match"] == "demote"
+    assert "1年以上" in parsed["match_reason"]
+
+
+@pytest.mark.parametrize("payload,expect", [
+    ('{"r":"正常文本","match":"keep"}', "keep"),
+    ('{"r":"写了"2 年及以上"和"本科"","match":"demote"}', "demote"),
+    (r'{"r":"已正确转义的\"引号\"","match":"keep"}', "keep"),
+    ('{"r":"中文引号「2年以上」不受影响","match":"keep"}', "keep"),
+])
+def test_lenient_json_preserves_valid_payloads(payload, expect):
+    """修复逻辑不能破坏本来就合法的 JSON（含已正确转义的引号）。"""
+    assert _mod._loads_lenient(payload)["match"] == expect
+
+
+def test_prompt_asks_for_chinese_quotes():
+    """双管齐下：解析层能修，也要让模型少产生这种输出。"""
+    assert "「」" in SYSTEM_PROMPT
+    assert "不要用英文双引号" in SYSTEM_PROMPT
+
+
+def test_prompt_treats_year_requirement_as_default_hit():
+    """经验年限必须是「默认命中、有出口才放过」。
+
+    反过来写（"无应届出口时才命中"）会被模型读成"没写不招应届就是有出口"，
+    而绝大多数 JD 都不会专门写那句 —— 实测这样改完，20 条本已判对的
+    掉了 2 条。这个方向性表述必须钉住。
+    """
+    assert "默认命中" in SYSTEM_PROMPT
+    assert "不是**出口" in SYSTEM_PROMPT or "不是出口" in SYSTEM_PROMPT
+
+
+def test_prompt_does_not_treat_regular_bachelor_as_gate():
+    """求职者是统招全日制本科（双非），这类要求他满足，不能当排除项。"""
+    assert "统招本科" in SYSTEM_PROMPT and "全日制本科" in SYSTEM_PROMPT
+    idx = SYSTEM_PROMPT.find("统招本科")
+    around = SYSTEM_PROMPT[max(0, idx - 200):idx + 200]
+    assert "不是" in around or "满足" in around

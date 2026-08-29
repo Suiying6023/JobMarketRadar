@@ -156,6 +156,44 @@ def test_request_counts_scoped_to_day(store):
     assert store.request_counts("2000-01-01")["detail"] == 1
 
 
+def test_total_excludes_refresh_chain(store):
+    """`total` 只算采集链路，不含状态刷新链路的 detail_page。
+
+    两条链路是不同登录态（带 cookie vs 免登录）+ 不同出口（家宽 vs 波尔机房 IP），
+    风控按「IP + 账号信任度」判，各自独立记账。合并计数时刷 100 条状态
+    （1400 次 detail_page）就能把采集侧日线 1000 顶满，而那些请求从未经过
+    采集账号或家宽 IP。
+    """
+    store.log_request("list", script="expand_list")
+    store.log_request("detail", script="backfill_details")
+    store.log_request("security_check", script="backfill_details")
+    for _ in range(14):
+        store.log_request("detail_page", script="refresh_status_loop")
+
+    counts = store.request_counts()
+    assert counts["total"] == 3, "detail_page 不该计入采集链路日线"
+    assert counts["detail_page"] == 14, "刷新链路的量仍要可见，只是不参与 total"
+
+
+def test_daily_budget_ignores_refresh_chain(store):
+    """采集侧的日线拦截不该被刷新链路的量触发。"""
+    page = FakePage(body={"code": 0, "zpData": {}})
+    collector = make_collector(page)
+    collector.ledger = store
+    collector.config.max_requests_per_day = 5
+
+    for _ in range(50):
+        store.log_request("detail_page", script="refresh_status_loop")
+
+    # 50 次刷新请求远超日线 5，但采集链路今天还没发过任何请求 → 不该被拦。
+    collector._check_daily_budget()
+
+    for _ in range(5):
+        store.log_request("detail", script="backfill_details")
+    with pytest.raises(RiskControlStop):
+        collector._check_daily_budget()
+
+
 def test_collect_reraises_risk_control_stop():
     """collect() 里的 `except Exception` 曾吞掉 RiskControlStop（它继承 RuntimeError），
     真封禁时循环还在往下抓，持续撞墙加重惩罚。必须原样上抛。"""

@@ -3,7 +3,7 @@
 输出：
 1. 数据总览（分层/补全状态）
 2. 投递池画像（active）：区域/薪资/规模/融资/行业/活跃度
-3. GLM 标签聚合：job_type / 技术栈 / 经验要求 / 学历院校 / 其他门槛
+3. LLM 标签聚合：job_type / 技术栈 / 经验要求 / 学历院校 / 其他门槛
 4. 值得投递的高价值岗位（薪资×活跃度×岗位类型）
 
 用法: python scripts/analyze_jobs.py
@@ -70,8 +70,8 @@ def main() -> None:
     # 活跃度
     print(f"  活跃度: {dict(Counter(r['recruiter_active_status'] or '(空)' for r in rows).most_common(6))}")
 
-    # 3. GLM 标签聚合
-    print("\n[GLM 标签聚合]")
+    # 3. LLM 标签聚合
+    print("\n[LLM 标签聚合]")
     jt = Counter((json.loads(r["glm_tags_json"] or "{}").get("job_type", "?")) for r in rows)
     print(f"  job_type: {dict(jt.most_common())}")
 

@@ -70,3 +70,34 @@ def test_cities3_actually_has_three_cities():
     assert names == ["杭州", "上海", "深圳"]
     assert all(c.boss_code for c in cfg.cities), "城市码未自动补全"
     assert len({c.boss_code for c in cfg.cities}) == 3, "城市码重复"
+
+
+@pytest.mark.parametrize("name", CONFIGS)
+def test_pages_per_keyword_keys_exist_in_keywords(name):
+    """按词翻页深度的 key 必须真的在 keywords 里。
+
+    拼写不一致（半角/全角、大小写、多余空格）不会报错，只会让那条覆盖
+    静默失效 —— 配了 `AI agent: 2` 而列表里是 `AI Agent`，结果它照旧翻满
+    默认页数，而日志里看不出任何异常。所以在配置加载阶段就拦。
+    """
+    cfg = load_config(name)
+    unknown = set(cfg.pages_per_keyword) - set(cfg.keywords)
+    assert not unknown, f"{name}: pages_per_keyword 有未知关键词 {unknown}"
+
+
+def test_pages_for_falls_back_to_default():
+    cfg = load_config("config.cities3.yaml")
+    assert cfg.pages_for("python") == 15, "高对口率词应深翻"
+    assert cfg.pages_for("AI Agent") == 2, "低对口率词应浅翻"
+    assert cfg.pages_for("MCP") == cfg.pages_per_query, "未配置的词走默认"
+    assert cfg.pages_for("不存在的词") == cfg.pages_per_query
+
+
+def test_per_keyword_depth_costs_less_than_uniform_deep():
+    """分词深度的意义是把配额从低对口词挪给高对口词，总量还要更省。"""
+    cfg = load_config("config.cities3.yaml")
+    per_kw = sum(cfg.pages_for(k) for k in cfg.keywords)
+    uniform_deep = len(cfg.keywords) * 10
+    assert per_kw < uniform_deep, "分词后总页数应低于统一深翻"
+    # 高对口词拿到的深度必须严格大于低对口词
+    assert cfg.pages_for("python") > cfg.pages_for("AI产品经理")

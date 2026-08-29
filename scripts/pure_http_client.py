@@ -32,8 +32,9 @@ sys.path.insert(0, str(ROOT / "src"))
 ORIGIN = "https://www.zhipin.com"
 DETAIL_PATH = "/wapi/zpgeek/job/detail.json"
 
-RISK_TEXTS = ("访问频繁", "安全校验", "环境存在异常", "账户存在异常",
-              "操作过于频繁", "操作太频繁", "滑块")
+from job_radar.collectors.boss import RISK_TEXTS  # noqa: E402
+
+# ⚠️ 本地副本已删（原先含「安全校验」，正常 JD 里的「数据安全校验」会命中它）。
 
 
 def load_cookie_jar(manual_file: str | None) -> dict[str, str]:

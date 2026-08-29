@@ -10,7 +10,7 @@
 3. **可中断可续跑**：所有状态在 DB 里，Ctrl+C 或断电后重跑就是续跑，不需要 resume 文件
 4. **顺序按"每次请求的价值"排**：列表最便宜且产出新岗位 → active 补详情（投递池
    直接受益）→ sample 补详情（只为样本，最后做）
-5. **零请求阶段不受预算约束**：阶跃标签提取、工商富化、导出都不碰 BOSS，随时可跑
+5. **零请求阶段不受预算约束**：LLM 标签提取、工商富化、导出都不碰 BOSS，随时可跑
 
 用法：
     python scripts/daily_cycle.py                  # 完整一轮
@@ -133,7 +133,9 @@ def main() -> None:
     p.add_argument("--config", default="config.hangzhou.yaml")
     p.add_argument("--reserve", type=float, default=0.15,
                    help="预留额度比例，默认 0.15（不把日线跑满）")
-    p.add_argument("--pages", type=int, default=5, help="列表每词页数")
+    p.add_argument("--pages", type=int, default=0,
+                   help="列表每词页数。0（默认）= 按配置的 pages_per_keyword "
+                        "/ pages_per_query 分词决定；给数值则统一覆盖")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--skip", action="append", default=[],
                    choices=["list", "active", "sample", "tags", "company", "export"],
@@ -158,14 +160,20 @@ def main() -> None:
 
     # ---- 阶段 1：列表扩充（最便宜，产出新岗位）----
     if "list" not in args.skip:
-        est = len(cfg.keywords) * args.pages
+        # 预估按每个词各自的深度求和（配了 pages_per_keyword 时各词不同），
+        # 乘城市数——expand_list 遍历全部城市，只算一城会低估数倍。
+        per_kw = [args.pages or cfg.pages_for(kw) for kw in cfg.keywords]
+        est = sum(per_kw) * len(cfg.cities)
         if left < est * 0.4:
             log(f"⏭️  跳过列表：预估 {est} 次，剩余 {left} 不足")
         else:
-            log(f"▶ 阶段1 列表扩充（{len(cfg.keywords)} 词 × {args.pages} 页，"
-                f"预估 ≤{est} 次；深翻靠 --dry-stop 提前收尾）")
+            depth = (f"统一 {args.pages} 页" if args.pages
+                     else f"按词 {min(per_kw)}-{max(per_kw)} 页")
+            log(f"▶ 阶段1 列表扩充（{len(cfg.keywords)} 词 × {len(cfg.cities)} 城，"
+                f"{depth}，预估 ≤{est} 次；深翻靠 --dry-stop 提前收尾）")
             if not args.dry_run:
                 before_new = new_jobs_today(cfg)
+                # --pages 0 = 让 expand_list 自己按词读配置
                 run("expand_list.py", "--config", args.config,
                     "--pages", str(args.pages))
                 left, used, usable = budget_left(cfg, args.reserve)
@@ -205,9 +213,9 @@ def main() -> None:
     if "tags" not in args.skip:
         pend = pending_counts(cfg)
         if pend["no_tags"]:
-            log(f"▶ 阶段4 阶跃标签提取 {pend['no_tags']} 条（不碰 BOSS，走 stepfun API）")
+            log(f"▶ 阶段4 LLM 标签提取 {pend['no_tags']} 条（不碰 BOSS，走外部 LLM 网关）")
             if not args.dry_run:
-                # 这个脚本用 --db 而不是 --config（历史差异），并发 ≤7（网关上限 8）
+                # 这个脚本用 --db 而不是 --config，模型/网关读 .env 的 LLM_*
                 run("extract_glm_tags.py", "--db", cfg.database_path)
         else:
             log("✓ 标签已全覆盖")

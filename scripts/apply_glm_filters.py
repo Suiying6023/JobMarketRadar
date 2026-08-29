@@ -1,13 +1,14 @@
-"""GLM 标签二次筛选：基于 glm_tags_json 把不符合用户画像的 active 岗位降级为 sample。
+"""LLM 标签二次筛选：基于 glm_tags_json 把不符合用户画像的 active 岗位降级为 sample。
 
-降级判断主口径（2026-08-05 起）：**阶跃 LLM 判断**——extract_glm_tags.py 在提取
-标签时已按用户画像输出 match(match=demote 即降级)，本脚本直接采用。仅当岗位没有
-match 字段（尚未被 LLM 判断）时，回退到关键词规则兜底（名校/硕士/不招应届/大小周
-/电销/非软件岗/运营市场设计内容岗/AIGC/仅27届/仅实习等）。
+降级判断主口径是 **LLM 的 match 字段**——extract_glm_tags.py 在提取标签时已按
+用户画像输出 match（demote 即降级），本脚本直接采用。仅当岗位没有 match 字段
+（尚未被 LLM 判断）时，才回退到关键词规则兜底（名校/硕士/不招应届/大小周/电销
+/非软件岗/运营市场设计内容岗/AIGC/仅27届/仅实习等）。
 
-事实性规则（DB 字段，不依赖 LLM）：薪资过低(<7K)、华为。
+事实性规则（读 DB 字段，不依赖 LLM）：薪资过低(<7K)、华为。
 
-依赖：glm_tags_json 已由 scripts/extract_glm_tags.py 填充（step-3.7-flash 提取）。
+依赖：glm_tags_json 已由 scripts/extract_glm_tags.py 填充。
+列名里的 glm 是历史遗留，与当前用的模型无关（见 .env 的 LLM_MODEL）。
 
 用法:
   python scripts/apply_glm_filters.py --dry-run   # 预览将降级数量
@@ -56,7 +57,7 @@ NON_SW_ROLE_KW = ("商品开发", "辅料", "面料", "饰品", "珠宝", "采�
                   "电销", "面销")
 # 电销/电话销售出现在标题或 JD 正文即降级（用户只要不碰电话销售岗）
 SALES_PHONE_KW = ("电销", "电话销售")
-# 不招应届信号：JD/GLM 明确排除应届（用户应届，2026-08-05 确认）
+# 不招应届信号：JD/LLM 明确排除应届
 # 注意"社招"裸词不算（"社招全职/应届生/实习生"三选一是接受的）
 FRESH_GRAD_EXCLUDE = (
     r"不招应届", r"不接受应届", r"不招聘应届", r"非应届",
@@ -77,9 +78,8 @@ OUTSOURCING = ("外包岗位", "本岗位为外包", "岗位外包", "外包性�
 def classify(r) -> tuple[str, str]:
     """返回 (是否降级 yes/no, 原因)。
 
-    主判断：阶跃 LLM 在提取阶段已按用户画像输出 match（2026-08-05 用户要求
-    LLM 判断降级，不再依赖关键词规则）。仅当岗位没有 match 字段（尚未被 LLM
-    判断）时，回退到关键词规则兜底。
+    主判断用 LLM 在提取阶段按用户画像输出的 match，不依赖关键词规则。
+    仅当岗位没有 match 字段（尚未被 LLM 判断）时，才回退到关键词兜底。
     """
     # 事实性规则（DB 字段，非 JD 文本）：薪资过低、华为
     maxk = r["salary_max_k"]

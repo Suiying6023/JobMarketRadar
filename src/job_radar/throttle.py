@@ -14,10 +14,14 @@
 4. 全局预算：单轮请求上限，超了就停。
 
 用法：
-    throttle = HumanThrottle(detail_batch=5, detail_cooldown=(1200, 1800))
-    await throttle.delay_before_request('list')   # 列表请求前
-    await throttle.delay_before_request('detail') # 详情请求前
-    await throttle.after_batch('detail')          # 每批详情后冷却
+    throttle = HumanThrottle(cfg, detail_batch=5, detail_cooldown=(10.0, 15.0))
+    await throttle.delay_before_request('list')    # 列表请求前
+    await throttle.delay_before_request('detail')  # 详情请求前
+    await throttle.human_heartbeat(page, 30)       # 长暂停期间保鲜 cookie
+
+注意 `config` 是必需的位置参数（节流档位从 yaml 读，见 __init__）。
+批间冷却由调用方自己排（backfill_details / backfill_activity 用随机批大小），
+本模块只提供 `detail_batch` / `detail_cooldown` 这两个值和 `_gaussian` 采样。
 """
 from __future__ import annotations
 
@@ -95,12 +99,6 @@ class HumanThrottle:
             p_lo, p_hi = self.burst_penalty
             await asyncio.sleep(self._gaussian(p_lo, p_hi))
 
-    async def after_detail_batch(self) -> None:
-        """每批详情请求结束后长冷却（解决详情接口累计配额）。"""
-        self._detail_count = 0
-        lo, hi = self.detail_cooldown
-        await asyncio.sleep(self._gaussian(lo, hi))
-
     async def human_heartbeat(self, page, duration: float) -> None:
         """批间冷却期间模拟真人活动，保鲜 cookie（2026-08-02 调研方案）。
 
@@ -117,7 +115,3 @@ class HumanThrottle:
             except Exception:
                 pass
             await asyncio.sleep(_random.uniform(2.0, 5.0))
-
-    def in_detail_batch(self, current: int) -> bool:
-        """判断是否仍在当前详情批次内（用于决定是否触发批间冷却）。"""
-        return current % self.detail_batch != 0

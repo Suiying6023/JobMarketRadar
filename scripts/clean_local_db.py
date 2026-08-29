@@ -1,14 +1,12 @@
-"""本地数据分层：按画像把不符合的岗位标记为 sample（不再物理删除）。
+"""本地数据分层：按画像把不符合的岗位标记为 sample（不物理删除）。
 
-口径（用户确认）：
-- 经验：在校/应届、经验不限、1年以内、1-3年
-- 学历：本科及以下（本科/大专/学历不限/中专及以下）
-- 薪资：排除 salary_min_k > 25（起点就超25K的高薪岗）
-- 排除：代招(is_proxy_job)、已失效(job_invalid)、日薪(实习)、标题含销售/客服等
-- 排除公司：猎头/劳务派遣/人力资源
+判定口径全部来自 `job_radar.profile`，本文件不自带阈值。当前包括：
+城市白名单、匿名公司、薪资区间均值上限、日薪(实习)、经验/学历白名单、
+代招、已失效/已关闭、标题与公司黑名单、招聘者头衔黑名单。
 
 被降级为 sample 的记录保留在库中，作为后续增量扩充的去重样本——下次采集
 遇到同一岗位（canonical_id 相同）走 UPDATE 而非 INSERT，避免重复抓取。
+`bookmarked=1` 的岗位一律不动（人工决定优先于自动判定）。
 
 用法:
   python scripts/clean_local_db.py --dry-run   # 只统计，不改
@@ -18,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -29,13 +28,21 @@ from job_radar import profile as P  # noqa: E402
 DB = "data/hangzhou_agent.sqlite3"
 
 
-def should_demote(r) -> tuple[bool, str]:
-    """画像判定。阈值/名单全部来自 job_radar.profile 单一真源。
+def _raw_of(r) -> dict:
+    """取 raw_json。老库的 raw 可能被列表轮次覆盖过，解析失败就返回空字典,
+    让 is_anonymous 回退到公司名兜底判断。"""
+    try:
+        return json.loads(r["raw_json"] or "{}")
+    except (json.JSONDecodeError, TypeError, IndexError, KeyError):
+        return {}
 
-    2026-08-10 修复：标题/公司黑名单两个分支原先写成
-    `if any(kw in title for kw in EXCLUDE_TITLE): return True, f"标题[{kw}]"`,
-    生成器的 kw 不泄漏到外层作用域 → NameError，这两条判定从未真正生效过
-    （降级原因分布里从来只有 高薪/代招/已失效，外包公司名单一次都没命中）。
+
+def should_demote(r) -> tuple[bool, str]:
+    """画像判定。返回 (是否降级, 原因)。阈值/名单全部来自 job_radar.profile。
+
+    关键词匹配一律走 `P.match_keyword()`——不要写
+    `if any(kw in title for kw in KW): ... f"[{kw}]"`，生成器的 kw 不泄漏到
+    外层作用域，那样写是 NameError 而不是匹配失败。
     """
     if r["job_invalid"]:
         return True, "已失效"
@@ -45,8 +52,11 @@ def should_demote(r) -> tuple[bool, str]:
         return True, "代招"
     if not P.city_allowed(r["city"] or ""):
         return True, f"非目标城市[{r['city']}]"
-    if r["salary_min_k"] is not None and r["salary_min_k"] > P.SALARY_DROP_MIN_ABOVE:
-        return True, f"高薪(下限{r['salary_min_k']:.0f}K)"
+    if P.is_anonymous(_raw_of(r), r["company_name"] or ""):
+        return True, "匿名公司"
+    if P.salary_out_of_range(r["salary_min_k"], r["salary_max_k"], r["salary_months"]):
+        mid = P.salary_mid(r["salary_min_k"], r["salary_max_k"], r["salary_months"])
+        return True, f"超纲(均值{mid:.0f}K)"
     if P.is_daily_salary(r["salary_text"] or ""):
         return True, "日薪(实习)"
     exp = r["experience"] or ""

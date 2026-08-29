@@ -22,6 +22,10 @@ data/*.sqlite3-shm
 data/raw/
 output/
 
+# prompt 回归样本集：含真实公司名与 JD 正文摘录，与数据库同属采集数据。
+# 留在本地可复跑，但不入库（这个仓库有「不进公开仓」的约定）。
+data/eval/
+
 # 探针/调试产物（cookie、token、DOM dump 等，不进仓库）
 data/manual_listen/
 data/token_probe/

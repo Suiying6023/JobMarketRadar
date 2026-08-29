@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 from patchright.async_api import BrowserContext, Page
 from patchright.async_api import Error as PlaywrightError
 
+from .. import profile
 from ..models import AutoChatPolicy, CityConfig, CollectionConfig, JobRecord, Platform, SearchFilters
 from ..normalization import (
     active_days_from_desc,
@@ -99,7 +100,6 @@ class BossCollector(Collector):
         self.code37_limit = getattr(config, "code37_limit", 35)
         self.last_lid = ""
         self.owns_page = False
-        self._cached_token = ""  # window._PAGE.token 会话内稳定，避免每条请求重复读
         # 已有 JD 的 canonical_id：详情接口是最贵资源（封禁红线 150-200 条），
         # 由 runner 从库里灌进来，命中即跳过详情，配额只花在真正缺 JD 的岗位上。
         self.skip_detail_ids: set[str] = set()
@@ -140,7 +140,6 @@ class BossCollector(Collector):
             await self.page.goto(url, wait_until="domcontentloaded")
             await self.page.wait_for_timeout(random.randint(2500, 4000))
             if ORIGIN in (self.page.url or ""):
-                self._cached_token = ""  # 页面刷新后 window._PAGE 重置，token 需重读
                 return
             if attempt < attempts:
                 await asyncio.sleep(random.uniform(2.0, 4.0))
@@ -279,8 +278,8 @@ class BossCollector(Collector):
             }
         }"""
         # zp_token 在页面内从 document.cookie 现读，不需要 Python 侧传 token。
-        # （旧的 _read_token/_cached_token 走 window._PAGE.token，该对象在当前前端
-        # 版本已不存在，且前端真实请求从不发 token 头——见上方注释②。）
+        # （旧代码走 window._PAGE.token，该对象在当前前端版本已不存在，
+        # 且前端真实请求从不发 token 头——见上方注释②。）
         for attempt in range(1, attempts + 1):
             if self.request_count >= self.config.max_requests_per_run:
                 raise RiskControlStop(
@@ -297,25 +296,6 @@ class BossCollector(Collector):
                 await self._settle_on_origin()
                 await asyncio.sleep(random.uniform(1.5, 3.0))
         raise RuntimeError("同源请求重试耗尽")  # pragma: no cover
-
-    async def _read_token(self) -> str:
-        """读 window._PAGE.token（登录会话内稳定）。页面刷新会临时重置，重试几次。"""
-        page = self.page
-        if page is None:
-            return ""
-        for _ in range(3):
-            try:
-                return str(
-                    await page.evaluate(
-                        """() => (typeof window._PAGE !== 'undefined' && window._PAGE)
-                                     ? (window._PAGE.token || '') : ''"""
-                    )
-                )
-            except PlaywrightError as exc:
-                if "Execution context was destroyed" not in str(exc):
-                    raise
-                await asyncio.sleep(2)
-        return ""
 
     @staticmethod
     def _dump_risk_body(path: str, status: int, raw_text: str) -> None:
@@ -444,61 +424,6 @@ class BossCollector(Collector):
             timeout=self.config.browser.navigation_timeout_ms,
         )
         await self.page.wait_for_timeout(2000)
-        self._cached_token = ""  # 重算后页面刷新，token 需重读
-
-    async def _forge_stoken(self) -> bool:
-        """主动铸造 __zp_stoken__（不等 code=37 触发），重置详情配额窗口。
-
-        BossAutomation 实测（2026-08-03 调研）：用硬编码 seed/name + 新 ts 导航
-        security-check.html，页面 JS 会自动生成新 stoken，无需先触发 code=37。
-        这能把「耗尽才重铸」改成「每批主动补」，彻底堵住配额洞。
-        __zp_stoken__ 是 HttpOnly，须用 context.cookies() 读（document.cookie 读不到）。
-        铸造后等 ≥1.5s 再发请求（Vampxgg 实测 <1.2s 会 37）。
-
-        返回是否铸造成功。失败时调用方回退到被动 _recover_code37。
-        """
-        assert self.page is not None and self.context is not None
-        import time as _time
-
-        # 2026-08-03 调研：BossAutomation 验证有效的硬编码 seed/name（每日 0-1 点轮换，
-        # 若失效则 fallback 到被动触发拿真实 seed）
-        seed = "ttttZij2JIIK+xUw73+6ZmzsaYKTbDQuIH6OR6Bm54o="
-        name = "e331459e"
-        ts = int(_time.time() * 1000)
-        sec_url = (
-            f"{ORIGIN}/web/common/security-check.html?"
-            f"{urlencode({'seed': seed, 'name': name, 'ts': ts, 'callbackUrl': '/web/geek/jobs'})}"
-        )
-        try:
-            await self.page.goto(sec_url, wait_until="domcontentloaded",
-                                 timeout=self.config.browser.navigation_timeout_ms)
-            # 轮询 cookie 直到出现新 __zp_stoken__（最长 120s，参考 BossKit）
-            deadline = _time.monotonic() + 120
-            forged = False
-            while _time.monotonic() < deadline:
-                await self.page.wait_for_timeout(2000)
-                try:
-                    cookies = await self.context.cookies()
-                    st = next((c for c in cookies if c["name"] == "__zp_stoken__"), None)
-                    if st and st.get("value"):
-                        forged = True
-                        break
-                except Exception:
-                    pass
-            # 回搜索页，恢复 fetch 所需的 zhipin 域环境
-            await self.page.goto(
-                f"{SEARCH_BASE}?query=AI%20Agent&city=101210100",
-                wait_until="domcontentloaded",
-                timeout=self.config.browser.navigation_timeout_ms,
-            )
-            await self.page.wait_for_timeout(3000)
-            self._cached_token = ""  # 页面刷新后 token 需重读
-            if forged:
-                await asyncio.sleep(1.5)  # 铸造后冷却，避免过短间隔触发 37
-            return forged
-        except Exception as exc:  # noqa: BLE001
-            print(f"[forge] 主动铸造异常: {str(exc)[:60]}")
-            return False
 
     def _parse_api_job(self, raw: dict, keyword: str, rank: int) -> JobRecord:
         encrypt_job_id = str(raw.get("encryptJobId") or "")
@@ -552,6 +477,11 @@ class BossCollector(Collector):
         if any(word.lower() in title for word in self.config.exclude_title_keywords):
             return False
         if any(word.lower() in company for word in self.config.exclude_company_keywords):
+            return False
+        # 匿名公司在列表阶段就能判（raw.anonymous），必须在这里拦：
+        # 标成 active 就会去抓详情，而投递前无法核实公司身份的岗位最终一定被
+        # clean_local_db 降级 —— 等于每条白花一次详情配额。
+        if profile.is_anonymous(job.raw, job.company_name):
             return False
         # 日薪岗基本都是实习/日结，即使标题没写“实习”也按薪资口径排除。
         if is_daily_rate(job.salary_text):

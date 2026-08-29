@@ -1,11 +1,15 @@
-"""GLM 批量提取岗位 JD 标签，写入 DB 的 glm_tags_json 列（断点续跑）。
+"""LLM 批量提取岗位 JD 标签，写入 DB 的 glm_tags_json 列（断点续跑）。
 
-用 step-3.7-flash + reasoning_effort=low（信息抽取场景）从 JD 正文提取：
-exp_req / edu_req / school_req / tech_req / other_req / bonus / job_type。
+从 JD 正文提取硬性要求与加分项，并给出投递匹配判断（match=keep/demote）：
+exp_req / edu_req / school_req / tech_req / other_req / bonus / job_type
++ fresh_grad / work_schedule / grad_year + match_evidence / match_reason / match。
 并发批量 + 429 退避重试，只处理 active 且已补 JD 的岗位。
 
+模型与网关全部读 .env 的 LLM_MODEL / LLM_API_URL / LLM_API_KEY（OpenAI 兼容）。
+列名 `glm_tags_json` 是历史遗留，与当前用的模型无关，不要按名字推断。
+
 用法:
-  python scripts/extract_glm_tags.py --concurrency 20 --limit 0
+  python scripts/extract_glm_tags.py --concurrency 8 --limit 0
   --limit 0 表示全部；指定条数用于小批测试。
 """
 from __future__ import annotations
@@ -24,14 +28,20 @@ from urllib import request as urlreq
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+# 见 call_glm 里的说明：网关在 Cloudflare 后面，默认 urllib UA 会被 403 拦掉。
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
 SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位 JD 正文提取硬性要求与加分项，并综合判断该岗位是否符合给定的求职者画像。只输出 JSON，不要任何解释或前后缀。
 
 求职者画像（26届应届本科·双非，求职杭州 AI/Agent/大模型 编程开发岗，要求双休）：
 可投：AI/Agent 开发、大模型应用、算法、AI全栈/后端/前端/客户端等编程岗；AI 产品经理。
 必须排除（命中任一即 match=demote）：
   1. 不招应届：JD 写"暂未开放在校生/应届生计划""仅实习经历请勿投递""必须有实际工作经验""实习经历不计"或硬性要求N年以上正式工作经验
-  2. 名校要求：985/211/一本/双一流/重点院校等硬性院校门槛
-  3. 硕士及以上学历
+  2. 名校要求：985/211/一本/双一流/重点院校等硬性院校门槛（求职者是双非）。
+     "倾向985""top 985/211""限985""985起"都算硬门槛；只有同句带"优先/加分/更佳"才不算。
+     ⚠️ "统招本科""全日制本科"**不是**名校门槛，求职者满足，不要算命中
+  3. 硕士及以上学历（"硕士及以上""仅招硕士""研究生学历"算；"硕士优先""硕博优先"不算）
   4. 仅限27届 / 仅招实习生
   5. 硬性英语四级及以上（"优先/加分"不算硬性）
   6. 非双休：大小周/单休/996/上六休一/六天工作制等
@@ -78,7 +88,35 @@ SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位 
   - ⚠️ 先写证据再判定，不要先决定 keep/demote 再补理由。**证据里没有的排除项，不得凭印象判 demote；
     但证据里明确写了的经验/学历/院校/工作制门槛，绝不能漏判成 keep**。
   - 命中任一排除项 → "demote"；否则 "keep"。无法从 JD 判断的条件默认不算命中。
-所有标签必须有 JD 原文依据，不得凭空编造。"""
+
+★★ 硬门槛 vs 软性偏好，这是判错的最主要来源，逐条对照：
+  - 硬门槛（算命中）："硕士及以上""3年以上经验""限985""需通过英语六级"
+    ——即求职者不满足就投不了
+  - 软性偏好（**不算命中**，归到 bonus）："硕士优先""985加分""有大厂经验更佳"
+    "英语好有优势""不强制要求论文"——即不满足仍可投
+  - 判据是**同一句里有没有"优先/加分/更佳/为佳/有优势/不强制/不做硬性"**。
+    注意这些词可能出现在小标题上（如"加分选项："后面跟一串条目），
+    此时**整段都属于加分项**，不要因为段内出现"985"就判 demote。
+
+★★ 求职者**已满足**的条件不是排除项，不要判 demote：
+  - 学历是**统招全日制本科**（双非院校）。所以"本科及以上""统招本科""全日制本科"
+    "本科学历"**全部满足**，只有"硕士及以上"和硬性名校门槛才不满足。
+  - 经验年限的判定是**默认命中、有出口才放过**，不要反过来：
+    · JD 写了"N年以上/至少N年/N年及以上 工作经验" → **默认命中第 1 条**
+      （应届生没有工作经验，这本身就是硬门槛，不需要 JD 另写"不招应届"）
+    · 仅当同句或邻句明确给了应届出口时才改判 keep：
+      "优秀应届生可放宽""或应届生""接受应届""经验不限""应届亦可"
+    · ⚠️ "全文没写不招应届"**不是**出口。绝大多数 JD 都不会专门写这句，
+      把它当出口等于让年限门槛永远不生效。
+    · "熟练掌握 Python（1年以上经验）"这类描述**技能熟练度**而非工龄的，不算命中。
+
+★★ 接口字段与 JD 正文冲突时，**以 JD 正文为准**（这是本任务存在的理由）：
+  平台的"经验不限""本科"只是招聘者勾选的粗筛项，实测 19% 标"经验不限"的岗位
+  JD 里写着"2年以上"，9% 标"本科"的写着"统招本科/硕士及以上"。
+  你只看 JD 正文，看到年限/学历门槛就如实提取，不要因为"平台说经验不限"而放过。
+
+所有标签必须有 JD 原文依据，不得凭空编造。
+⚠️ 摘录 JD 原文时用中文引号「」，**不要用英文双引号** —— 它会截断 JSON 字符串导致解析失败。"""
 
 
 def load_env() -> dict[str, str]:
@@ -108,15 +146,13 @@ ENUM_FIELDS = {
 def validate_tags(parsed: dict) -> str | None:
     """校验抽取结果，返回错误描述或 None（通过）。
 
-    为什么要这层：阶跃只有 json_object，**不保证字段齐全或枚举值合法**，
-    所以"能 json.loads"不等于"能用"。
+    为什么要这层：`json_object` 模式只保证是合法 JSON，**不保证字段齐全或
+    枚举值合法**，所以"能 json.loads"不等于"能用"。
 
-    ★ 空 match_reason 是漏判的特征信号，不是无害的省略。
-    2026-08-11 实测另一个模型（laguna-s-2.1-free）在 60 条对照里把 13 条该 demote 的
-    岗位放成 keep，**这 13 条的 match_reason 全是空字符串** —— 模型没找依据就下了结论。
-    人工核对 7 条，现役 stepfun 全对（那些 JD 明写"1年以上经验""1-3年工作经验"）。
-    对 26 届应届生来说"不招应届"是最高频的排除项，放过一条的代价远高于误杀一条，
-    所以这里把"理由为空"直接判为无效并触发重试，而不是存进库。
+    ★ 空 match_reason 判为无效，不是无害的省略。实测某模型在 60 条对照里把
+    13 条该 demote 的岗位放成 keep，**这 13 条的 match_reason 全是空字符串**
+    —— 模型没找依据就先下了结论。对 26 届应届生来说"不招应届"是最高频的排除项，
+    放过一条的代价远高于误杀一条，所以理由为空直接触发重试而不是存进库。
     """
     missing = [k for k in REQUIRED_FIELDS if k not in parsed]
     if missing:
@@ -133,10 +169,53 @@ def validate_tags(parsed: dict) -> str | None:
     return None
 
 
+def _escape_inner_quotes(text: str) -> str:
+    """把 JSON 字符串**值内部**的裸 `"` 转义掉。
+
+    模型被要求逐字摘录 JD 原文，而 JD 里满是引号，于是它会吐出
+    `"match_reason":"JD写"2年以上经验"，命中第1条"` —— 值里的裸引号提前
+    终止了字符串，整个 JSON 报 `Expecting ',' delimiter`。实测这是唯一的
+    解析失败原因（三次抽样全是它），而且**判定内容本身是对的**，
+    丢掉整条重试纯属浪费；重试也未必好转，因为原文引号还在。
+
+    做法：扫一遍，只在"字符串内部且不是结构性引号"的位置插反斜杠。
+    结构性引号的判据是它后面紧跟 `:` `,` `}` `]`（允许空白）或它是键的开引号。
+    """
+    out: list[str] = []
+    in_str = False
+    for i, ch in enumerate(text):
+        if ch == "\\":
+            out.append(ch)
+            continue
+        if ch == '"':
+            if not in_str:
+                in_str = True
+                out.append(ch)
+                continue
+            # 已在字符串内：看这个引号是不是真的收尾
+            rest = text[i + 1:].lstrip()
+            if rest[:1] in (":", ",", "}", "]") or rest == "":
+                in_str = False
+                out.append(ch)
+            else:
+                out.append('\\"')      # 值内部的裸引号 → 转义
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _loads_lenient(content: str) -> dict:
+    """先按标准 JSON 解析，失败则修掉值内裸引号再试一次。"""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return json.loads(_escape_inner_quotes(content))
+
+
 def call_glm(env: dict, jd: str, max_retries: int = 5) -> tuple[dict | None, str | None, int]:
-    """调用 GLM，返回 (解析 JSON 或 None, 错误或 None, 尝试次数)。429 指数退避重试。"""
+    """调用 LLM，返回 (解析 JSON 或 None, 错误或 None, 尝试次数)。429 指数退避重试。"""
     body = json.dumps({
-        "model": env["GLM_MODEL"],
+        "model": env["LLM_MODEL"],
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"岗位 JD：\n{jd[:2500]}"},
@@ -144,14 +223,20 @@ def call_glm(env: dict, jd: str, max_retries: int = 5) -> tuple[dict | None, str
         "temperature": 0.1,
         "max_tokens": 4000,
         "reasoning_effort": "low",  # 信息抽取用低推理，省 token 且快
-        # 阶跃只支持 json_object（不支持 OpenAI 那种 json_schema 强约束，2026-08-12 查官方文档确认）。
-        # 收益是模型原生 JSON 模式、不再吐 ``` 围栏；但**不保证字段齐全或枚举值合法**，
-        # 所以下面的 _validate 校验必须保留，剥围栏的兜底也保留（防它偶尔仍加围栏）。
+        # 只用 json_object（不依赖 json_schema 强约束——换网关时未必都支持）。
+        # 它**不保证字段齐全或枚举值合法**，所以 validate_tags 必须保留；
+        # 剥 ``` 围栏的兜底也必须保留：实测同一模型会偶发加围栏（3 次里 2 次）。
         "response_format": {"type": "json_object"},
     }).encode("utf-8")
-    req = urlreq.Request(env["GLM_API_URL"], data=body, headers={
-        "Authorization": f"Bearer {env['ZHIPU_API_KEY']}",
+    req = urlreq.Request(env["LLM_API_URL"], data=body, headers={
+        "Authorization": f"Bearer {env['LLM_API_KEY']}",
         "Content-Type": "application/json",
+        # ⚠️ 必须伪装 UA：网关在 Cloudflare 后面，默认的 `Python-urllib/3.12`
+        # 会被挑战拦掉。返回的还不是 CF 那个 HTML 挑战页，而是网关自己包装的
+        # `HTTP 403 {"code":"bad_response_status_code","type":"upstream_error"}`——
+        # 看起来像上游模型挂了，实际是本地 UA 被拒，重试永远救不回来。
+        # curl 能通是因为它默认发 `curl/x.y`，恰好不在拦截名单里。
+        "User-Agent": USER_AGENT,
     })
     attempt = 0
     while attempt < max_retries:
@@ -163,7 +248,7 @@ def call_glm(env: dict, jd: str, max_retries: int = 5) -> tuple[dict | None, str
             content = ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
             if content.startswith("```"):
                 content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            parsed = json.loads(content)
+            parsed = _loads_lenient(content)
             if not isinstance(parsed, dict):
                 raise ValueError("非 JSON 对象")
             bad = validate_tags(parsed)
@@ -201,9 +286,11 @@ def main() -> None:
     args = parser.parse_args()
 
     env = load_env()
-    if not env.get("ZHIPU_API_KEY") or not env.get("GLM_API_URL"):
-        raise SystemExit("缺少 ZHIPU_API_KEY / GLM_API_URL（.env）")
-    model = env.get("GLM_MODEL", "step-3.7-flash")
+    missing = [k for k in ("LLM_API_KEY", "LLM_API_URL", "LLM_MODEL")
+               if not env.get(k)]
+    if missing:
+        raise SystemExit(f"缺少 {' / '.join(missing)}（.env）")
+    model = env["LLM_MODEL"]
 
     con = sqlite3.connect(args.db)
     con.row_factory = sqlite3.Row

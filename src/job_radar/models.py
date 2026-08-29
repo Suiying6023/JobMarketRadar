@@ -52,9 +52,6 @@ class SearchFilters(BaseModel):
     # 求职类型：全职/兼职/实习（接口参数 jobType，1901=全职）
     jobType: str | None = None
 
-    def api_params(self) -> dict[str, str]:
-        return {k: v for k, v in self.model_dump().items() if v}
-
 
 class AutoChatPolicy(BaseModel):
     enabled: bool = False
@@ -89,6 +86,12 @@ class CollectionConfig(BaseModel):
     cities: list[CityConfig]
     keywords: list[str]
     pages_per_query: int = Field(default=3, ge=1, le=10)
+    # 按关键词覆盖翻页深度：`{关键词: 页数}`，未列出的用 pages_per_query。
+    # 为什么需要：关键词的产量和对口率差一个数量级——`后端开发工程师` 第 7-10 页
+    # 每页仍有 29-30 条全新岗位（浅层各词共享、深层各词独有），而 `AI Agent`
+    # 对口率只有 14%，给它同样的深度等于把配额烧在最差的词上。
+    # 上限比 pages_per_query 宽（30）：深翻是明确的定向动作，不是默认行为。
+    pages_per_keyword: dict[str, int] = Field(default_factory=dict)
     detail_limit_per_query: int = Field(default=30, ge=0, le=200)
     page_size: int = Field(default=30, ge=10, le=50)
     request_delay_seconds: tuple[float, float] = (6.0, 12.0)
@@ -117,10 +120,32 @@ class CollectionConfig(BaseModel):
     exclude_company_keywords: list[str] = Field(default_factory=lambda: ["猎头", "人力资源", "劳务派遣"])
     collect_details: bool = True
     database_path: str = "data/jobs.sqlite3"
+    # 这两个字段代码里没有消费点（输出路径由 cli.py 的选项和各脚本自己定），
+    # 但 8 个 yaml 全都写着它们 —— pydantic 默认对未声明字段报错，所以留着
+    # 是为了让现有配置能加载，不是有人在读。
     raw_dir: str = "data/raw"
     output_dir: str = "output"
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     auto_chat: AutoChatPolicy = Field(default_factory=AutoChatPolicy)
+
+    @field_validator("pages_per_keyword")
+    @classmethod
+    def validate_pages_per_keyword(cls, value: dict[str, int], info):
+        """页数必须在 1-30；关键词必须真的在 keywords 里（拼错会静默失效）。"""
+        known = set(info.data.get("keywords") or [])
+        for kw, pages in value.items():
+            if not 1 <= pages <= 30:
+                raise ValueError(f"pages_per_keyword[{kw}]={pages} 超出 1-30")
+            if known and kw not in known:
+                raise ValueError(
+                    f"pages_per_keyword 里的 {kw!r} 不在 keywords 列表中"
+                    "（拼写不一致会让这条覆盖静默失效）"
+                )
+        return value
+
+    def pages_for(self, keyword: str) -> int:
+        """该关键词本轮翻多少页。未单独配置的用 pages_per_query。"""
+        return self.pages_per_keyword.get(keyword, self.pages_per_query)
 
 
 class JobRecord(BaseModel):
@@ -195,7 +220,6 @@ class CollectionStats(BaseModel):
     detail_failed: int = 0
     inserted: int = 0
     updated: int = 0
-    skipped: int = 0
     auto_chat_planned: int = 0
     auto_chat_executed: int = 0
     requests_used: int = 0

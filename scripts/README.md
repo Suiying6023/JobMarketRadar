@@ -49,7 +49,9 @@
 ## 数据处理与分析
 
 - `clean_local_db.py` — 重跑分层（active / sample / purged）
-- `extract_glm_tags.py` — 阶跃 JD 标签提取（变量名叫 glm，实际是 stepfun）
+- `extract_glm_tags.py` — LLM JD 标签提取。模型/网关读 `.env` 的 `LLM_MODEL`
+  / `LLM_API_URL` / `LLM_API_KEY`；文件名和 DB 列名里的 `glm` 是历史遗留，
+  与当前用的模型无关。⚠️ 网关在 Cloudflare 后面，请求必须带浏览器 UA
 - `apply_glm_filters.py` / `extract_jd_labels.py` / `eval_match_quality.py`
 - `analyze_jobs.py` / `analyze_jd_labels.py` / `analyze_keyword_yield.py`
   / `analyze_local_filter.py` / `analyze_tag_diffs.py`

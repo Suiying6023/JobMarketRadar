@@ -5,7 +5,9 @@
 足够做筛选和初筛。
 
 用法: python scripts/expand_list.py [--pages N] [--delay S]
-  --pages  每个关键词抓多少页（默认 5）
+  --pages  每个关键词抓多少页。**默认 0 = 按配置分词决定**
+           （`pages_per_keyword` 里配了的用它，其余用 `pages_per_query`）；
+           给了数值则对所有词统一覆盖。
   --delay  每页间隔秒数（默认 8，列表接口零风控可放松）
 """
 from __future__ import annotations
@@ -21,7 +23,12 @@ from urllib.parse import urlencode
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from job_radar.collectors.boss import BossCollector, ORIGIN, API_PATH  # noqa: E402
+from job_radar.collectors.boss import (  # noqa: E402
+    API_PATH,
+    ORIGIN,
+    RISK_TEXTS,
+    BossCollector,
+)
 from job_radar.config import load_config  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
@@ -53,14 +60,18 @@ FETCH_TPL = """(payload) => {
 # 页面内现读，见 FETCH_TPL。
 
 # 对齐 boss.py：不能含「安全校验」——列表接口虽无 JD 正文，但保持口径一致防误报。
-RISK_TEXTS = ("访问频繁", "环境存在异常", "账户存在异常",
-              "操作过于频繁", "操作太频繁", "滑块")
+# RISK_TEXTS 从 boss.py 导入（单一真源）。曾在三个脚本里各存一份副本并已开始漂移：
+# 两份仍带「安全校验」，而正常 JD 里的「数据安全校验」「安全校验通过」会命中它，
+# 把好数据判成风控（boss.py 那份 2026-08-10 已移除，副本没跟上）。
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.hangzhou.yaml", help="配置文件（可指向试验配置）")
-    parser.add_argument("--pages", type=int, default=5)
+    parser.add_argument("--pages", type=int, default=0,
+                        help="每个关键词翻多少页。0（默认）= 读配置的 "
+                             "pages_per_keyword / pages_per_query 按词分别决定；"
+                             "给了数值则对所有词统一覆盖")
     parser.add_argument("--delay", type=float, default=8.0)
     parser.add_argument("--start", type=int, default=0,
                         help="从第几个关键词开始（0-based，跳过已完成的词）")
@@ -152,9 +163,13 @@ async def main() -> None:
                         print(f"[{city.name}|{kw}] 已确认翻到底（第 {done_page} 页），跳过")
                         continue
                     start_page = 1 if args.restart else done_page + 1
-                    end_page = start_page + args.pages - 1
-                    if start_page > 1:
-                        print(f"[{city.name}|{kw}] 续翻 第 {start_page}-{end_page} 页")
+                    # 本轮翻几页：--pages 显式给了就统一覆盖，否则按词读配置
+                    # （高产词深翻、低对口词浅翻，见 models.pages_for）。
+                    span = args.pages or cfg.pages_for(kw)
+                    end_page = start_page + span - 1
+                    if start_page > 1 or span != cfg.pages_per_query:
+                        print(f"[{city.name}|{kw}] 翻 第 {start_page}-{end_page} 页"
+                              f"（本词 {span} 页）")
                     last_page_done = done_page
                     for p in range(start_page, end_page + 1):
                         used = store.request_counts().get("total", 0)

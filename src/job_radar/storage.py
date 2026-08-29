@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from . import profile as P
 from .models import JobRecord
 from .normalization import merge_unique, normalized_text, stable_id
 
@@ -73,7 +74,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     retention_status TEXT NOT NULL DEFAULT 'active',
     -- 用户浏览/投递过的岗位，画像外也保留（投递池 = active OR bookmarked）。
     bookmarked INTEGER NOT NULL DEFAULT 0,
-    -- GLM(step-3.7-flash) 从 JD 提取的结构化标签（exp_req/edu_req/school_req/tech_req/other_req/bonus/job_type）。
+    -- LLM 从 JD 提取的结构化标签（exp_req/edu_req/school_req/tech_req/other_req/bonus/job_type）。
     glm_tags_json TEXT NOT NULL DEFAULT '{}',
     glm_tags_updated_at TEXT NOT NULL DEFAULT '',
     -- 工商登记信息（gongsi 页免登录抓取，按 brand_id 富化）：
@@ -100,6 +101,11 @@ CREATE TABLE IF NOT EXISTS collection_runs (
 -- expand_list / backfill_details / backfill_activity 各跑各的，谁也不知道今天
 -- 一共发了多少请求，"今天已经很克制了"完全是凭感觉。
 -- 一行 = 一次真实 HTTP 请求，kind 区分 list/detail/security_check（三者风险不同）。
+-- ⚠️ 两条链路都写这张表，但**各有独立日线**：采集链路（list/detail/security_check，
+-- 带账号 cookie + 家宽 IP）由 `max_requests_per_day` 卡，口径见
+-- `JobStore.COLLECT_KINDS`；状态刷新链路（detail_page，免登录 + 波尔机房 IP）
+-- 由 refresh_status_loop 自己的 `--daily-cap` 卡。风控按「IP + 账号信任度」判，
+-- 两条链路既不同出口也不同登录态，合并计数只会让彼此凭空少掉额度。
 -- ⚠️ ts 由 Python 写入**本地时间**，不用 SQLite 的 CURRENT_TIMESTAMP（那是 UTC）。
 -- 混用会让同一行的 ts 和 day 差 8 小时（day 按本地日算，见 log_request 注释），
 -- 看账本时极易误判成两批不同的事件——实测已经误导过一次判读。
@@ -250,11 +256,9 @@ class JobStore:
     )
 
     # 重新采集时这些字段直接用新值覆盖（平台上的最新状态）。
-    # ⚠️ raw_json 已从此列表移除（2026-08-10）——原先无条件覆盖会导致下一轮列表
-    # 采集时用「列表版 raw」覆盖「含 detail 的完整 raw」，raw.detail / raw 里的新鲜
-    # securityId/lid 全部丢失。实测 1891 条有 JD 的记录里 639 条（34%）的 raw.detail
-    # 已消失，且丢失组平均 seen_count 5.9 vs 保留组 4.29——被列表重复命中越多丢得越多。
-    # 改为在 upsert 前 Python 侧 merge：列表字段覆盖旧值，detail 等 raw 子键保留。
+    # ⚠️ raw_json 绝不能加进这个列表：列表轮次的 raw 只有列表字段，无条件覆盖会把
+    # 含 detail 的完整 raw 连同新鲜 securityId/lid 一起抹掉（曾丢掉 34% 的
+    # raw.detail，且被列表重复命中越多丢得越快）。它走 Python 侧 merge，见 upsert。
     OVERWRITE_COLUMNS = (
         "job_url", "company_url", "title", "company_name", "city", "district",
         "business_district", "location_text", "salary_text", "salary_min_k",
@@ -266,23 +270,13 @@ class JobStore:
         "recruiter_online",
     )
 
-    # 这些字段只在新值非空时才覆盖，避免第二轮只抓列表就把已抓到的详情抹掉。
-    # ⚠️ 2026-08-10 追加 recruiter_active_status/recruiter_active_days/
-    # recruiter_certificated/is_proxy_job/job_invalid —— 这五个**只有详情接口给**
-    # （列表接口不返回 activeTimeDesc，见 boss.py:473 的实测注释），原先它们在
-    # OVERWRITE_COLUMNS 里被列表轮次的空值无条件覆盖：
-    # 每跑一次列表采集，就把花详情配额换来的活跃度/认证/代招标记清空一批。
-    # 小批量验证时实测复现：1 个关键词 2 页列表，12 条 active 的活跃度被抹成空
-    # （空活跃度 active 从 6 条涨到 17 条）。
-    #
-    # ⚠️ 2026-08-11 再追加 job_status_desc/position_name/recruitment_count ——
-    # 上一次（8-10）补了五个字段却**漏了这三个**，它们同样只有详情接口给
-    # （`_parse_api_job` 完全不赋值，实测确认），于是继续被列表轮次抹。
-    # 抹除率按 seen_count 单调爬升是决定性证据：
-    #   seen=2 → 0%(1/749)  seen=3-4 → 63%  seen=5-7 → 71%  seen=8+ → 85%(242/284)
-    # 即同一岗位被列表多扫到几次，这几列就越可能被清空。
-    # （recruiter_online 不在此列：列表确实给 bossOnline，且"当前在线"是会来回
-    #  变的实时状态，做单向保护反而会把旧的 True 永久钉住。）
+    # 只在新值非空时覆盖。判据很简单：**凡是只有详情接口返回的字段都必须在这里**，
+    # 否则每跑一次列表采集，就会用列表轮次的空值把花详情配额换来的数据清空一批。
+    # 加新字段时先确认 `_parse_api_job` 是否给它赋值——不赋值的就属于这一类。
+    # 抹除率按 seen_count 单调爬升可以验证是否漏了字段：同一岗位被列表扫到越多次，
+    # 漏掉的列被清空的比例越高（曾出现 seen≥8 的行 85% 被抹）。
+    # recruiter_online 不在此列：列表确实返回 bossOnline，且"当前在线"是会来回变的
+    # 实时状态，做单向保护反而会把旧的 True 永久钉住。
     KEEP_IF_EMPTY_COLUMNS = (
         "recruiter_id", "brand_id", "company_intro", "company_founded_year",
         "address", "latitude", "longitude", "detail_fetched_at",
@@ -493,14 +487,31 @@ class JobStore:
         )
         self.conn.commit()
 
+    #: 采集链路的 kind（带账号 cookie、走本机家宽、打 /wapi JSON 接口）。
+    #: `total` 只累计这些——它是 `max_requests_per_day` 的执行口径。
+    COLLECT_KINDS = frozenset({"list", "detail", "security_check", "recommend"})
+
     def request_counts(self, day: str | None = None) -> dict[str, int]:
-        """某天各类请求数（默认今天本地日）。返回 {'list': n, 'detail': n, ...,'total': n}。"""
+        """某天各类请求数（默认今天本地日）。返回 {'list': n, ..., 'total': n}。
+
+        `total` **只累计采集链路**（`COLLECT_KINDS`），不含状态刷新链路的
+        `detail_page`。两条链路是不同账号（带 cookie vs 免登录）、不同出口
+        （家宽 vs 波尔机房 IP），风控是按「IP + 账号信任度」判的，各自独立记账——
+        把免登录跳板的请求算进采集账号的日线，会让采集侧凭空少掉额度：
+        刷 100 条状态（1400 次 detail_page）就能把日线 1000 直接顶满，
+        而那 1400 次请求从未经过采集账号或家宽 IP。
+
+        刷新链路自己按 `--daily-cap` 卡 `detail_page` 的量（见
+        `scripts/refresh_status_loop.py`），不共用这条线。
+        """
         day = day or datetime.now().astimezone().strftime("%Y-%m-%d")
         rows = self.conn.execute(
             "SELECT kind, COUNT(*) FROM request_log WHERE day = ? GROUP BY kind", (day,)
         ).fetchall()
         counts = {str(k): int(n) for k, n in rows}
-        counts["total"] = sum(counts.values())
+        counts["total"] = sum(
+            n for kind, n in counts.items() if kind in self.COLLECT_KINDS
+        )
         return counts
 
     # ---- 关键词翻页进度 ----
@@ -573,15 +584,29 @@ class JobStore:
         return out
 
     def city_summary(self) -> list[dict]:
-        query = """
+        """按城市汇总。经验/学历口径取自 `profile.py`（阈值单一真源）。
+
+        原先这里写死两份名单，两份都不对——因为混淆了「BOSS 搜索**参数**」和
+        「列表接口**返回值**」：
+          · `'应届生'` 是搜索参数码 102 的标签，接口返回的是 `'在校/应届'`
+            → 35 条应届岗从未被 junior_jobs 数进去
+          · `'不限'` 同理，接口返回 `'学历不限'`，且缺 中专/高中/初中
+            → bachelor_accessible 少算 24 条
+        `profile.ALLOW_EXP` / `ALLOW_DEG` 存的就是接口返回值（那边有注释专门
+        标注了这个区分），直接用它们，顺带以后调画像不用改两处。
+        """
+        exp_ph = ", ".join("?" * len(P.ALLOW_EXP))
+        deg_ph = ", ".join("?" * len(P.ALLOW_DEG))
+        query = f"""
         SELECT city,
                COUNT(*) AS jobs,
                COUNT(DISTINCT company_name) AS companies,
                ROUND(AVG((salary_min_k + salary_max_k) / 2.0), 2) AS avg_mid_salary_k,
-               SUM(CASE WHEN experience IN ('应届生', '经验不限', '1年以内') THEN 1 ELSE 0 END) AS junior_jobs,
-               SUM(CASE WHEN education IN ('', '不限', '大专', '本科') THEN 1 ELSE 0 END) AS bachelor_accessible
+               SUM(CASE WHEN experience IN ({exp_ph}) THEN 1 ELSE 0 END) AS junior_jobs,
+               SUM(CASE WHEN education IN ({deg_ph}) THEN 1 ELSE 0 END) AS bachelor_accessible
         FROM jobs
         GROUP BY city
         ORDER BY jobs DESC
         """
-        return [dict(row) for row in self.conn.execute(query)]
+        params = (*sorted(P.ALLOW_EXP), *sorted(P.ALLOW_DEG))
+        return [dict(row) for row in self.conn.execute(query, params)]

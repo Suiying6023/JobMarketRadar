@@ -29,8 +29,11 @@ WATCH = (
 )
 NOISE = "zpApm"
 
-RISK_TEXTS = ("访问频繁", "安全校验", "环境存在异常", "账户存在异常",
-              "操作过于频繁", "操作太频繁", "滑块")
+sys.path.insert(0, str(ROOT / "src"))
+from job_radar.collectors.boss import RISK_TEXTS  # noqa: E402
+
+# ⚠️ 本地副本已删（原先含「安全校验」，而正常 JD 里的「数据安全校验」会命中它，
+# 把好数据标成 risk_hit —— boss.py 那份 2026-08-10 就移除了，副本没跟上）。
 
 
 def stamp() -> str:

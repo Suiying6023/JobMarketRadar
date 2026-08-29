@@ -122,10 +122,12 @@ def exit_status(port: int, timeout: int = 20) -> tuple[str, str]:
 
 def log_requests(con: sqlite3.Connection, n: int, outcome: str = "ok",
                  code: int | None = None) -> None:
-    """把一条岗位页折算成 n 次请求记进 request_log。
+    """把一条岗位页折算成 n 次请求记进 request_log，kind 固定 `detail_page`。
 
-    复用老链路那张表，这样两条链路共享同一条单日线——否则页面链路跑起来
-    在账本上完全隐形，而它才是请求量的大头。
+    共用那张表只为「一个地方看全部请求」，**不共用日线**：这条链路免登录、
+    走波尔机房 IP，与采集链路（带账号 cookie、家宽直连）的风控主体完全不同。
+    两侧各按自己的 kind 记账 —— 见 `used_today()` 与
+    `JobStore.request_counts()` 的 `COLLECT_KINDS`。
     """
     now = datetime.now().astimezone()
     con.executemany(
@@ -137,9 +139,16 @@ def log_requests(con: sqlite3.Connection, n: int, outcome: str = "ok",
 
 
 def used_today(con: sqlite3.Connection) -> int:
+    """今日**本链路**已用请求数，只数 `detail_page`。
+
+    原先数的是全表，于是采集链路当天跑过的量会顶掉刷新链路的额度（反之亦然），
+    两条本该独立的安全线互相扣血。风控按 IP + 账号判，两条链路既不同 IP
+    也不同登录态，没有理由共享同一条线。
+    """
     day = datetime.now().astimezone().strftime("%Y-%m-%d")
-    return con.execute("SELECT count(*) FROM request_log WHERE day=?",
-                       (day,)).fetchone()[0]
+    return con.execute(
+        "SELECT count(*) FROM request_log WHERE day=? AND kind='detail_page'",
+        (day,)).fetchone()[0]
 
 
 def probe_exit(port: int, timeout: int = 12) -> int:

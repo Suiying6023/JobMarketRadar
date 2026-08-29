@@ -13,7 +13,7 @@
 
 用法:
   # 拿存量标签当基准，评估新模型/新 prompt（只读，不写库）
-  uv run python scripts/eval_match_quality.py --model step-3.7-flash --n 60
+  uv run python scripts/eval_match_quality.py --model minimax-m3 --n 60
 
   # 只统计现有存量标签的分布（不调 API）
   uv run python scripts/eval_match_quality.py --stats-only
@@ -81,7 +81,7 @@ def report(pairs: list[tuple[str, str]], flips: list[tuple]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="", help="要评估的模型（默认读 .env 的 GLM_MODEL）")
+    ap.add_argument("--model", default="", help="要评估的模型（默认读 .env 的 LLM_MODEL）")
     ap.add_argument("--n", type=int, default=60, help="样本数，keep/demote 各半")
     ap.add_argument("--concurrency", type=int, default=6)
     ap.add_argument("--db", default="data/hangzhou_agent.sqlite3")
@@ -112,8 +112,8 @@ def main() -> None:
 
     env = _mod.load_env()
     if args.model:
-        env["GLM_MODEL"] = args.model
-    model = env.get("GLM_MODEL", "?")
+        env["LLM_MODEL"] = args.model
+    model = env.get("LLM_MODEL", "?")
 
     rows = []
     for want in ("keep", "demote"):
