@@ -1,6 +1,22 @@
-"""__zp_stoken__ 本地计算（iv8 方案，逆向自 Yang-hua6/boss-）。
+"""【已废弃：死路，不要再捡起来】__zp_stoken__ 本地计算（iv8 方案）。
 
-机制（2026-08-01 逆向确认）：
+2026-08-28 从 `src/job_radar/stoken.py` 移到这里归档。三条独立原因：
+
+1. **服务端不认**：能算出格式合法的 469 字符 token，但请求仍返回 code=37 ——
+   服务端除了签名还校验环境指纹（`HANDOFF.md:237` 记录）。
+2. **依赖从未装过**：`iv8` 既不在 `pyproject.toml`/`requirements.txt`，也不在
+   `uv.lock`，本机 venv 里也没有 → `_IV8_AVAILABLE` 恒为 False，
+   `compute_stoken()` 第一行就返回 None。等于整个模块从来没真正执行过。
+3. **已被真方案取代**：现在走 `boss.py:_recover_code37()` ——
+   导航到 `security-check.html` 让**真浏览器自己的 JS** 生成 stoken，
+   约 10 秒完整重置配额窗口，实测 10/10 通过。不需要在 Python 里复现签名算法。
+
+archived 的 `probe_stoken_loop.py` / `probe_stoken_retry.py` 仍写着
+`from job_radar.stoken import ...`，那个路径已不存在，它们只作证据留档、不再可运行。
+
+---
+
+原始机制说明（2026-08-01 逆向确认）：
   BOSS 对每个会话下发 seed/ts/name（在 code=37 响应的 zpData 里），__zp_stoken__
   是「seed+ts」的短时效签名，由 security-js/{name}.js 里的 (new window.ABC).z(seed, ts)
   计算。stoken 过期后请求返回 code=37，需要用响应里的新 seed 重新计算。
