@@ -203,7 +203,11 @@ class JobStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        # timeout=30：采集（补详情）常与刷新链路、标签重打并行跑，
+        # 三方写同一个库。库是 WAL（写者排队而非直接失败），但默认 5s 的
+        # busy_timeout 在三方争抢下会抛 "database is locked" ——
+        # 而这一侧写的是**花了不可退配额换来的详情**，崩在写库最不值。
+        self.conn = sqlite3.connect(self.path, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate_legacy_columns()

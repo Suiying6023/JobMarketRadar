@@ -202,7 +202,8 @@ async def main() -> None:
                         help="配合 --refresh-active：活跃度换算天数 >= 此值即视为长期不活跃并降级为 sample")
     args = parser.parse_args()
 
-    con = sqlite3.connect(DB)
+    # timeout=30：与其他链路并行时避免 "database is locked"（见 storage.py 的说明）
+    con = sqlite3.connect(DB, timeout=30.0)
     con.row_factory = sqlite3.Row
     sql = ("SELECT canonical_id, title, company_name, source_job_id FROM jobs "
            "WHERE retention_status='active' AND job_invalid=0 AND job_status_desc != '职位已关闭' "

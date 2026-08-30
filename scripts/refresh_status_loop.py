@@ -499,7 +499,12 @@ async def main() -> None:
                             FETCH_WINDOW, REQ_PER_RECOVER))
     args = ap.parse_args()
 
-    con = sqlite3.connect(DB)
+    # timeout：三条链路（刷新 / 补详情 / 标签重打）会并行写同一个库。
+    # 库本身是 WAL（允许一写多读 + 写者排队），但**默认 5s 的 busy_timeout
+    # 在三方争抢下不够** —— 超时会抛 "database is locked" 把整批打断，
+    # 而刷新是花了配额才拿到的结果，中途崩掉等于白花。
+    # 30s 足够让另一方的短事务（都是单行 UPDATE + commit）让开。
+    con = sqlite3.connect(DB, timeout=30.0)
     con.row_factory = sqlite3.Row
     # ⚠️ 只刷**已在投递池里**（有 JD）的岗位，且按快照年龄从旧到新。
     #

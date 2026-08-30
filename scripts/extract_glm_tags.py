@@ -330,7 +330,10 @@ def main() -> None:
         raise SystemExit(f"缺少 {' / '.join(missing)}（.env）")
     model = env["LLM_MODEL"]
 
-    con = sqlite3.connect(args.db)
+    # timeout=30：标签重打会与刷新/补详情并行跑，三方写同一个库。
+    # 默认 5s 在争抢下会抛 "database is locked"；本脚本每条都是
+    # 一次 LLM 调用（5-8s）换来的结果，崩在写库那一步最不值。
+    con = sqlite3.connect(args.db, timeout=30.0)
     con.row_factory = sqlite3.Row
     if args.ids_file:
         ids = [ln.strip() for ln in Path(args.ids_file).read_text(encoding="utf-8").splitlines()
