@@ -313,7 +313,8 @@ def main() -> None:
             if run_stage("backfill", ROOT / "logs" / f"backfill-slow-{stamp}.log",
                          ["uv", "run", "python", "scripts/backfill_details.py",
                           "--config", args.collect_config,
-                          "--limit", str(lim)]) == "risk":
+                          "--limit", str(lim),
+                          "--over-quota", args.over_quota]) == "risk":
                 halt("backfill 命中 [RISK-STOP]")
                 sys.exit(3)
             return True
@@ -362,7 +363,8 @@ def main() -> None:
             if run_stage("expand-list", ROOT / "logs" / f"expand-{stamp}.log",
                          ["uv", "run", "python", "scripts/expand_list.py",
                           "--config", args.collect_config,
-                          "--pages", str(args.list_pages)]) == "risk":
+                          "--pages", str(args.list_pages),
+                          "--over-quota", args.over_quota]) == "risk":
                 halt("expand_list 命中 [RISK-STOP]")
                 sys.exit(3)
             time.sleep(30)
@@ -376,7 +378,8 @@ def main() -> None:
                              ROOT / "logs" / f"backfill-slow-{stamp}.log",
                              ["uv", "run", "python", "scripts/backfill_details.py",
                               "--config", args.collect_config,
-                              "--limit", str(lim)]) == "risk":
+                              "--limit", str(lim),
+                              "--over-quota", args.over_quota]) == "risk":
                     halt("backfill 命中 [RISK-STOP]")
                     sys.exit(3)
             else:

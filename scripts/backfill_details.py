@@ -108,9 +108,26 @@ async def main() -> None:
     parser.add_argument("--limit", type=int, default=150)
     parser.add_argument("--include-sample", action="store_true",
                         help="也给 sample 岗位补详情（默认只补 active，省详情配额）")
+    # 越线行为是**策略**，由调用方给，不写死在配置或代码里。
+    # 默认 None = 用配置文件里的值（当前默认 stop，保持历史行为）。
+    parser.add_argument("--over-quota", choices=("stop", "slow"), default=None,
+                        help="越过 max_requests_per_day 后：stop=停机，slow=降速跑完。"
+                             "默认用配置文件的 over_quota_action")
+    parser.add_argument("--slow-ladder", default=None,
+                        help="降速档位 用量倍数:延迟乘数，逗号分隔（配合 --over-quota slow）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    # 命令行覆盖配置：策略由本次调用决定，配置只提供默认值。
+    if args.over_quota:
+        cfg.over_quota_action = args.over_quota
+        print(f"[策略] 越线行为 = {args.over_quota}")
+    if args.slow_ladder:
+        cfg.over_quota_ladder = [
+            (float(t), float(m))
+            for t, _, m in (p.partition(":") for p in args.slow_ladder.split(","))
+        ]
+        print(f"[策略] 降速档位 = {cfg.over_quota_ladder}")
     with JobStore(cfg.database_path) as store:
         status_filter = "" if args.include_sample else "AND retention_status = 'active' "
         # 多取一些候选，因为下面要按投递池判定过滤掉注定被降级的，

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import random
 import sys
@@ -30,7 +31,9 @@ from job_radar.collectors.boss import (  # noqa: E402
     BossCollector,
 )
 from job_radar.config import load_config  # noqa: E402
+from job_radar.refresh_fetch import quota_factor  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
+from job_radar.throttle import gaussian  # noqa: E402
 
 # ⚠️ 2026-08-10 两处修复（详见 boss.py:_evaluate_fetch 注释）：
 # ① headers 必须嵌在 init 的 `headers` 键里，否则 fetch 静默丢弃非白名单键
@@ -88,12 +91,19 @@ async def main() -> None:
     parser.add_argument("--dry-stop", type=int, default=5,
                         help="连续几页零新增才换关键词（默认 5：浅层零新增是常态，"
                              "深层才出货，设太小会在富矿前掉头）")
+    # 越线行为是策略，由调用方给。默认 None = 用配置文件的值（当前 stop）。
+    parser.add_argument("--over-quota", choices=("stop", "slow"), default=None,
+                        help="越过 max_requests_per_day 后：stop=停止（默认），slow=降速继续")
     parser.add_argument("--restart", action="store_true",
                         help="忽略断点进度，所有关键词从第 1 页重新翻"
                              "（平台岗位有轮换，隔一段时间重扫浅层有意义）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    # 命令行覆盖配置：策略由本次调用决定，配置只给默认值。
+    if args.over_quota:
+        cfg.over_quota_action = args.over_quota
+        print(f"[策略] 越线行为 = {args.over_quota}")
     # ⚠️ 遍历**全部**城市。原先只取 cities[0]，配置里写三个城市它也只抓第一个——
     # 静默跑三倍时间抓同一批数据，而日志看不出任何异常（2026-08-11 扩沪深时发现）。
     cities = cfg.cities
@@ -126,6 +136,8 @@ async def main() -> None:
         with JobStore(cfg.database_path) as store:
             from job_radar.throttle import HumanThrottle
             throttle = HumanThrottle(cfg)
+            # 越线提示的节流游标（每 50 次请求提示一次，别刷屏）
+            last_over_notice = -10**9
             # zp_token（= cookie bst）在页面内现读，不需要 Python 侧传，见 FETCH_TPL。
             seen_new = seen_total = 0
             recover_count = 0  # code=37 恢复次数，过高即熔断（防封号）
@@ -173,12 +185,26 @@ async def main() -> None:
                     last_page_done = done_page
                     for p in range(start_page, end_page + 1):
                         used = store.request_counts().get("total", 0)
+                        # 越线行为由 cfg.over_quota_action 决定（策略，由调用方给）：
+                        # stop=达上限停止（历史行为），slow=降速继续跑完。
                         if used >= cfg.max_requests_per_day:
-                            print(f"⛔ 今日累计请求 {used}/{cfg.max_requests_per_day}，"
-                                  f"达上限主动停止（封禁按累计量算）")
-                            break
+                            if cfg.over_quota_action == "stop":
+                                print(f"⛔ 今日累计请求 {used}/{cfg.max_requests_per_day}，"
+                                      f"达上限主动停止（封禁按累计量算）")
+                                break
+                            if used - last_over_notice >= 50:
+                                last_over_notice = used
+                                print(f"[OVER-QUOTA] 累计 {used}/"
+                                      f"{cfg.max_requests_per_day}，降速继续")
                         # 请求前节流：高斯延迟 + 突发惩罚（账号信任度已降低，不能无脑快抓）
                         await throttle.delay_before_request("list")
+                        # 越线后额外拉长间隔（倍数由 cfg.over_quota_ladder 定）
+                        f = quota_factor(used, cfg.max_requests_per_day,
+                                         cfg.over_quota_ladder
+                                         if cfg.over_quota_action == "slow" else None)
+                        if f > 1.0:
+                            lo, hi = cfg.request_delay_seconds
+                            await asyncio.sleep(gaussian(lo * (f - 1), hi * (f - 1)))
                         params = collector._params(city, kw, filters, p)
                         url = f"{ORIGIN}{API_PATH}?{urlencode(params)}"
                         text = ""
