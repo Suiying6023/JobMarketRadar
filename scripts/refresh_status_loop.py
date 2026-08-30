@@ -88,6 +88,14 @@ MIN_WINDOW = 5
 # 反复重算换不回一个已经在收缩的窗口。
 EXIT_STRIKE_LIMIT = 3
 
+# 重算 stoken 后要等多久才 fetch。**下界不能小于 5s**（2026-08-30 实测）：
+# 扫 0/1/2/3/5/8s 各 3 次，成功率 0% / 33% / 100% / 67% / 100% / 100%。
+# 趋势可信（0s 必失败、≥5s 必成功），但 **2s 那个 100% 与 3s 的 67% 是噪声**
+# —— 每档只 3 次，单次翻转就能造出这种假差异，所以不要照着 2s 去优化。
+# 原值是 3-5s（随手取的，从没量过），下界偏小。
+# 探针 `scripts/probe_stoken_recovery.py`，数据 `data/calibration/stoken-recovery.json`。
+REWARM_WAIT = (5.0, 7.0)
+
 # 出口池：(标识, SOCKS 端口)
 EXITS = [("vm", 1080), ("container", 1082)]
 FAIL_STREAK = 10         # 连续这么多条未判定才怀疑出口失效（先探再判，别急着弹窗）
@@ -719,7 +727,7 @@ async def main() -> None:
                     if clean_windows >= 2 and window_now < FETCH_WINDOW:
                         window_now += 1
                         clean_windows = 0
-                    await asyncio.sleep(random.uniform(3.0, 5.0))
+                    await asyncio.sleep(random.uniform(*REWARM_WAIT))
 
             rec = await fetch_job(page, r["source_job_id"])
             since_warm += 1
@@ -753,7 +761,7 @@ async def main() -> None:
                         window_now = FETCH_WINDOW
                         exit_strikes = 0
                         rotated = True
-                        await asyncio.sleep(random.uniform(3.0, 5.0))
+                        await asyncio.sleep(random.uniform(*REWARM_WAIT))
                         rec = await fetch_job(page, r["source_job_id"])
                         log_requests(con, REQ_PER_JOB,
                                      outcome="ok" if rec.get("ok") else "challenged")
@@ -768,7 +776,7 @@ async def main() -> None:
                     # 拿到新 cookie 了。原因是新 stoken 需要一小会儿才对
                     # fetch 生效（导航本身也还在收尾）。等一拍再打，
                     # 否则每个窗口边界都要白费一条。
-                    await asyncio.sleep(random.uniform(3.0, 5.0))
+                    await asyncio.sleep(random.uniform(*REWARM_WAIT))
                     rec = await fetch_job(page, r["source_job_id"])
                     log_requests(con, REQ_PER_JOB,
                                  outcome="ok" if rec.get("ok") else "challenged")
