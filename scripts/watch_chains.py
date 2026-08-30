@@ -80,7 +80,11 @@ def main() -> None:
         tail, hits = "", []
         if p.exists():
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            # 只认 RISK-STOP。**BUDGET-STOP 不算异常** —— 它是日线到顶的正常
+            # 预算行为，明日自然恢复。两者曾共用一个标记，导致 900/900 正常停机
+            # 被报成"需要人工介入"（2026-08-30 实测踩到）。
             hits = [l for l in lines if "[RISK-STOP]" in l]
+            budget = [l for l in lines if "[BUDGET-STOP]" in l]
             # 取最后一条**有进度语义**的行，跳过节奏/停顿提示
             for l in reversed(lines):
                 if re.search(r"进度|完成|本轮|待检测|待补", l):
@@ -88,6 +92,8 @@ def main() -> None:
                     break
         state = "运行中" if n >= 1 else "已结束"
         print(f"  {name:<9} {state:<7} {tail}")
+        if budget and not hits:
+            print(f"    💰 额度到顶正常停止（无需人工）：{budget[-1].strip()[:80]}")
         if hits:
             risk = True
             print(f"    ⛔ RISK-STOP: {hits[-1].strip()[:100]}")

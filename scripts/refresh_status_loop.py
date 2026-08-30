@@ -543,7 +543,9 @@ async def main() -> None:
     print(f"[账本] 今日已用 {used} 次请求 / 上限 {args.daily_cap}，"
           f"余量 {room} 次 ≈ {affordable} 条（每条摊薄 {per_job_req:.2f} 次）")
     if affordable <= 0:
-        print("今日请求额度已用尽，明天再跑。封禁按累计请求量算，不是按条数。")
+        # 与 backfill_details 用同一个标记体系：BUDGET-STOP 是正常预算行为
+        # （明日自然恢复、无需人工），RISK-STOP 才需要人立刻处理。
+        print("[BUDGET-STOP] 今日请求额度已用尽，明天再跑。无需人工介入。")
         return
     if len(rows) > affordable:
         print(f"本轮按额度截到 {affordable} 条（原 {len(rows)} 条）")

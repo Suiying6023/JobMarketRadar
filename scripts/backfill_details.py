@@ -257,14 +257,26 @@ async def main() -> None:
                 if done % 4 == 0:
                     print(f"进度 {done}/{len(rows)}")
         except RiskControlStop as exc:
-            # 用**唯一且好 grep 的标记**打头。长跑时这行会埋在几百行进度里，
-            # 而它是唯一需要人立刻知道的事（`code=36/32` 要人工过验证）。
-            # 监控只要 grep 这个标记，不必去解析进度行。
-            print("!" * 68, flush=True)
-            print(f"[RISK-STOP] 命中风控，已停止：{exc}", flush=True)
-            print("[RISK-STOP] 若是 code=36/32，需要人工过验证："
-                  "uv run python scripts/check_account_status.py", flush=True)
-            print("!" * 68, flush=True)
+            # ⚠️ `RiskControlStop` 承担了**两类语义完全不同**的停止：
+            #   ① 真风控（code=36/32、验证页）—— 要人立刻处理
+            #   ② 日线闸门到顶（账本 >= max_requests_per_day）—— 正常预算行为，
+            #      明天自然恢复，**不需要任何人工介入**
+            # 两者都打同一个 `[RISK-STOP]` 会让长跑巡检误报（实测踩到：
+            # 900/900 停机被标成风控，巡检报"需要人工介入"）。
+            # 所以这里按消息内容分流成两个标记，让监控能直接判读。
+            msg = str(exc)
+            if "今日累计请求已达" in msg or "单次运行请求上限" in msg:
+                print("=" * 68, flush=True)
+                print(f"[BUDGET-STOP] 额度到顶，正常停止：{msg}", flush=True)
+                print("[BUDGET-STOP] 无需人工介入，明日额度重置后可续跑。",
+                      flush=True)
+                print("=" * 68, flush=True)
+            else:
+                print("!" * 68, flush=True)
+                print(f"[RISK-STOP] 命中风控，已停止：{msg}", flush=True)
+                print("[RISK-STOP] 若是 code=36/32，需要人工过验证："
+                      "uv run python scripts/check_account_status.py", flush=True)
+                print("!" * 68, flush=True)
         finally:
             print(f"完成 {done} 条，失败 {failed} 条，共发起请求 {collector.request_count} 次，code=37 重算 {collector.code37_count} 次")
             if stale_skipped:
