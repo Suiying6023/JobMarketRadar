@@ -505,23 +505,59 @@ class BossCollector(Collector):
         )
 
     def _should_keep(self, job: JobRecord) -> bool:
+        """列表阶段的准入判定 —— **这是唯一花不可退配额的一环**。
+
+        ⚠️ 判据必须与 `profile` 同源。原先只读 config 的 YAML 名单，而
+        `profile.py` 开头声称"各脚本一律 from job_radar.profile import"，
+        采集侧是唯一没收敛进来的一环，于是两份名单各自漂移：
+        实测 profile 有而 YAML 缺 `猎头`/`劳务派遣`（标题）、
+        `人力资源`/`华钦`/`新致软件`/`汉得`（公司）。
+
+        更贵的是**城市与薪资从不在这里判**，而它们在列表响应里就已知。
+        实测代价（2026-08-30）：3207 条注定被 clean_local_db 降级的岗位里，
+        **828 条已经花掉了详情配额**（超纲 596、匿名 112、公司 69、标题 30、
+        非目标城市 10）—— 一条详情就是一次不可退的请求。
+        超纲一项就占 596 条，而 `salary_min_k`/`salary_max_k` 全部来自列表。
+
+        YAML 名单保留为**追加**而非替代：配置可以按轮次临时加词，
+        但不能让它成为绕过 profile 基线的通道。
+        """
         title = job.title.lower()
         company = job.company_name.lower()
         if self.config.include_title_keywords and not any(
             word.lower() in title for word in self.config.include_title_keywords
         ):
             return False
+        # profile 基线 + config 追加，两份都要过
+        if profile.match_keyword(job.title, profile.EXCLUDE_TITLE):
+            return False
         if any(word.lower() in title for word in self.config.exclude_title_keywords):
             return False
+        if profile.match_keyword(job.company_name, profile.EXCLUDE_COMPANY):
+            return False
         if any(word.lower() in company for word in self.config.exclude_company_keywords):
+            return False
+        # OD 要按词边界判（裸子串会吃掉 Coding，见 profile.outsourced_od）
+        if profile.outsourced_od(job.title):
+            return False
+        # 届别错位：只能从标题识别，JD 正文里没有
+        if profile.future_cohort(job.title):
             return False
         # 匿名公司在列表阶段就能判（raw.anonymous），必须在这里拦：
         # 标成 active 就会去抓详情，而投递前无法核实公司身份的岗位最终一定被
         # clean_local_db 降级 —— 等于每条白花一次详情配额。
         if profile.is_anonymous(job.raw, job.company_name):
             return False
+        # 城市与薪资：列表响应里就已知，**前移到这里能省下最大一笔配额**
+        if not profile.city_allowed(job.city or ""):
+            return False
+        if profile.salary_out_of_range(job.salary_min_k, job.salary_max_k,
+                                      job.salary_months):
+            return False
         # 日薪岗基本都是实习/日结，即使标题没写“实习”也按薪资口径排除。
         if is_daily_rate(job.salary_text):
+            return False
+        if profile.is_daily_salary(job.salary_min_k, job.salary_max_k):
             return False
         return bool(job.title and job.job_url)
 

@@ -375,6 +375,10 @@ async def main() -> None:
     ap.add_argument("--batch", type=int, default=120,
                     help="本次最多处理多少条（默认 120，一轮人工验证大约撑这么多）")
     ap.add_argument("--all", action="store_true", help="不限条数，跑到没有为止")
+    ap.add_argument("--include-no-jd", action="store_true",
+                    help="也刷还没抓 JD 的岗位（默认只刷已进投递池的）。"
+                         "默认关闭的理由：一条刷新 14 次请求，而无 JD 的岗位"
+                         "页面上看不见，刷了没收益 —— 实测占了 70%")
     ap.add_argument("--stale-days", type=int, default=60,
                     help="活跃度换算天数 >= 此值即降级为 sample")
     ap.add_argument("--rotate-every", type=int, default=15, help="每 N 条换出口")
@@ -401,10 +405,30 @@ async def main() -> None:
 
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
+    # ⚠️ 只刷**已在投递池里**（有 JD）的岗位，且按快照年龄从旧到新。
+    #
+    # 一条刷新 = 14 次请求，是整个项目最贵的单位操作。而实测（2026-08-30）
+    # 原先的选行取 2703 条，其中 **1896 条（70%）没有 JD** —— 它们还没进池，
+    # 页面上根本看不见，刷了活跃度没有任何收益。全刷需要 37842 次请求，
+    # 只刷有 JD 的需要 11298 次，省下 26544 次。
+    #
+    # 排序也从 `canonical_id`（等于随机）改成按快照年龄降序：有 JD 的 807 条里
+    # 345 条是 3 天内刚抓的（不必刷），462 条超 15 天（真需要刷）。
+    # 按 id 排会让每轮都从同一批开始，最旧的那些永远轮不到。
+    #
+    # `--include-no-jd` 保留手动开关：如果哪天想给无 JD 的岗位刷状态
+    # （比如先判死活再决定要不要花详情配额），显式打开。
+    where = ("WHERE retention_status='active' AND job_invalid=0 "
+             "  AND job_status_desc != '职位已关闭' ")
+    if not args.include_no_jd:
+        where += "  AND job_description != '' "
     rows = con.execute(
         "SELECT canonical_id, title, company_name, source_job_id FROM jobs "
-        "WHERE retention_status='active' AND job_invalid=0 "
-        "  AND job_status_desc != '职位已关闭' ORDER BY canonical_id"
+        + where +
+        # NULL 最旧，排最前；detail_fetched_at 有 Z 与 +00:00 两种后缀，
+        # 但前 10 位都是日期，按字符串升序即年龄降序。
+        "ORDER BY CASE WHEN detail_fetched_at IS NULL OR detail_fetched_at='' "
+        "         THEN 0 ELSE 1 END, detail_fetched_at ASC"
     ).fetchall()
     if not args.all:
         rows = rows[: args.batch]

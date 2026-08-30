@@ -32,9 +32,13 @@ def test_should_keep_rejects_anonymous_before_detail_fetch():
     """
     collector = _collector()
     raw = json.loads(Path("tests/fixtures/boss_joblist.json").read_text(encoding="utf-8"))["zpData"]["jobList"][0]
+    # fixture 的薪资是 `20-35K·14薪`（月基薪均值 27.5K），本身就超 25K 门槛 ——
+    # 而这条测试要证明的是**匿名公司**被拦，所以基准行得先在薪资上过关，
+    # 否则两个原因混在一起，断言通过与否都说明不了匿名判定有没有生效。
+    raw = {**raw, "salaryDesc": "15-25K", "salaryMonth": 12}
 
     normal = collector._parse_api_job(raw, "AI Agent", 1)
-    assert collector._should_keep(normal) is True
+    assert collector._should_keep(normal) is True, "基准行应通过，否则下面证明不了匿名判定"
 
     anon = collector._parse_api_job({**raw, "anonymous": 101,
                                      "brandName": "某大型互联网公司"}, "AI Agent", 1)
