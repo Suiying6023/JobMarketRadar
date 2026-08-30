@@ -32,7 +32,8 @@ sys.path.insert(0, str(ROOT / "src"))
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位 JD 正文提取硬性要求与加分项，并综合判断该岗位是否符合给定的求职者画像。只输出 JSON，不要任何解释或前后缀。
+SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位标题与 JD 正文提取硬性要求与加分项，并综合判断该岗位是否符合给定的求职者画像。只输出 JSON，不要任何解释或前后缀。
+⚠️ 输入里的「岗位标题」和「薪资」与 JD 正文**同等有效**：届别限制（27届/校招/实习）绝大多数只写在标题里，JD 正文往往完全不提；薪资也多半只在「薪资」字段而不在正文。判断时必须一并读。
 
 求职者画像（26届应届本科·双非，求职杭州 AI/Agent/大模型 编程开发岗，要求双休）：
 可投：AI/Agent 开发、大模型应用、算法、AI全栈/后端/前端/客户端等编程岗；AI 产品经理。
@@ -42,7 +43,7 @@ SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位 
      "倾向985""top 985/211""限985""985起"都算硬门槛；只有同句带"优先/加分/更佳"才不算。
      ⚠️ "统招本科""全日制本科"**不是**名校门槛，求职者满足，不要算命中
   3. 硕士及以上学历（"硕士及以上""仅招硕士""研究生学历"算；"硕士优先""硕博优先"不算）
-  4. 仅限27届 / 仅招实习生
+  4. 仅限27届 / 仅招实习生（**标题里的「27届」「27届校招」就足以命中**，不需要 JD 正文另写）
   5. 硬性英语四级及以上（"优先/加分"不算硬性）
   6. 非双休：大小周/单休/996/上六休一/六天工作制等
   7. 电销/电话销售/电话开发客户
@@ -50,7 +51,7 @@ SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位 
   9. 纯设计岗/内容岗/运营岗/市场销售BD岗
   10. 非编程业务岗：商品开发/辅料开发/面料/饰品/采购/商务/货代/跟单/企划/渠道/外贸/出纳/会计等（即使标题带"开发"）
   11. 普通产品岗（文创/电商/服饰/五金/供应链等）；AI/Agent 产品岗可留
-  12. 最高薪资低于 7K（无薪资信息不算）
+  12. 最高薪资低于 7K（看输入里的「薪资」字段；没给薪资就不算命中）
 
 输出格式（必须严格是这个结构，字段顺序也必须一致）：
 {"exp_req":[],"edu_req":[],"school_req":[],"tech_req":[],"other_req":[],"bonus":[],"job_type":"开发岗/算法岗/测试岗/设计岗/运营岗/市场岗/产品岗/内容岗/其他","grad_year":"26届可投/仅27届/仅实习/不限","work_schedule":"双休/大小周/单休/其他非双休/未提及","fresh_grad":"接受应届/不接受应届/优秀应届可放宽","match_evidence":"","match_reason":"","match":"keep/demote"}
@@ -106,6 +107,10 @@ SYSTEM_PROMPT = """你是岗位画像提取与投递匹配判断器。从岗位 
       （应届生没有工作经验，这本身就是硬门槛，不需要 JD 另写"不招应届"）
     · 仅当同句或邻句明确给了应届出口时才改判 keep：
       "优秀应届生可放宽""或应届生""接受应届""经验不限""应届亦可"
+    · ⚠️ 出口必须与门槛**同维度**：放宽「专业」「学历」的表述**不能**豁免经验年限；
+      写明「优秀硕士应届可放宽」的出口**不适用于本科应届**；
+      「公司愿意培养新人」「有导师带教」「可提供成长空间」这类福利/培养话术
+      **不是**经验豁免。跨维度搭桥属于判错。
     · ⚠️ "全文没写不招应届"**不是**出口。绝大多数 JD 都不会专门写这句，
       把它当出口等于让年限门槛永远不生效。
     · "熟练掌握 Python（1年以上经验）"这类描述**技能熟练度**而非工龄的，不算命中。
@@ -183,9 +188,21 @@ def _escape_inner_quotes(text: str) -> str:
     """
     out: list[str] = []
     in_str = False
-    for i, ch in enumerate(text):
+    i = -1
+    # 用 while 而不是 for/enumerate：遇到反斜杠要**连它转义的那个字符一起消费**。
+    # 原先只 append 反斜杠自身就 continue，紧随其后的 `"` 会被当成独立引号重新判定，
+    # 于是**已经正确转义的 `\"` 被改成 `\\"`**（转义反斜杠 + 引号），字符串提前终止。
+    # 对全合法 JSON 无影响（json.loads 先成功，不会进这个修复路径），
+    # 但模型吐出"一部分正确转义、一部分裸引号"的混合串时，
+    # 这恰恰是该函数存在的场景，而它会把本来能救回的串弄得更坏。
+    while i + 1 < len(text):
+        i += 1
+        ch = text[i]
         if ch == "\\":
             out.append(ch)
+            if i + 1 < len(text):
+                i += 1
+                out.append(text[i])
             continue
         if ch == '"':
             if not in_str:
@@ -212,13 +229,27 @@ def _loads_lenient(content: str) -> dict:
         return json.loads(_escape_inner_quotes(content))
 
 
-def call_glm(env: dict, jd: str, max_retries: int = 5) -> tuple[dict | None, str | None, int]:
-    """调用 LLM，返回 (解析 JSON 或 None, 错误或 None, 尝试次数)。429 指数退避重试。"""
+def call_glm(env: dict, jd: str, title: str = "", salary: str = "",
+             max_retries: int = 5) -> tuple[dict | None, str | None, int]:
+    """调用 LLM，返回 (解析 JSON 或 None, 错误或 None, 尝试次数)。429 指数退避重试。
+
+    ⚠️ **必须带上标题**：排除项里的「仅限 27 届」这类届别限制**只存在于标题**，
+    JD 正文里几乎没有（项目记忆里早有这条实测结论，而 prompt 却在要求判届别）。
+    原先 `title` 在 main() 里查出来只用于打日志，从未进入模型上下文 ——
+    结果 6 条标题明写 27 届的岗位全部判 keep 且留在 active，
+    而模型没有任何可能判对。薪资同理：排除项 12 卡 <7K，
+    但只有 8.2% 的 JD 正文提到薪资，`salary_text` 在库里却是现成的。
+    """
+    head = ""
+    if title:
+        head += f"岗位标题：{title}\n"
+    if salary:
+        head += f"薪资：{salary}\n"
     body = json.dumps({
         "model": env["LLM_MODEL"],
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"岗位 JD：\n{jd[:2500]}"},
+            {"role": "user", "content": f"{head}岗位 JD：\n{jd[:2500]}"},
         ],
         "temperature": 0.1,
         "max_tokens": 4000,
@@ -310,15 +341,17 @@ def main() -> None:
         # 显式指名的岗位一律重判，不受分层与"已提取过"限制 —— 调用方要的就是覆盖。
         qs = ",".join("?" * len(ids))
         rows = con.execute(
-            f"SELECT canonical_id, title, company_name, job_description FROM jobs"
-            f" WHERE canonical_id IN ({qs}) AND job_description != ''", ids).fetchall()
+            f"SELECT canonical_id, title, company_name, salary_text, job_description"
+            f" FROM jobs WHERE canonical_id IN ({qs}) AND job_description != ''",
+            ids).fetchall()
         print(f"按 id 列表处理 {len(rows)} 条（列表给了 {len(ids)} 个 id）")
     else:
         where = "WHERE retention_status = 'active' AND job_description != ''"
         if not args.force:
             where += " AND glm_tags_updated_at = ''"
         rows = con.execute(
-            f"SELECT canonical_id, title, company_name, job_description FROM jobs {where}"
+            f"SELECT canonical_id, title, company_name, salary_text, job_description"
+            f" FROM jobs {where}"
         ).fetchall()
     if args.limit:
         rows = rows[: args.limit]
@@ -332,7 +365,9 @@ def main() -> None:
     start_all = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         # 一次提交全部 futures
-        futures = {pool.submit(call_glm, env, r["job_description"]): r for r in rows}
+        futures = {pool.submit(call_glm, env, r["job_description"],
+                               r["title"] or "", r["salary_text"] or ""): r
+                   for r in rows}
         for idx, fut in enumerate(as_completed(futures), 1):
             r = futures[fut]
             parsed, err, attempts = fut.result()

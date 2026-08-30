@@ -118,6 +118,29 @@ def outsourced_od(title: str) -> bool:
     if _NOT_OD_RE.search(t):
         return False
     return bool(_OD_RE.search(t))
+
+
+_COHORT_RE = _re.compile(r"(20\d{2}|\d{2})\s*届")
+
+
+def future_cohort(title: str) -> bool:
+    """标题写的届数是否晚于求职者（26 届）→ 投不进去。
+
+    **届数只存在于标题**：详情接口的 `postDescription` 不含毕业时间，
+    那是校招岗专属的服务端渲染结构化字段（2026-08-10 抽查 5 岗验证）。
+    所以这条只能按标题正则判，不能指望 LLM 从 JD 正文读出来 ——
+    实测 8 条标题写 27 届的岗位 LLM 全判 keep、`grad_year` 甚至标成
+    「26届可投」，因为标题此前从未进入 prompt（已修，但存量标签仍是错的）。
+
+    放在 profile 里是为了让画像层和导出层共用一份实现：
+    原先只有导出层有，那 8 条便以 active 留在库里被反复刷状态、补详情。
+    """
+    m = _COHORT_RE.search(title or "")
+    if not m:
+        return False
+    num = m.group(1)
+    yr = int(num) if len(num) == 4 else 2000 + int(num)
+    return yr > COHORT_YEAR
 EXCLUDE_COMPANY = (
     "猎头", "劳务派遣", "人力资源",
     # IT/人力外包服务公司（名称关键词，命中即降级；2026-08-03 确认）

@@ -436,14 +436,12 @@ def is_cv_job(r) -> bool:
 
 def is_future_cohort(r) -> bool:
     """校招届数错位剔除：用户 26 届，标题含 27届/2027届 等未来届 → 不投。
-    JD 正文通常不提届数（详情接口 postDescription 也不含毕业时间——那是校招岗
-    专属的服务端渲染结构化字段），届数只在标题里。2026-08-10 抽查 5 岗验证。"""
-    m = re.search(r"(20\d{2}|\d{2})届", r["title"] or "")
-    if not m:
-        return False
-    num = m.group(1)
-    yr = int(num) if len(num) == 4 else 2000 + int(num)
-    return yr > P.COHORT_YEAR
+
+    实现已移到 `profile.future_cohort()`，让画像层与导出层共用一份 ——
+    原先只有这里有，那批岗位便以 active 留在库里被反复刷状态、补详情。
+    这里保留薄封装是因为调用方传的是整行而不是标题。
+    """
+    return P.future_cohort(r["title"] or "")
 
 
 def hard_drop(r) -> str:

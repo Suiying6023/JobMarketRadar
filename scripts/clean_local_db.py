@@ -71,6 +71,13 @@ def should_demote(r) -> tuple[bool, str]:
     # OD 单独判：它要按词边界匹配，混进 EXCLUDE_TITLE（裸子串）会吃掉 Coding
     if P.outsourced_od(r["title"] or ""):
         return True, "外包[OD]"
+    # 届别错位（用户 26 届，标题写 27 届）。原先只有导出层查，
+    # 结果这 8 条以 active 留在库里，每轮还被刷状态、补详情 ——
+    # 而它们永远不可能进池。实测 LLM 全部判 keep（`grad_year` 甚至标成
+    # 「26届可投」）：**届数只在标题里，而标题此前从未进入 prompt**，
+    # 模型没有任何可能判对。两层判据在这里是互补的，都要有。
+    if P.future_cohort(r["title"] or ""):
+        return True, "未来届"
     kw = P.match_keyword(r["company_name"] or "", P.EXCLUDE_COMPANY)
     if kw:
         return True, f"公司[{kw}]"

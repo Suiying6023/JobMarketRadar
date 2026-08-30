@@ -159,6 +159,55 @@ def test_lenient_json_preserves_valid_payloads(payload, expect):
     assert _mod._loads_lenient(payload)["match"] == expect
 
 
+def test_lenient_json_repairs_mixed_escaping():
+    """一部分已转义、一部分裸引号的混合串也要能救回。
+
+    原先反斜杠只 append 自身就 continue，**没有消费它转义的那个字符**，
+    于是紧随的 `"` 被当成独立引号重新判定，已正确转义的 `\\"` 被改成
+    `\\\\"`（转义反斜杠+引号）→ 字符串提前终止，修完仍解析失败。
+    对全合法 JSON 无影响（json.loads 先成功，不进修复路径），
+    但混合串恰恰是这个函数存在的理由。
+    """
+    broken = (r'{"a":"he said \"hi\" ok",'
+              '"b":"bare "quote" here","match":"keep"}')
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(broken)
+    parsed = _mod._loads_lenient(broken)
+    assert parsed["match"] == "keep"
+    assert parsed["a"] == 'he said "hi" ok', "已转义部分不该被破坏"
+    assert parsed["b"] == 'bare "quote" here', "裸引号部分该被修好"
+
+
+def test_prompt_includes_title_and_salary():
+    """标题与薪资必须进入模型上下文。
+
+    届别限制（27届/校招）绝大多数**只写在标题里**，JD 正文往往完全不提；
+    薪资也多半只在字段里（只有 8.2% 的 JD 正文提到薪资）。
+    原先 title 查出来只用于打日志，结果 6 条标题明写 27 届的岗位全部判 keep，
+    而模型没有任何可能判对 —— prompt 在要求它判一件它看不到的事。
+    """
+    import inspect
+    src = inspect.getsource(_mod.call_glm)
+    assert "岗位标题" in src, "user message 必须带标题"
+    assert "薪资" in src, "user message 必须带薪资"
+    # prompt 也要说明标题与正文同等有效，否则模型可能只当参考
+    assert "同等有效" in _mod.SYSTEM_PROMPT
+    # 调用点要真的传进去（签名有参数但调用不传是静默失效）
+    caller = inspect.getsource(_mod.main)
+    assert 'r["title"]' in caller and 'r["salary_text"]' in caller
+
+
+def test_prompt_requires_same_dimension_exemptions():
+    """豁免必须与门槛同维度，否则模型会跨维度搭桥。
+
+    实测 4 类误判：用「可放宽专业要求」豁免经验年限、用「公司愿意培养新人」
+    （福利话术）豁免经验、用「接受优秀硕士应届」豁免本科应届。
+    """
+    p = _mod.SYSTEM_PROMPT
+    assert "同维度" in p
+    assert "本科应届" in p, "要说明硕士出口不适用于本科应届"
+
+
 def test_prompt_asks_for_chinese_quotes():
     """双管齐下：解析层能修，也要让模型少产生这种输出。"""
     assert "「」" in SYSTEM_PROMPT
