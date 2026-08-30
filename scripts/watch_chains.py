@@ -66,11 +66,25 @@ def exit_state(port: int | None) -> str:
     cmd.append(INFO)
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        zp = (json.loads((out.stdout or "{}").strip()) or {}).get("zpData") or {}
+        raw = (out.stdout or "").strip()
     except Exception as exc:
-        return f"查不到（{type(exc).__name__}）"
+        return f"⚠️ 查不到（{type(exc).__name__}）"
+    # ⚠️ 空响应 = 隧道不通（curl 超时），**不是 ok**。
+    # 实测踩到：container 隧道断了（端口仍 LISTENING 但流量不通），
+    # 而旧代码把空响应 json 成 {} → code != 31 → 报 "ok ip=?"。
+    # 那是假绿灯：真正的信息在「ip 取不到」里，却被 ok 盖住了。
+    # 判据必须先确认**拿到了可解析的响应**，再看 code。
+    if not raw:
+        return "⚠️ 隧道不通（无响应，端口可能还在 LISTENING 但转发已失效）"
+    try:
+        zp = (json.loads(raw) or {}).get("zpData") or {}
+    except json.JSONDecodeError:
+        return f"⚠️ 非 JSON 响应: {raw[:50]}"
     if zp.get("code") != 31:
-        return f"ok  ip={zp.get('ip', '?')}"
+        ip = zp.get("ip")
+        if not ip:
+            return "⚠️ 响应里没有 ip（异常，别当 ok）"
+        return f"ok  ip={ip}"
     kind = "verify(可人工过)" if zp.get("jumpVerify") else "blocked(硬封)"
     exp = zp.get("expireTime")
     when = ""
@@ -110,11 +124,19 @@ def main() -> None:
             print(f"    ⛔ RISK-STOP: {hits[-1].strip()[:100]}")
 
     print("  出口:")
+    tunnel_down = []
     for label, port in (("vm", 1080), ("container", 1082), ("家宽", None)):
         s = exit_state(port)
         print(f"    {label:<10} {s}")
         if s.startswith("⛔"):
-            risk = True
+            risk = True          # 被风控标记 → 要人工过验证
+        elif s.startswith("⚠️") and port:
+            tunnel_down.append((label, port))   # 隧道断 → 重起即可，不用人
+    if tunnel_down:
+        print("  隧道不通（**不是风控**，重起即可，不需要人工过验证）:")
+        for label, port in tunnel_down:
+            print(f"    ssh -f -N -D {port} -o ServerAliveInterval=30 "
+                  f"bohrium-{'vm' if label == 'vm' else 'container'}")
 
     con = sqlite3.connect(DB, timeout=30.0)
     day = datetime.now().strftime("%Y-%m-%d")
