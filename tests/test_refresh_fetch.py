@@ -67,6 +67,45 @@ def test_challenge_page_length_threshold_separates_the_two_shapes():
     assert 41_384 < MIN_JOB_HTML_LEN < 138_736
 
 
+def test_shrinking_the_rewarm_threshold_below_five_costs_more_than_hitting_the_wall():
+    """主动重暖的阈值有**收益下限**，收太小反而更贵。
+
+    这条钉的是一次真实的性能回归（2026-08-30）：我加了"撞墙就把阈值降 1"的
+    自适应逻辑，下限写 2，结果那轮 30 条跑出 **4.13 次请求/条** ——
+    而前一轮固定阈值 5 只要 1.68 次。重算占掉总成本 42%，
+    "减少浪费"的机制自己成了最大的浪费。
+
+    模型：主动重暖 = 1 + 重算代价/N；等撞墙 = 1 + (1 浪费 + 3 重算 + 1 重试)/W。
+    重算代价是 3 次请求，所以 N < 5 时主动重暖已经不划算。
+    """
+    def proactive(n: int) -> float:
+        return 1 + 3 / n
+
+    def wait_for_wall(w: int = 5) -> float:
+        return 1 + 5 / w
+
+    # 阈值收到 4 以下就不如等撞墙
+    assert proactive(3) >= wait_for_wall()
+    assert proactive(2) > wait_for_wall()
+    # 而 5 及以上确实划算
+    assert proactive(5) < wait_for_wall()
+    assert proactive(6) < proactive(5)
+
+
+def test_min_window_is_at_the_break_even_point():
+    """下限必须落在盈亏平衡点上，不能为了"更保守"而调低。
+
+    调低阈值直觉上像是"更小心"，实际是**更贵**——这个反直觉正是回归的成因，
+    所以用测试把它固定住。
+    """
+    import re
+    src = (ROOT / "scripts" / "refresh_status_loop.py").read_text(encoding="utf-8")
+    m = re.search(r"^MIN_WINDOW\s*=\s*(\d+)", src, re.M)
+    assert m, "refresh_status_loop.py 里找不到 MIN_WINDOW"
+    assert int(m.group(1)) >= 5, (
+        "MIN_WINDOW 低于 5 时主动重暖比等撞墙更贵（实测 4.13 vs 1.68 次/条）")
+
+
 def test_amortized_cost_reflects_measured_window_and_recovery():
     """成本模型要贴实测：窗口约 5.5 条、恢复 3 次请求 → 摊薄 1.58 次/条。
 

@@ -78,6 +78,16 @@ from job_radar.refresh_fetch import (  # noqa: E402
 # 不再用一个写死的估计值。
 REQ_PER_JOB = 1
 
+# 主动重暖阈值的**下限**。推导见主循环里的注释：每条期望成本
+# = 1 + REQ_PER_RECOVER/N，而等撞墙是 1 + 5/W。N 低于 5 就已经不比等撞墙便宜，
+# 低到 2 时（2.50 次/条）比什么都不做更糟。
+# 实测代价：第一版下限写 2，那轮 30 条跑出 **4.13 次/条**，
+# 而前一轮固定阈值 5 只要 1.68 —— "减少浪费"的机制自己成了最大的浪费。
+MIN_WINDOW = 5
+# 同一出口连续撞墙多少次就换出口。窗口是 **IP 的属性**，
+# 反复重算换不回一个已经在收缩的窗口。
+EXIT_STRIKE_LIMIT = 3
+
 # 出口池：(标识, SOCKS 端口)
 EXITS = [("vm", 1080), ("container", 1082)]
 FAIL_STREAK = 10         # 连续这么多条未判定才怀疑出口失效（先探再判，别急着弹窗）
@@ -646,10 +656,12 @@ async def main() -> None:
             await browser.close()
             return
         since_warm = 0
-        # 自适应窗口：初值取实测上界，撞墙即收缩、连续顺利则回升。
-        # 窗口是**出口的属性**（随该 IP 累计用量收缩），换出口时要重置。
+        # 自适应窗口：初值取实测上界，撞墙即收缩（但不低于 MIN_WINDOW）、
+        # 连续顺利则回升。窗口是**出口的属性**（随该 IP 累计用量收缩），
+        # 换出口时要重置。
         window_now = FETCH_WINDOW
         clean_windows = 0
+        exit_strikes = 0
 
         for i, r in enumerate(rows, 1):
             if i > 1 and (i - 1) % args.rotate_every == 0 and len(usable) > 1:
@@ -673,17 +685,29 @@ async def main() -> None:
                 log_requests(con, REQ_PER_RECOVER, outcome="warm")
                 since_warm = 0
                 # 新出口的窗口是它自己的额度，回到上界重新摸。
+                # strikes 也要清零：它记的是「当前出口」的不健康程度，
+                # 跨出口累加会让刚换上的好出口立刻又被判定该换。
                 window_now = FETCH_WINDOW
                 clean_windows = 0
+                exit_strikes = 0
 
             # 主动重暖：撞墙那一条**必然浪费一次请求**（拿回 41KB 挑战页，
             # 什么都判不出来），还要再花一次重试。与其等撞墙，不如在窗口边界前
             # 主动换 stoken —— 代价相同（都是一次重算），但省掉那两次浪费。
             #
-            # ⚠️ 窗口大小**会随出口累计用量收缩**，不能写死。实测 40 条那轮：
-            # 前四个窗口干净地 5 条一换，之后只撑 2-4 条就撞墙（5 次 challenged）。
-            # 所以这里用**自适应**阈值：撞一次就把阈值降 1，连续顺利则慢慢回升。
-            # 下限 2 —— 再低就是重算比读还频繁，不如换出口。
+            # ⚠️ 阈值**不能无限往下收**，因为重算本身值 3 次请求。
+            # 每条期望成本 = 1 + REQ_PER_RECOVER/N：
+            #   N=6 → 1.50   N=5 → 1.60   N=4 → 1.75   N=3 → 2.00   N=2 → 2.50
+            # 而「等撞墙」的成本是 1 + 5/W（浪费 1 次挑战页 + 3 次重算 + 1 次重试），
+            # W=5 时是 2.00。**所以 N 收到 4 以下就已经比等撞墙更贵**，
+            # 收到 2 更是灾难。
+            #
+            # 这是实测教训：第一版下限写 2，那一轮（30 条）单条成本
+            # **4.13 次**，是四轮里最差的 —— 而前一轮固定阈值 5 只要 1.68 次。
+            # 阈值一旦被撞墙事件推到低位，重算就占掉总成本的 42%，
+            # 「减少浪费」的机制自己变成了最大的浪费。
+            # 所以下限定在 MIN_WINDOW=5：低于它就不该靠重算硬撑，
+            # 该做的是换出口（那个 IP 的窗口已经不健康了）。
             if since_warm >= window_now:
                 print(f"  [窗口] 已连打 {since_warm} 条（阈值 {window_now}），"
                       f"主动重算 stoken", flush=True)
@@ -707,10 +731,36 @@ async def main() -> None:
             # 放过去等于这条白花一次请求且下轮还要再花。
             if not rec.get("ok") and rec.get("reason") == "challenged":
                 print(f"  [窗口] 第 {since_warm} 条后撞挑战页，重算 stoken", flush=True)
-                # 撞墙说明当前阈值偏大（窗口随累计用量收缩），收一格。
-                window_now = max(2, window_now - 1)
+                # 撞墙说明该出口的窗口在缩，但**收阈值的收益有下限**（见上方推导：
+                # 低于 5 就比等撞墙更贵）。所以只收到 MIN_WINDOW 就不再收，
+                # 并记一次该出口的不健康信号。
+                window_now = max(MIN_WINDOW, window_now - 1)
                 clean_windows = 0
-                if await warm_stoken(page, ctx, r["source_job_id"]):
+                exit_strikes += 1
+                # 同一出口反复撞墙 = 那个 IP 的配额窗口已经不健康，
+                # 继续靠重算硬撑只会让重算占比越来越高（实测能到 42%）。
+                # 换出口比换 stoken 有效：窗口是 IP 的属性。
+                rotated = False
+                if exit_strikes >= EXIT_STRIKE_LIMIT and len(usable) > 1:
+                    print(f"  [出口] {cur_tag} 连续 {exit_strikes} 次撞墙，"
+                          f"换出口而不是继续重算", flush=True)
+                    await ctx.close()
+                    ei += 1
+                    ctx, page, cur_tag, cur_port = await new_ctx(ei)
+                    if await warm_stoken(page, ctx, r["source_job_id"]):
+                        log_requests(con, REQ_PER_RECOVER, outcome="warm")
+                        since_warm = 0
+                        window_now = FETCH_WINDOW
+                        exit_strikes = 0
+                        rotated = True
+                        await asyncio.sleep(random.uniform(3.0, 5.0))
+                        rec = await fetch_job(page, r["source_job_id"])
+                        log_requests(con, REQ_PER_JOB,
+                                     outcome="ok" if rec.get("ok") else "challenged")
+                # 换出口已经重暖并重取过值了，别再走下面这条重暖路径 ——
+                # 否则同一条岗位会连着花两次重算 + 两次 fetch（4 次请求），
+                # 正是这类重复让 b4 那轮单条成本冲到 4.13 次。
+                if not rotated and await warm_stoken(page, ctx, r["source_job_id"]):
                     log_requests(con, REQ_PER_RECOVER, outcome="rewarm")
                     since_warm = 0
                     # ⚠️ 重暖成功后不要立刻 fetch。实测（首轮 12 条）两次窗口耗尽
