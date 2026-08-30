@@ -257,7 +257,14 @@ async def main() -> None:
                 if done % 4 == 0:
                     print(f"进度 {done}/{len(rows)}")
         except RiskControlStop as exc:
-            print(f"命中风控，停止：{exc}")
+            # 用**唯一且好 grep 的标记**打头。长跑时这行会埋在几百行进度里，
+            # 而它是唯一需要人立刻知道的事（`code=36/32` 要人工过验证）。
+            # 监控只要 grep 这个标记，不必去解析进度行。
+            print("!" * 68, flush=True)
+            print(f"[RISK-STOP] 命中风控，已停止：{exc}", flush=True)
+            print("[RISK-STOP] 若是 code=36/32，需要人工过验证："
+                  "uv run python scripts/check_account_status.py", flush=True)
+            print("!" * 68, flush=True)
         finally:
             print(f"完成 {done} 条，失败 {failed} 条，共发起请求 {collector.request_count} 次，code=37 重算 {collector.code37_count} 次")
             if stale_skipped:

@@ -621,7 +621,8 @@ async def main() -> None:
                     if again == "ok":
                         usable.append((tag, port))
         if not usable:
-            print("没有可用出口，退出。")
+            # 统一的可 grep 标记，长跑监控只认它（见 backfill_details 的同名标记）
+            print("[RISK-STOP] 没有可用出口（出口被标记或隧道不通），退出。")
             await browser.close()
             return
         print(f"可用出口: {[t for t, _ in usable]}", flush=True)
@@ -688,7 +689,7 @@ async def main() -> None:
                     print(f"[stoken] {cur_tag} 暖场失败，移出出口池", flush=True)
                     usable[:] = [(t, p) for t, p in usable if p != cur_port]
                     if not usable:
-                        print("所有出口都不可用，本轮停止。已处理的结果都已落库。")
+                        print("[RISK-STOP] 所有出口都不可用，本轮停止。已处理的结果都已落库。")
                         break
                     ei += 1
                     ctx, page, cur_tag, cur_port = await new_ctx(ei)
@@ -830,7 +831,7 @@ async def main() -> None:
                         print(f"{cur_tag} IP 已被硬封（见上面的解封时间），移出出口池",
                               flush=True)
                         if not usable:
-                            print("所有出口都不可用，本轮停止。已处理的结果都已落库。")
+                            print("[RISK-STOP] 所有出口都不可用，本轮停止。已处理的结果都已落库。")
                             break
                         streak = 0
                         ei += 1
