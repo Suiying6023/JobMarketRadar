@@ -61,20 +61,23 @@ RISK_DUMP_DIR = Path("data/risk_dumps")
 
 # 一次 code=37 重算折算多少次请求。**不是 1**（2026-08-30 实测推翻）。
 #
-# 重算发两次整页导航（`security-check.html` + 回搜索页）：
-#   · 无拦截：发起 226 次
-#   · 有拦截（`BrowserSession._block_heavy_resources`）：发起 227、拦掉 88，
-#     **真实上网 139 次**
+# 重算发两次导航（`security-check.html` + 回一个同域页），逐步优化的实测轨迹：
+#   · 无拦截 + 回搜索页        ：发起 226 次
+#   · 加资源拦截 + 回搜索页    ：真实上网 **139** 次（拦截只砍 39%）
+#   · 加资源拦截 + 回 /about   ：真实上网 **37** 次  ← 现状，再省 73%
 #
-# ⚠️ 拦截只砍掉约 39%，因为剩下的大头是**脚本 80 + xhr 45**——
-# 那是搜索页这个 SPA 自己的壳，而 script/xhr 恰恰不能拦
-# （stoken 靠自家 JS 算，xhr 就是采集要读的接口）。
-# 所以采集侧不可能像刷新侧那样降到个位数：刷新侧的 1.7 次/条来自
-# **改用同源 fetch 完全不加载页面**，而采集侧的重算**必须走真实导航**。
+# 关键在**回哪个页**，不在拦什么：回搜索页要加载整个 SPA（107 次），
+# 而 `_evaluate_fetch` 只要求页面停在 zhipin 域，不依赖搜索页的 DOM。
+# 换成 `/about` 后那 107 次变成 1 次。
 #
-# 取 139 是拦截生效后的实测值。**改动拦截规则就要重新量。**
-# 探针 `scripts/probe_recover_cost.py`，数据 `data/calibration/recover-cost*.json`。
-REQ_PER_RECOVER = 139
+# 剩下的 37 次里 script 30 是 `security-check.html` 自己的挑战脚本 ——
+# **这部分不可压缩**，stoken 就是靠它算出来的。所以 37 已接近这条路的下限；
+# 想再低只能不走导航，而 stoken 必须由真实浏览器 JS 生成（本地算已证死路）。
+#
+# **改动拦截规则或回法就要重新量。**
+# 探针 `scripts/probe_recover_cost.py` + `probe_recover_callback.py`，
+# 数据 `data/calibration/recover-cost*.json`。
+REQ_PER_RECOVER = 37
 
 
 class RiskControlStop(RuntimeError):
@@ -486,13 +489,24 @@ class BossCollector(Collector):
                     break
             except Exception:
                 pass
-        # 回搜索页，恢复 fetch 所需的 zhipin 域环境
+        # 回一个**轻量同域页**恢复 fetch 环境，而不是完整搜索页 SPA。
+        #
+        # `_evaluate_fetch` 唯一的要求是「页面停在 zhipin 域」
+        # （`_settle_on_origin` 的判据就是 `ORIGIN in page.url`）——
+        # 它在页面里发同源 fetch，**不依赖搜索页的任何 DOM 或 JS 状态**。
+        # 而回搜索页要加载整个 SPA：实测 **107 次**真实请求
+        # （script 49、image 49、xhr 38…），是整次重算成本的绝大部分。
+        #
+        # 实测三种回法（`scripts/probe_recover_callback.py`）：
+        #   搜索页 SEARCH_BASE : 107 次，fetch 可用
+        #   轻量页 /about      : **1 次**，fetch 可用  ← 现用
+        # 即一次重算从 139 次降到约 33 次，**省 76%**，而能力没有任何损失。
         await self.page.goto(
-            f"{SEARCH_BASE}?query=AI%20Agent&city=101210100",
+            f"{ORIGIN}/about",
             wait_until="domcontentloaded",
             timeout=self.config.browser.navigation_timeout_ms,
         )
-        await self.page.wait_for_timeout(2000)
+        await self.page.wait_for_timeout(800)
 
     def _parse_api_job(self, raw: dict, keyword: str, rank: int) -> JobRecord:
         encrypt_job_id = str(raw.get("encryptJobId") or "")
