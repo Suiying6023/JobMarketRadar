@@ -29,10 +29,20 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 INFO = "https://www.zhipin.com/wapi/zpsecureflow/forbidden-info?"
 
+# 日志按 glob 取**最新一份**，不写死日期。
+# 写死日期的代价实测过：跨零点续跑后，巡检还在读前一天的日志，
+# 于是持续汇报昨天那条已经处理完的 BUDGET-STOP，而看不到新批次的进度。
+# 「写死的标识符是定时炸弹」—— 它不报错，只会一直给出过期答案。
 CHAINS = {
-    "refresh": ("refresh_status_loop", "logs/refresh-slow-20260830.log"),
-    "backfill": ("backfill_details", "logs/backfill-slow-20260830.log"),
+    "refresh": ("refresh_status_loop", "logs/refresh-slow-*.log"),
+    "backfill": ("backfill_details", "logs/backfill-slow-*.log"),
 }
+
+
+def latest_log(pattern: str) -> Path | None:
+    """取匹配 glob 的最新一份日志（按修改时间）。"""
+    files = sorted(ROOT.glob(pattern), key=lambda f: f.stat().st_mtime)
+    return files[-1] if files else None
 
 
 def alive(needle: str) -> int:
@@ -76,9 +86,9 @@ def main() -> None:
     risk = False
     for name, (needle, log) in CHAINS.items():
         n = alive(needle)
-        p = ROOT / log
-        tail, hits = "", []
-        if p.exists():
+        p = latest_log(log)
+        tail, hits, budget = "", [], []
+        if p and p.exists():
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
             # 只认 RISK-STOP。**BUDGET-STOP 不算异常** —— 它是日线到顶的正常
             # 预算行为，明日自然恢复。两者曾共用一个标记，导致 900/900 正常停机
@@ -91,7 +101,8 @@ def main() -> None:
                     tail = l.strip()[:70]
                     break
         state = "运行中" if n >= 1 else "已结束"
-        print(f"  {name:<9} {state:<7} {tail}")
+        print(f"  {name:<9} {state:<7} {tail}"
+              + (f"   [{p.name}]" if p else "   [无日志]"))
         if budget and not hits:
             print(f"    💰 额度到顶正常停止（无需人工）：{budget[-1].strip()[:80]}")
         if hits:
