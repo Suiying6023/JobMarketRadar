@@ -470,6 +470,9 @@ async def main() -> None:
                          "页面上看不见，刷了没收益 —— 实测占了 70%")
     ap.add_argument("--stale-days", type=int, default=60,
                     help="活跃度换算天数 >= 此值即降级为 sample")
+    ap.add_argument("--skip-fresh-hours", type=float, default=12.0,
+                    help="跳过 updated_at 在 N 小时内的行（默认 12，0=关闭）。"
+                         "无人值守续跑必须开：见选行处的注释")
     ap.add_argument("--rotate-every", type=int, default=15, help="每 N 条换出口")
     ap.add_argument("--burst", type=int, default=25, help="每 N 条一次长停顿")
     # 节奏档。**随成本重算过**：原先条间 110-170s 是按「一条 14 次请求」定的，
@@ -479,6 +482,11 @@ async def main() -> None:
     #
     # ⚠️ 别把它再调快：真正的约束不是请求数而是 stoken 窗口 —— 每约 5 条就要
     # 重算一次，重算本身是导航（比 fetch 重）。间隔太小只会让重算更密。
+    # ⚠️ 提速的收益上限由 stoken 窗口决定，不由间隔决定。实测（2026-08-30 阶梯探测）：
+    #   12-18s → 1.67 请求/条、挑战率 14%、日线可跑 598 条
+    #    8-12s → 1.92 请求/条、挑战率 29%、日线可跑 520 条
+    # 也就是**间隔压到 8-12s 反而少跑 78 条**：挑战页是白花的请求，
+    # 密度上去之后吃掉的比省下的时间更多。所以下限守在 12s。
     ap.add_argument("--gap", type=float, nargs=2, metavar=("LO", "HI"),
                     default=[18.0, 32.0],
                     help="条间间隔秒区间（默认 18-32s ≈ 3.8 请求/分钟）")
@@ -523,6 +531,18 @@ async def main() -> None:
              "  AND job_status_desc != '职位已关闭' ")
     if not args.include_no_jd:
         where += "  AND job_description != '' "
+    # ⚠️ **排序键（detail_fetched_at）不是本脚本写的列**，所以刷完一条之后
+    # 它在队列里的位置**不变** —— 下一次启动会从同一批头部重新开始。
+    # 手工按批跑时看不出来（人记得跑到哪了），但无人值守续跑会把额度
+    # 反复花在同一批上：实测 2026-08-31 队头 200 条里 153 条是 6 小时内
+    # 刚刷过的，直接重起等于 76% 的配额买重复结论。
+    #
+    # 判据用 `updated_at`（本脚本唯一真正写的时间戳），而不是给排序键补写值：
+    # `detail_fetched_at` 的语义是「详情抓取时间」，刷新并没有抓详情，
+    # 借用它会让补详情链路的选行跟着漂。
+    if args.skip_fresh_hours > 0:
+        where += (f"  AND (updated_at IS NULL OR updated_at = '' OR "
+                  f"updated_at < datetime('now','-{args.skip_fresh_hours} hours')) ")
     rows = con.execute(
         "SELECT canonical_id, title, company_name, source_job_id FROM jobs "
         + where +
@@ -531,6 +551,22 @@ async def main() -> None:
         "ORDER BY CASE WHEN detail_fetched_at IS NULL OR detail_fetched_at='' "
         "         THEN 0 ELSE 1 END, detail_fetched_at ASC"
     ).fetchall()
+    if args.skip_fresh_hours > 0:
+        # 把跳过量打出来。这条数字是「续跑有没有在重复劳动」的唯一现场判据：
+        # 它接近队列总量说明本轮几乎无事可做（正常），而它长期为 0 则说明
+        # 判据失效（比如哪天有人给 updated_at 换了写入口径）。
+        # ⚠️ 这里**重新拼一遍条件**而不是对上面的 where 做字符串替换：
+        # 那个条件是 `(IS NULL OR = '' OR < 时刻)`，只把 `<` 换成 `>=`
+        # 会把 NULL/空 也一起数进"新鲜"里，虚报跳过量。
+        fresh = con.execute(
+            "SELECT count(*) FROM jobs WHERE retention_status='active' "
+            "AND job_invalid=0 AND job_status_desc != '职位已关闭' "
+            + ("AND job_description != '' " if not args.include_no_jd else "")
+            + f"AND updated_at >= datetime('now','-{args.skip_fresh_hours} hours')"
+        ).fetchone()[0]
+        print(f"[选行] 跳过 {args.skip_fresh_hours:.0f}h 内已刷过的 {fresh} 条"
+              f"（含补详情链路刚更新的——它同样写 recruiter_active_status，"
+              f"再刷一次是白花配额）")
     if not args.all:
         rows = rows[: args.batch]
 
@@ -680,6 +716,25 @@ async def main() -> None:
         exit_strikes = 0
 
         for i, r in enumerate(rows, 1):
+            # ⚠️ **日线必须在循环里复查**，不能只在启动时算一次。
+            # 启动时的截断用的是摊薄估值 1.60 次/条，而实测（2026-08-31 本轮）
+            # 真实是 2.04 次/条：挑战页重试 + 换出口重暖都不在那个估值里
+            # （当轮 449 次请求里 ok 只占 274，其余是 challenged/warm/rewarm/prewarm）。
+            # 于是启动时按 552 条放行，跑完实际会花约 1243 次 —— 超日线 24%。
+            # 估值偏低不是可以接受的误差：日线是风控安全线，宁可少跑。
+            #
+            # 每 10 条查一次库（单次 count 走 idx_request_log_day，微秒级），
+            # 而不是每条都查：这里要的是"别越线太多"，不是精确到单次请求。
+            if i % 10 == 1:
+                now_used = used_today(con)
+                if now_used >= args.daily_cap:
+                    print(f"\n[BUDGET-STOP] 日线到顶：已用 {now_used}/"
+                          f"{args.daily_cap} 次请求（实测约 {now_used/max(i-1,1):.2f} "
+                          f"次/条，高于启动估值 {per_job_req:.2f}）。"
+                          f"已处理 {i-1}/{len(rows)} 条，结果都已落库。", flush=True)
+                    print("[BUDGET-STOP] 无需人工介入，明日额度重置后可续跑。",
+                          flush=True)
+                    break
             if i > 1 and (i - 1) % args.rotate_every == 0 and len(usable) > 1:
                 await ctx.close()
                 ei += 1

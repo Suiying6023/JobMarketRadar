@@ -38,6 +38,13 @@ CHAINS = {
     "backfill": ("backfill_details", "logs/backfill-slow-*.log"),
 }
 
+# 无人值守调度器。它在两段之间会有几十秒到几分钟的空档，
+# 此时两条链路都显示「已结束」——⚠️ **那不是可以手工续跑的信号**：
+# 手工起一批会和调度器下一段撞成两个同名进程，共用出口互相把 stoken 打掉。
+# 所以巡检必须先报「调度器在跑」，把续跑决定交给它。
+SUPERVISOR = "overnight_supervisor"
+STOP_FLAG = ROOT / "logs" / "SUPERVISOR-STOPPED.txt"
+
 
 def latest_log(pattern: str) -> Path | None:
     """取匹配 glob 的最新一份日志（按修改时间）。"""
@@ -98,6 +105,16 @@ def main() -> None:
     print(f"===== 巡检 {datetime.now():%H:%M:%S} =====")
 
     risk = False
+    sup = alive(SUPERVISOR)
+    if STOP_FLAG.exists():
+        risk = True
+        print("  ⛔ 调度器已停机（撞风控），标记内容：")
+        for line in STOP_FLAG.read_text(encoding="utf-8").splitlines()[:4]:
+            print(f"     {line}")
+    elif sup >= 1:
+        print("  调度器  运行中   —— 续跑由它决定，**不要手工起新批次**")
+    else:
+        print("  调度器  未运行   —— 「已结束」的链路才需要人工判断是否续跑")
     for name, (needle, log) in CHAINS.items():
         n = alive(needle)
         p = latest_log(log)
