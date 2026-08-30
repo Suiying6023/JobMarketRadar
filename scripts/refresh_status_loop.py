@@ -184,6 +184,24 @@ def used_today(con: sqlite3.Connection) -> int:
         (day,)).fetchone()[0]
 
 
+def over_quota_factor(used: int, cap: int) -> float:
+    """越过日线后的减速倍数（1.0 = 未越线）。与 boss.py 的同名方法同一档位表。
+
+    阶梯而非连续：连续函数在越线那一刻几乎无感（1.0x → 1.01x），
+    阶梯让每一档都真的看得出来，日志里也能一眼认出当前在哪一档。
+    """
+    if cap <= 0 or used < cap:
+        return 1.0
+    over = used / cap
+    if over < 1.25:
+        return 2.0
+    if over < 1.5:
+        return 3.0
+    if over < 2.0:
+        return 4.0
+    return 6.0
+
+
 def probe_exit(port: int, timeout: int = 12) -> int:
     """返回 BOSS 首页 HTTP 码。**只用来判隧道通不通**：0=不通，非 0=通。
 
@@ -578,14 +596,19 @@ async def main() -> None:
     affordable = int(room / per_job_req)
     print(f"[账本] 今日已用 {used} 次请求 / 上限 {args.daily_cap}，"
           f"余量 {room} 次 ≈ {affordable} 条（每条摊薄 {per_job_req:.2f} 次）")
+    # ⚠️ 语义变更（2026-08-31，用户要求）：日线是**降速线**，不是停线。
+    # 「达到配额但还没风控的话就降低速度运行，直到该刷新的刷新完毕」。
+    #
+    # 可以这么做的理由：1000 这个数不是平台给的，是我们按「未触发封禁的那轮」
+    # 反推的保守值。真正的风控信号（挑战页连撞、出口被标记 code=31）仍然
+    # 立刻停 —— 放开的只是自设预算。
+    # 降速而非原速：封禁按累计量也按速率算，越线后速率是唯一还能压的旋钮。
     if affordable <= 0:
-        # 与 backfill_details 用同一个标记体系：BUDGET-STOP 是正常预算行为
-        # （明日自然恢复、无需人工），RISK-STOP 才需要人立刻处理。
-        print("[BUDGET-STOP] 今日请求额度已用尽，明天再跑。无需人工介入。")
-        return
-    if len(rows) > affordable:
-        print(f"本轮按额度截到 {affordable} 条（原 {len(rows)} 条）")
-        rows = rows[:affordable]
+        print(f"[OVER-QUOTA] 今日已用 {used}/{args.daily_cap}，"
+              f"越线后降速继续（不再停机）。风控信号仍会立刻停止。")
+    elif len(rows) > affordable:
+        print(f"[OVER-QUOTA] 额度只够 {affordable} 条，其余 "
+              f"{len(rows) - affordable} 条将降速跑完（不再截断）")
 
     # 把节奏换算成请求/分钟打出来，和老链路的安全速率对齐着看。
     # 只报"条间 X 秒"没有意义——风控数的是请求数。
@@ -714,6 +737,10 @@ async def main() -> None:
         window_now = FETCH_WINDOW
         clean_windows = 0
         exit_strikes = 0
+        # 当前降速倍数。循环里每 10 条按**实际用量**复算一次。
+        slow_factor = over_quota_factor(used, args.daily_cap)
+        if slow_factor > 1.0:
+            print(f"[OVER-QUOTA] 起步即越线，降速 {slow_factor:.0f}x", flush=True)
 
         for i, r in enumerate(rows, 1):
             # ⚠️ **日线必须在循环里复查**，不能只在启动时算一次。
@@ -725,16 +752,20 @@ async def main() -> None:
             #
             # 每 10 条查一次库（单次 count 走 idx_request_log_day，微秒级），
             # 而不是每条都查：这里要的是"别越线太多"，不是精确到单次请求。
+            # 每 10 条复查一次实际用量，换算当前降速倍数。
+            # ⚠️ 必须按**实际计数**复查而不是沿用启动估值：启动时按 1.60 次/条
+            # 估，实测是 2.04 次/条（挑战页重试与换出口重暖不在估值里），
+            # 沿用估值会让降速迟迟不触发。
             if i % 10 == 1:
                 now_used = used_today(con)
-                if now_used >= args.daily_cap:
-                    print(f"\n[BUDGET-STOP] 日线到顶：已用 {now_used}/"
-                          f"{args.daily_cap} 次请求（实测约 {now_used/max(i-1,1):.2f} "
-                          f"次/条，高于启动估值 {per_job_req:.2f}）。"
-                          f"已处理 {i-1}/{len(rows)} 条，结果都已落库。", flush=True)
-                    print("[BUDGET-STOP] 无需人工介入，明日额度重置后可续跑。",
-                          flush=True)
-                    break
+                new_factor = over_quota_factor(now_used, args.daily_cap)
+                if new_factor != slow_factor:
+                    slow_factor = new_factor
+                    if slow_factor > 1.0:
+                        print(f"\n[OVER-QUOTA] 已用 {now_used}/{args.daily_cap}"
+                              f"（{now_used/max(args.daily_cap,1):.2f}x，实测 "
+                              f"{now_used/max(i-1,1):.2f} 次/条），"
+                              f"降速至 {slow_factor:.0f}x 继续。", flush=True)
             if i > 1 and (i - 1) % args.rotate_every == 0 and len(usable) > 1:
                 await ctx.close()
                 ei += 1
@@ -961,12 +992,16 @@ async def main() -> None:
                       f"活跃度{refreshed} 降级{stale}", flush=True)
 
             if i < len(rows):
+                # 越线后所有等待按倍数拉长（日线是降速线，见 over_quota_factor）
                 if args.burst and i % args.burst == 0:
-                    bp = random.uniform(*args.burst_pause)
-                    print(f"[节奏] 长停顿 {bp/60:.1f} 分钟", flush=True)
+                    bp = random.uniform(*args.burst_pause) * slow_factor
+                    print(f"[节奏] 长停顿 {bp/60:.1f} 分钟"
+                          + (f"（降速 {slow_factor:.0f}x）" if slow_factor > 1 else ""),
+                          flush=True)
                     await asyncio.sleep(bp)
                 else:
-                    await asyncio.sleep(random.uniform(*args.gap))
+                    await asyncio.sleep(
+                        random.uniform(*args.gap) * slow_factor)
 
         await ctx.close()
         await browser.close()

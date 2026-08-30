@@ -79,20 +79,40 @@ def test_ledger_classifies_detail_vs_list(store):
     assert counts["detail"] == 1
 
 
-def test_daily_budget_stops_across_processes(store):
+def test_daily_budget_is_cross_process(store):
     """日线是跨进程的：账本里已有的量要算进来，不能只看本进程计数。
 
-    模拟"另一个脚本今天已经跑了 5 次"，本进程上限设 5 → 第一次请求就该停。
+    ⚠️ 2026-08-31 起日线是**降速线**而非停线，所以这里断言的是"另一个脚本的量
+    也能把本进程推入降速档"，而不是"第一次请求就抛异常"。
+    跨进程这一点没变，只是越线后的动作从"停"改成了"慢"。
     """
     for _ in range(5):
         store.log_request("detail", script="other_script")
     page = FakePage()
     collector = make_collector(page, store, max_requests_per_day=5)
+    # 本进程一次请求都还没发，但账本里已有 5 次 → 已越线，应降速。
+    assert collector.request_count == 0
+    assert collector.over_quota_factor() > 1.0
+
+    # 越线不阻断请求：请求照发，只是节奏变慢。
+    asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
+    assert len(page.requested_urls) == 1
+
+
+def test_per_run_cap_still_hard_stops(store):
+    """`max_requests_per_run` 仍是硬停线，别跟着日线一起放开。
+
+    两者性质不同：日线是我们自设的风控预算（可以降速越过），
+    单轮上限只是"别让一个进程无限跑"（进程越久浏览器状态越可能漂），
+    调用方重起一段就能继续。合并这两个概念会让"重起一段"失去意义。
+    """
+    page = FakePage()
+    collector = make_collector(page, store, max_requests_per_day=5000)
+    collector.config.max_requests_per_run = 1
+    asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
     with pytest.raises(RiskControlStop) as err:
         asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
-    assert "今日累计请求" in str(err.value)
-    # 关键：请求根本没发出去（不是发了才发现超限）
-    assert page.requested_urls == []
+    assert "单次运行请求上限" in str(err.value)
 
 
 def test_daily_budget_allows_under_cap(store):
@@ -176,7 +196,13 @@ def test_total_excludes_refresh_chain(store):
 
 
 def test_daily_budget_ignores_refresh_chain(store):
-    """采集侧的日线拦截不该被刷新链路的量触发。"""
+    """采集侧的日线**降速**不该被刷新链路的量触发。
+
+    ⚠️ 2026-08-31 语义变更：日线从硬停线改成降速线（用户要求「达到配额但还没
+    风控就降低速度运行」）。理由是 900 这个数不是平台给的，而是我们按
+    「未触发封禁的那轮」反推的自设预算；真正的风控信号（code=36/32、验证页）
+    仍然立刻停。所以这里断言的是 `over_quota_factor`，不再是抛异常。
+    """
     page = FakePage(body={"code": 0, "zpData": {}})
     collector = make_collector(page)
     collector.ledger = store
@@ -185,13 +211,36 @@ def test_daily_budget_ignores_refresh_chain(store):
     for _ in range(50):
         store.log_request("detail_page", script="refresh_status_loop")
 
-    # 50 次刷新请求远超日线 5，但采集链路今天还没发过任何请求 → 不该被拦。
-    collector._check_daily_budget()
+    # 50 次刷新请求远超日线 5，但采集链路今天还没发过任何请求 → 不该降速。
+    assert collector.over_quota_factor() == 1.0
+    collector._check_daily_budget()   # 不抛
 
     for _ in range(5):
         store.log_request("detail", script="backfill_details")
-    with pytest.raises(RiskControlStop):
-        collector._check_daily_budget()
+    assert collector.over_quota_factor() > 1.0, "越线后必须降速"
+    collector._check_daily_budget()   # 仍然不抛——降速不是停机
+
+
+def test_over_quota_slows_down_but_never_stops(store):
+    """越线只降速、永不抛异常；倍数随超出比例阶梯上升。
+
+    钉死"永不抛"这一点：把降速写成异常会让越线表现得跟风控一样，
+    而两者要求的人工动作完全不同（一个不需要人，一个必须立刻处理）。
+    """
+    page = FakePage(body={"code": 0, "zpData": {}})
+    collector = make_collector(page)
+    collector.ledger = store
+    collector.config.max_requests_per_day = 100
+
+    seen = []
+    for target, expect in ((100, 2.0), (130, 3.0), (160, 4.0), (220, 6.0)):
+        while store.request_counts().get("total", 0) < target:
+            store.log_request("detail", script="t")
+        f = collector.over_quota_factor()
+        seen.append(f)
+        assert f == expect, f"用量 {target} 时应降速 {expect}x，实际 {f}x"
+        collector._check_daily_budget()   # 任何档位都不抛
+    assert seen == sorted(seen), "倍数必须单调不减"
 
 
 def test_collect_reraises_risk_control_stop():

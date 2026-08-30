@@ -1,8 +1,16 @@
-"""无人值守调度：刷新 → 补详情 → 打标签，额度用尽就睡到次日，撞风控就停。
+"""无人值守调度：按阶段推进，越过配额只降速不停机，撞风控立刻停。
 
-**为什么需要它**：两条链路各有独立日线（刷新 1000 次 `detail_page`、采集 900 次
-`COLLECT_KINDS`），而它们几乎从不同时到顶 —— 手工跑就得守着看谁先空出来。
-夜里没人守，就需要一个进程替人做「查余量 → 起下一段 → 到顶就睡」这件事。
+**阶段顺序**（2026-08-31 用户指定）：
+  ① 刷新 —— 把该刷新的刷完（不再按日线截断，越线降速跑）
+  ② 补 JD —— 刷完之后补详情内容
+  ③ 本地库优化 —— 补完跑一轮 clean_local_db + 标签 + 导出
+  ④ 交叉采集 —— 标题（列表）与 JD（详情）交替推进，持续跑
+
+**配额语义**（与旧版最大的区别）：日线不再是停线，而是**降速线**。
+用户原话：「达到相关配额还没风控的话就降低速度运行，直到该刷新的刷新完毕」。
+可以这么做的理由：900/1000 都不是平台给的数字，是我们按「未触发封禁的那轮」
+反推的自设预算。真正的风控信号（code=36/32、验证页、出口 code=31）仍然立刻停。
+降速而非原速：封禁按累计量也按速率算，越线后速率是唯一还能压的旋钮。
 
 **它不做的事**（这些是它安全的前提）：
   · 不改任何节奏参数、不改配置 —— 只按给定参数起子进程
@@ -16,12 +24,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,17 +42,14 @@ STOP_FLAG = ROOT / "logs" / "SUPERVISOR-STOPPED.txt"
 # 免登录刷新链路的 `detail_page` **不算在内**（不同 IP、不同登录态、独立风控主体）。
 COLLECT_KINDS = ("list", "detail", "security_check", "recommend")
 
-# 一条刷新摊薄 1.6 次请求（1 次 fetch + 每 5 条一次 3 次重算）。
-# 从 refresh_fetch 取而不是抄字面值：那边是这个常数的唯一出处。
-from job_radar.refresh_fetch import REQ_PER_JOB_AMORTIZED  # noqa: E402
-
 # 一条详情实测约 1.2 次（含 code=37 重算），与 daily_cycle.py 同一标定值。
+# 只用于日志里估算，不再用来截断队列（日线已改成降速线）。
 REQ_PER_DETAIL = 1.2
 
-# 低于这个余量就不起新一段：起一段的固定开销（冷启动暖 stoken 3 次、
-# 采集侧导航建域）会把零头吃掉，反而留下一个刚启动就 BUDGET-STOP 的日志。
-MIN_ROOM_REFRESH = 40
-MIN_ROOM_COLLECT = 60
+# 阶段推进的判据阈值：待办降到这个数以下就算该阶段做完，进下一阶段。
+# 不取 0 是因为总有少数条目会反复失败（岗位已下架但标记没落、
+# raw_json 缺 securityId），卡在 0 会让流水线永远进不到下一阶段。
+DONE_THRESHOLD = 15
 
 
 def log(msg: str) -> None:
@@ -179,18 +183,22 @@ def halt(reason: str) -> None:
     log(f"⛔ 标记已写入 {STOP_FLAG}")
 
 
-def sleep_until_tomorrow() -> None:
-    """睡到次日本地零点后 3 分钟（让账本的 day 确实翻页再起）。"""
-    now = datetime.now().astimezone()
-    nxt = (now + timedelta(days=1)).replace(hour=0, minute=3, second=0,
-                                            microsecond=0)
-    secs = max(60.0, (nxt - now).total_seconds())
-    log(f"两条链路都到顶，睡到 {nxt:%m-%d %H:%M}（{secs/3600:.1f} 小时后）")
-    # 分段睡，让 Ctrl+C / TaskStop 能及时生效，也便于日志看出它还活着。
-    end = time.monotonic() + secs
-    while time.monotonic() < end:
-        time.sleep(min(600.0, end - time.monotonic()))
-        log(f"   仍在等待日线重置…（余 {(end-time.monotonic())/3600:.1f} 小时）")
+def over_quota_factor(used: int, cap: int) -> float:
+    """越线后的减速倍数。与 boss.py / refresh_status_loop.py 同一档位表。
+
+    这里**只用于日志汇报**：真正的减速在两个子脚本内部按同一张表算，
+    调度器不重复施加（否则会叠乘成 4x/9x）。
+    """
+    if cap <= 0 or used < cap:
+        return 1.0
+    over = used / cap
+    if over < 1.25:
+        return 2.0
+    if over < 1.5:
+        return 3.0
+    if over < 2.0:
+        return 4.0
+    return 6.0
 
 
 def main() -> None:
@@ -204,6 +212,8 @@ def main() -> None:
     ap.add_argument("--rotate-every", type=int, default=15)
     ap.add_argument("--collect-config", default="config.cities3.yaml")
     ap.add_argument("--collect-limit", type=int, default=400)
+    ap.add_argument("--list-pages", type=int, default=0,
+                    help="交叉采集阶段每个关键词翻几页（0=按配置分词决定）")
     ap.add_argument("--cycles", type=int, default=0,
                     help="最多跑几轮，0=不限（跨日持续跑）")
     args = ap.parse_args()
@@ -214,13 +224,15 @@ def main() -> None:
         return
 
     log("=" * 64)
-    log("无人值守调度启动")
-    log(f"  刷新日线 {args.refresh_cap}   采集日线 {args.collect_cap}")
+    log("无人值守调度启动（阶段流水线）")
+    log(f"  阶段: ① 刷新 → ② 补 JD → ③ 本地库优化 → ④ 交叉采集")
+    log(f"  日线 刷新 {args.refresh_cap} / 采集 {args.collect_cap}"
+        f" —— **降速线，不是停线**（越线按 2/3/4/6x 阶梯降速继续）")
     log(f"  刷新节奏 条间 {args.gap[0]:.0f}-{args.gap[1]:.0f}s，"
         f"每 {args.burst} 条停 {args.burst_pause[0]/60:.1f}-"
         f"{args.burst_pause[1]/60:.1f} 分钟")
     log(f"  跳过 {args.skip_fresh_hours:.0f}h 内已刷过的行")
-    log("  ⛔ 撞 [RISK-STOP] 即整体停机，不自动重试")
+    log("  ⛔ 风控（code=36/32、验证页、出口 code=31）即整体停机，不自动重试")
     log("=" * 64)
 
     cycle = 0
@@ -243,75 +255,120 @@ def main() -> None:
             f" 采集 {uc}/{args.collect_cap}（余 {room_c}）"
             f" | 待刷 {rq} 待补 {cq} 待标 {ut}")
 
-        did = False
+        fr = over_quota_factor(ur, args.refresh_cap)
+        fc = over_quota_factor(uc, args.collect_cap)
+        if fr > 1 or fc > 1:
+            log(f"    越线降速中：刷新 {fr:.0f}x  采集 {fc:.0f}x")
+
         stamp = datetime.now().strftime("%Y%m%d")
 
-        # ① 刷新。放前面是因为它更便宜（1.6 次/条 vs 1.2 次/条但采集还要翻列表），
-        #    而且它的产出（关闭/不活跃判定）直接决定投递池的准确性。
-        if room_r >= MIN_ROOM_REFRESH and rq > 0:
+        # ===== 阶段 ① 刷新 =====
+        # 放最前是用户指定的顺序，也符合成本：它的产出（关闭/不活跃判定）
+        # 直接决定投递池准确性，而且比详情便宜。
+        # ⚠️ 不再按日线截断 —— 越线后子脚本自己降速跑完。
+        if rq > DONE_THRESHOLD:
             n = alive("refresh_status_loop")
             if n >= 1:
-                log(f"刷新已有 {n} 个进程在跑，跳过（两个进程共用出口会互相打死）")
-            else:
-                afford = int(room_r / REQ_PER_JOB_AMORTIZED)
-                log(f"刷新可跑 ≈{min(afford, rq)} 条")
-                v = run_stage(
-                    "refresh", ROOT / "logs" / f"refresh-slow-{stamp}.log",
-                    ["uv", "run", "python", "scripts/refresh_status_loop.py",
-                     "--all", "--gap", str(args.gap[0]), str(args.gap[1]),
-                     "--burst", str(args.burst),
-                     "--burst-pause", str(args.burst_pause[0]),
-                     str(args.burst_pause[1]),
-                     "--rotate-every", str(args.rotate_every),
-                     "--skip-fresh-hours", str(args.skip_fresh_hours),
-                     "--daily-cap", str(args.refresh_cap)])
-                if v == "risk":
-                    halt("refresh 命中 [RISK-STOP]")
-                    return
-                did = True
-        elif rq == 0:
-            log("刷新队列空（都在新鲜期内），跳过")
-        else:
-            log(f"刷新余量 {room_r} < {MIN_ROOM_REFRESH}，今日不再起")
+                log(f"刷新已有 {n} 个进程在跑，跳过（共用出口会互相打死）")
+                time.sleep(120)
+                continue
+            log(f"【阶段①刷新】待刷 {rq} 条"
+                + (f"（越线降速 {fr:.0f}x）" if fr > 1 else ""))
+            v = run_stage(
+                "refresh", ROOT / "logs" / f"refresh-slow-{stamp}.log",
+                ["uv", "run", "python", "scripts/refresh_status_loop.py",
+                 "--all", "--gap", str(args.gap[0]), str(args.gap[1]),
+                 "--burst", str(args.burst),
+                 "--burst-pause", str(args.burst_pause[0]),
+                 str(args.burst_pause[1]),
+                 "--rotate-every", str(args.rotate_every),
+                 "--skip-fresh-hours", str(args.skip_fresh_hours),
+                 "--daily-cap", str(args.refresh_cap)])
+            if v == "risk":
+                halt("refresh 命中 [RISK-STOP]")
+                return
+            time.sleep(60)
+            continue
 
-        # ② 补详情。
-        if room_c >= MIN_ROOM_COLLECT and cq > 0:
+        # ===== 阶段 ② 补 JD =====
+        if cq > DONE_THRESHOLD:
             n = alive("backfill_details")
             if n >= 1:
                 log(f"补详情已有 {n} 个进程在跑，跳过")
-            else:
-                afford = int(room_c / REQ_PER_DETAIL)
-                lim = min(args.collect_limit, afford, cq)
-                log(f"补详情可跑 ≈{lim} 条")
-                v = run_stage(
-                    "backfill", ROOT / "logs" / f"backfill-slow-{stamp}.log",
-                    ["uv", "run", "python", "scripts/backfill_details.py",
-                     "--config", args.collect_config, "--limit", str(lim)])
-                if v == "risk":
-                    halt("backfill 命中 [RISK-STOP]")
-                    return
-                did = True
-        elif cq == 0:
-            log("待补详情队列空，跳过")
-        else:
-            log(f"采集余量 {room_c} < {MIN_ROOM_COLLECT}，今日不再起")
-
-        # ③ 打标签。**不占平台配额**（只调 LLM），所以不受上面两条日线约束。
-        con = _con()
-        ut = untagged(con)
-        con.close()
-        if ut > 0 and alive("extract_glm_tags") < 1:
-            log(f"打标签 {ut} 条（不占平台配额）")
-            run_stage("tags", ROOT / "logs" / f"tags-{stamp}.log",
-                      ["uv", "run", "python", "scripts/extract_glm_tags.py",
-                       "--limit", "0", "--concurrency", "7"])
-            did = True
-
-        if not did:
-            sleep_until_tomorrow()
-        else:
-            # 段间小憩：让库的写事务落定，也避免两段紧邻起把出口压出尖峰。
+                time.sleep(120)
+                continue
+            lim = min(args.collect_limit, cq)
+            log(f"【阶段②补JD】待补 {cq} 条，本段 {lim} 条"
+                + (f"（越线降速 {fc:.0f}x）" if fc > 1 else ""))
+            v = run_stage(
+                "backfill", ROOT / "logs" / f"backfill-slow-{stamp}.log",
+                ["uv", "run", "python", "scripts/backfill_details.py",
+                 "--config", args.collect_config, "--limit", str(lim)])
+            if v == "risk":
+                halt("backfill 命中 [RISK-STOP]")
+                return
             time.sleep(60)
+            continue
+
+        # ===== 阶段 ③ 本地库优化 =====
+        # 刷新与补 JD 都收尾了，此刻库里信息最全，是做判定/降级/导出的最佳时点。
+        # 三步都**不碰平台**（纯本地 + LLM），所以不受任何日线约束。
+        # 每轮流水线只做一次：用标记文件记，避免阶段④跑完回到这里反复重做。
+        opt_flag = ROOT / "logs" / f".optimized-{stamp}"
+        if not opt_flag.exists():
+            log("【阶段③本地库优化】刷新与补 JD 均已收尾，开始本地优化")
+            if ut > 0:
+                log(f"  打标签 {ut} 条（不占平台配额）")
+                run_stage("tags", ROOT / "logs" / f"tags-{stamp}.log",
+                          ["uv", "run", "python", "scripts/extract_glm_tags.py",
+                           "--limit", "0", "--concurrency", "7"])
+            # 按画像降级不合格岗位。**不加 --purge**：物理删除是不可逆动作，
+            # 而 sample 记录还要当增量去重样本用。无人值守时更不该做不可逆的事。
+            run_stage("clean", ROOT / "logs" / f"optimize-{stamp}.log",
+                      ["uv", "run", "python", "scripts/clean_local_db.py"])
+            run_stage("glm-filter", ROOT / "logs" / f"optimize-{stamp}.log",
+                      ["uv", "run", "python", "scripts/apply_glm_filters.py"])
+            run_stage("export", ROOT / "logs" / f"optimize-{stamp}.log",
+                      ["uv", "run", "python", "scripts/export_pool.py"])
+            opt_flag.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n",
+                                encoding="utf-8")
+            log("【阶段③】完成，进入交叉采集")
+            time.sleep(30)
+            continue
+
+        # ===== 阶段 ④ 交叉采集 =====
+        # 标题（列表接口，零风控、产出新岗位）与 JD（详情接口，贵）交替推进。
+        # 先翻列表把新岗位灌进来，再补它们的详情 —— 这样详情永远有活可做，
+        # 而不是把列表翻到底之后闲置。
+        log("【阶段④交叉采集】刷新与补 JD 已收尾，列表↔详情交替推进")
+        v = run_stage("expand-list", ROOT / "logs" / f"expand-{stamp}.log",
+                      ["uv", "run", "python", "scripts/expand_list.py",
+                       "--config", args.collect_config,
+                       "--pages", str(args.list_pages)])
+        if v == "risk":
+            halt("expand_list 命中 [RISK-STOP]")
+            return
+        time.sleep(30)
+
+        con = _con()
+        cq2 = collect_queue(con)
+        con.close()
+        if cq2 > DONE_THRESHOLD and alive("backfill_details") < 1:
+            lim = min(args.collect_limit, cq2)
+            log(f"  列表带来 {cq2} 条待补，接着补 {lim} 条详情")
+            v = run_stage(
+                "backfill", ROOT / "logs" / f"backfill-slow-{stamp}.log",
+                ["uv", "run", "python", "scripts/backfill_details.py",
+                 "--config", args.collect_config, "--limit", str(lim)])
+            if v == "risk":
+                halt("backfill 命中 [RISK-STOP]")
+                return
+        else:
+            # 列表没带来新活：说明当前关键词深度已翻到底。等一会再来，
+            # 让平台侧出现新岗位（而不是空转刷屏）。
+            log(f"  列表未带来新的待补（{cq2} 条），休息 30 分钟再来")
+            time.sleep(1800)
+        time.sleep(60)
 
 
 if __name__ == "__main__":

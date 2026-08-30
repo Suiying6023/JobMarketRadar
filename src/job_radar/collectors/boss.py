@@ -135,6 +135,9 @@ class BossCollector(Collector):
         self.page: Page | None = None
         self.chat_count = 0
         self.request_count = 0
+        # 越线提示的节流游标（见 _check_daily_budget）。日线现在是降速线而非停线，
+        # 提示每 50 次请求打一次就够——每次都打会把真正的风控行淹掉。
+        self._last_overquota_notice = -10**9
         self.code37_count = 0  # security-check 重算次数，高频会升级到 32 封禁
         # code=37 熔断阈值。2026-08-10/11 标定：code=37 是每约 6 条一次的配额窗口
         # 信号（间距实测全程稳定 6.0），所以抓 N 条详情正常会触发约 N/6 次。
@@ -244,25 +247,63 @@ class BossCollector(Collector):
             return "recommend"
         return "list"
 
-    def _check_daily_budget(self) -> None:
-        """跨进程单日请求上限。没注入账本时跳过（不让账本成为采集硬依赖）。
+    def over_quota_factor(self) -> float:
+        """超过日线之后的**减速倍数**（1.0 = 未超线，正常速度）。
 
-        每次请求都查一次 DB 看似浪费，但 request_log 有 (day, kind) 索引且行数
-        是千级，成本远低于一次网络请求；换来的是三个脚本并行/串行跑都不会突破
-        同一条日线——这正是旧代码缺的东西（各进程只管自己的 max_requests_per_run）。
+        ⚠️ 语义变更（2026-08-31，用户要求）：日线不再是硬停线，而是**降速线**。
+        「达到配额但还没风控就降速跑，直到该做的做完」。
+
+        为什么可以这么做：`max_requests_per_day=900` 从来不是平台给的数字，
+        而是我们自己按「08-11 那轮未触发封禁」反推的保守值。真正的风控信号是
+        code=36/32 与验证页 —— 那些仍然**立刻停**（见 `_mark_outcome`），
+        这里放开的只是我们自己设的预算线。
+
+        为什么降速而不是原速：封禁按**累计量**算，但也按**速率**算。越线之后
+        继续原速是把两个风险变量同时推高；降速让累计量继续涨、速率反而降下来，
+        是这两者里唯一还能动的那个旋钮。
+
+        倍数随超出比例**阶梯式**增长而不是连续函数：连续函数会让减速在越线
+        那一刻几乎无感（1.0x → 1.01x），阶梯让每一档都真的看得出来。
         """
         if self.ledger is None:
+            return 1.0
+        try:
+            used = self.ledger.request_counts().get("total", 0)
+        except Exception:
+            return 1.0
+        cap = self.config.max_requests_per_day
+        if used < cap:
+            return 1.0
+        over = used / max(cap, 1)
+        if over < 1.25:
+            return 2.0
+        if over < 1.5:
+            return 3.0
+        if over < 2.0:
+            return 4.0
+        return 6.0
+
+    def _check_daily_budget(self) -> None:
+        """越过日线时打一次提示（每 50 次请求一次，别刷屏）。**不再抛异常**。
+
+        保留这个方法名与调用点：它原先是硬停线的执行处，现在改成只做观测，
+        真正的减速发生在 `_collect_detail` 的条内延迟与调用方的批间冷却里。
+        """
+        if self.ledger is None:
+            return
+        factor = self.over_quota_factor()
+        if factor <= 1.0:
             return
         try:
             used = self.ledger.request_counts().get("total", 0)
         except Exception:
             return
         cap = self.config.max_requests_per_day
-        if used >= cap:
-            raise RiskControlStop(
-                f"今日累计请求已达 {used}/{cap}（跨进程账本），主动停止。"
-                "封禁按累计量算，明日再跑。"
-            )
+        if self.request_count - self._last_overquota_notice >= 50:
+            self._last_overquota_notice = self.request_count
+            print(f"[OVER-QUOTA] 今日累计 {used}/{cap}（{used/max(cap,1):.2f}x），"
+                  f"降速 {factor:.0f}x 继续。风控信号（code=36/32、验证页）仍会立刻停止。",
+                  flush=True)
 
     def _count_request(self, url: str, outcome: str = "ok", code: int | None = None) -> None:
         """本轮内存计数 + 落账本。账本写失败不能打断采集——请求已经发出去了，
@@ -328,6 +369,9 @@ class BossCollector(Collector):
         # （旧代码走 window._PAGE.token，该对象在当前前端版本已不存在，
         # 且前端真实请求从不发 token 头——见上方注释②。）
         for attempt in range(1, attempts + 1):
+            # ⚠️ `max_requests_per_run` 仍是**硬停线**，但它的作用只是"别让一个进程
+            # 无限跑"（进程越久，浏览器状态越可能漂）。它不是风控线，所以调用方
+            # 重起一段就能继续 —— 与日线（已改为降速线）性质不同，别把两者合并。
             if self.request_count >= self.config.max_requests_per_run:
                 raise RiskControlStop(
                     f"已达单次运行请求上限 {self.config.max_requests_per_run}，主动停止。"
@@ -705,7 +749,11 @@ class BossCollector(Collector):
         job.detail_fetched_at = datetime.now(timezone.utc).isoformat()
         # 条内延迟用高斯分布（比 uniform 更像真人：有时快有时慢），2026-08-03 拟人化
         lo, hi = self.config.detail_delay_seconds
-        await asyncio.sleep(gaussian(lo, hi))
+        # 越过日线后按倍数拉长（日线是降速线，见 over_quota_factor）。
+        # 乘在**条内延迟**上而不是只乘批间冷却：条内延迟是每条都走的路径，
+        # 乘它才能真正把速率压下去。
+        f = self.over_quota_factor()
+        await asyncio.sleep(gaussian(lo * f, hi * f))
         return job
 
     async def _maybe_chat(self, job: JobRecord) -> str:
