@@ -54,8 +54,49 @@ class BrowserSession:
             ignore_default_args=["--enable-automation"],
         )
         self.context.set_default_timeout(self.config.navigation_timeout_ms)
+        await self._block_heavy_resources(self.context)
         self.owns_context = True
         return self.context
+
+    @staticmethod
+    async def _block_heavy_resources(context: BrowserContext) -> None:
+        """拦掉图片/字体/媒体与埋点域。**只影响导航，不影响同源 fetch**。
+
+        为什么必须有（2026-08-30 实测）：采集链路的**每次 stoken 重算发 226 次
+        HTTP 请求**（两次整页导航：`security-check.html` + 回搜索页），
+        而账本只记 1 行 —— 低估 226 倍。按 08-29 那轮（1019 条详情、
+        182 次重算）折算，真实请求量约 42151 次而非账本上的 1201 次，
+        即**每条详情 41.4 次**而不是 1.18 次。
+
+        这条链路一直没有任何 `page.route` 拦截，所以那两次导航把
+        `static.zhipin.com`(98)、`img.bosszhipin.com`(45) 等子资源全下载了。
+        刷新链路早就在拦（一条 102 → 约 10 次），这里照搬同一套判据。
+
+        ⚠️ 绝不能拦 `script` / `document` / `xhr`：
+        stoken 靠自家 JS（`security-js/<name>.js`）计算，拦掉脚本
+        等于让重算永远算不出来；而 `xhr` 就是采集本身要读的接口。
+        ⚠️ `logapi.zhipin.com` 是 BOSS 自己的埋点上报，拦掉同时少交行为特征。
+        """
+        blocked_types = {"image", "media", "font"}
+        blocked_hosts = (
+            "logapi.zhipin.com", "geetest.com", "apm-fe.zhipin.com",
+            "hm.baidu.com", "shink.zhipin.com", "t.zhipin.com",
+            "img.bosszhipin.com",
+        )
+
+        async def _route(route) -> None:
+            req = route.request
+            host = (req.url.split("/")[2] if "//" in req.url else "").lower()
+            if req.resource_type in blocked_types or any(
+                b in host for b in blocked_hosts
+            ):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        # 挂在 context 上而不是单个 page：采集会开新页签（_maybe_chat），
+        # 挂 page 级的话新页签不受保护。
+        await context.route("**/*", _route)
 
     async def close(self) -> None:
         if self.owns_context and self.context:

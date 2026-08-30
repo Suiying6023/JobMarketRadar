@@ -59,6 +59,23 @@ RISK_TEXTS = (
 
 RISK_DUMP_DIR = Path("data/risk_dumps")
 
+# 一次 code=37 重算折算多少次请求。**不是 1**（2026-08-30 实测推翻）。
+#
+# 重算发两次整页导航（`security-check.html` + 回搜索页）：
+#   · 无拦截：发起 226 次
+#   · 有拦截（`BrowserSession._block_heavy_resources`）：发起 227、拦掉 88，
+#     **真实上网 139 次**
+#
+# ⚠️ 拦截只砍掉约 39%，因为剩下的大头是**脚本 80 + xhr 45**——
+# 那是搜索页这个 SPA 自己的壳，而 script/xhr 恰恰不能拦
+# （stoken 靠自家 JS 算，xhr 就是采集要读的接口）。
+# 所以采集侧不可能像刷新侧那样降到个位数：刷新侧的 1.7 次/条来自
+# **改用同源 fetch 完全不加载页面**，而采集侧的重算**必须走真实导航**。
+#
+# 取 139 是拦截生效后的实测值。**改动拦截规则就要重新量。**
+# 探针 `scripts/probe_recover_cost.py`，数据 `data/calibration/recover-cost*.json`。
+REQ_PER_RECOVER = 139
+
 
 class RiskControlStop(RuntimeError):
     """命中平台风控。必须立刻停止整轮采集，不重试。"""
@@ -440,6 +457,21 @@ class BossCollector(Collector):
         # 重算本身要发两次导航（security-check + 回搜索页），都是真实请求且都消耗
         # 信用——封禁页原文「请勿频繁提交刷新请求」印证刷新也算。旧代码只数 fetch，
         # 于是重算的开销在账上完全隐形，"今天发了多少"被系统性低估。
+        #
+        # ⚠️ 这里**仍然只记 1 行**，但那不代表它只值 1 次请求 ——
+        # 实测一次重算真实上网 139 次（见 REQ_PER_RECOVER 的注释）。
+        #
+        # 为什么不改成记 139 行：`max_requests_per_day` 的现值（900）是按
+        # **旧口径（重算记 1 行）** 标定的，而那条线的依据是实测的
+        # 「674 条详情安全 / 1019 条触发验证挑战」—— 那是**详情条数**的边界。
+        # 一旦改成记 139 行，900 这道闸会在约 34 条详情处就拦死，
+        # 远低于已知安全的 674，等于用一个记账口径的变化把采集能力砍掉 20 倍。
+        #
+        # 正确做法是**账本口径与安全线一起换**（换成按详情条数计，或把日线
+        # 按新口径重标）。那是一次独立改动，需要重新标定；在它落地之前，
+        # 这里保持旧口径，而把真实成本写在 REQ_PER_RECOVER 和文档里，
+        # 让「估风险」时用真实数字，「执行闸门」时用已标定的数字。
+        # ⚠️ 别只改一半 —— 改记账不改闸门，闸门的含义就悄悄变了。
         self._count_request(sec_url, outcome="code37_recover", code=37)
         await self.page.goto(sec_url, wait_until="domcontentloaded",
                              timeout=self.config.browser.navigation_timeout_ms)
