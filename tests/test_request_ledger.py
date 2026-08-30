@@ -79,22 +79,29 @@ def test_ledger_classifies_detail_vs_list(store):
     assert counts["detail"] == 1
 
 
-def test_daily_budget_is_cross_process(store):
+def test_daily_budget_stops_across_processes(store):
     """日线是跨进程的：账本里已有的量要算进来，不能只看本进程计数。
 
-    ⚠️ 2026-08-31 起日线是**降速线**而非停线，所以这里断言的是"另一个脚本的量
-    也能把本进程推入降速档"，而不是"第一次请求就抛异常"。
-    跨进程这一点没变，只是越线后的动作从"停"改成了"慢"。
+    模拟"另一个脚本今天已经跑了 5 次"，本进程上限设 5 → 第一次请求就该停。
     """
     for _ in range(5):
         store.log_request("detail", script="other_script")
     page = FakePage()
     collector = make_collector(page, store, max_requests_per_day=5)
-    # 本进程一次请求都还没发，但账本里已有 5 次 → 已越线，应降速。
-    assert collector.request_count == 0
-    assert collector.over_quota_factor() > 1.0
+    with pytest.raises(RiskControlStop) as err:
+        asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
+    assert "今日累计请求" in str(err.value)
+    # 关键：请求根本没发出去（不是发了才发现超限）
+    assert page.requested_urls == []
 
-    # 越线不阻断请求：请求照发，只是节奏变慢。
+
+def test_slow_mode_lets_requests_through(store):
+    """slow 模式下越线不阻断请求 —— 请求照发，只是节奏变慢。"""
+    for _ in range(5):
+        store.log_request("detail", script="other_script")
+    page = FakePage()
+    collector = make_collector(page, store, max_requests_per_day=5)
+    collector.config.over_quota_action = "slow"
     asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
     assert len(page.requested_urls) == 1
 
@@ -196,13 +203,7 @@ def test_total_excludes_refresh_chain(store):
 
 
 def test_daily_budget_ignores_refresh_chain(store):
-    """采集侧的日线**降速**不该被刷新链路的量触发。
-
-    ⚠️ 2026-08-31 语义变更：日线从硬停线改成降速线（用户要求「达到配额但还没
-    风控就降低速度运行」）。理由是 900 这个数不是平台给的，而是我们按
-    「未触发封禁的那轮」反推的自设预算；真正的风控信号（code=36/32、验证页）
-    仍然立刻停。所以这里断言的是 `over_quota_factor`，不再是抛异常。
-    """
+    """采集侧的日线不该被刷新链路的量触发（两条链路独立记账）。"""
     page = FakePage(body={"code": 0, "zpData": {}})
     collector = make_collector(page)
     collector.ledger = store
@@ -211,26 +212,39 @@ def test_daily_budget_ignores_refresh_chain(store):
     for _ in range(50):
         store.log_request("detail_page", script="refresh_status_loop")
 
-    # 50 次刷新请求远超日线 5，但采集链路今天还没发过任何请求 → 不该降速。
-    assert collector.over_quota_factor() == 1.0
-    collector._check_daily_budget()   # 不抛
+    # 50 次刷新请求远超日线 5，但采集链路今天还没发过任何请求 → 不该拦。
+    collector._check_daily_budget()
 
     for _ in range(5):
         store.log_request("detail", script="backfill_details")
-    assert collector.over_quota_factor() > 1.0, "越线后必须降速"
-    collector._check_daily_budget()   # 仍然不抛——降速不是停机
+    with pytest.raises(RiskControlStop):
+        collector._check_daily_budget()
 
 
-def test_over_quota_slows_down_but_never_stops(store):
-    """越线只降速、永不抛异常；倍数随超出比例阶梯上升。
+def test_over_quota_action_defaults_to_stop(store):
+    """默认必须是 `stop`（历史行为）。
 
-    钉死"永不抛"这一点：把降速写成异常会让越线表现得跟风控一样，
-    而两者要求的人工动作完全不同（一个不需要人，一个必须立刻处理）。
+    钉死默认值：越线该停还是该降速是**调用方的策略**，不是代码的事实。
+    把默认改成 slow 会让所有既有调用方在不知情的情况下变成"越线继续跑"。
     """
     page = FakePage(body={"code": 0, "zpData": {}})
-    collector = make_collector(page)
-    collector.ledger = store
-    collector.config.max_requests_per_day = 100
+    collector = make_collector(page, store, max_requests_per_day=5)
+    assert collector.config.over_quota_action == "stop"
+    for _ in range(5):
+        store.log_request("detail", script="t")
+    assert collector.over_quota_factor() == 1.0, "stop 模式不该返回降速倍数"
+    with pytest.raises(RiskControlStop):
+        collector._check_daily_budget()
+
+
+def test_over_quota_slow_mode_never_stops(store):
+    """显式选 slow 时越线只降速、永不抛异常，倍数按配置的档位表上升。
+
+    档位表从 `config.over_quota_ladder` 读而不是写死在代码里 —— 调档不该改代码。
+    """
+    page = FakePage(body={"code": 0, "zpData": {}})
+    collector = make_collector(page, store, max_requests_per_day=100)
+    collector.config.over_quota_action = "slow"
 
     seen = []
     for target, expect in ((100, 2.0), (130, 3.0), (160, 4.0), (220, 6.0)):
@@ -241,6 +255,20 @@ def test_over_quota_slows_down_but_never_stops(store):
         assert f == expect, f"用量 {target} 时应降速 {expect}x，实际 {f}x"
         collector._check_daily_budget()   # 任何档位都不抛
     assert seen == sorted(seen), "倍数必须单调不减"
+
+
+def test_custom_ladder_is_honoured(store):
+    """自定义档位表要生效 —— 这是"策略可调"的实际检验。"""
+    page = FakePage(body={"code": 0, "zpData": {}})
+    collector = make_collector(page, store, max_requests_per_day=10)
+    collector.config.over_quota_action = "slow"
+    collector.config.over_quota_ladder = [(1.0, 1.5), (3.0, 10.0)]
+    for _ in range(10):
+        store.log_request("detail", script="t")
+    assert collector.over_quota_factor() == 1.5
+    while store.request_counts().get("total", 0) < 30:
+        store.log_request("detail", script="t")
+    assert collector.over_quota_factor() == 10.0
 
 
 def test_collect_reraises_risk_control_stop():

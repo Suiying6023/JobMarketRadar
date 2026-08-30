@@ -30,6 +30,29 @@ from __future__ import annotations
 
 # 一条 fetch 的请求数，以及窗口耗尽后重算 stoken 的开销。
 # 用于账本折算——**别再用一个写死的 14**，那个数是从 verify 页数出来的。
+def quota_factor(used: int, cap: int,
+                 ladder: list[tuple[float, float]] | None = None) -> float:
+    """越过日线后的延迟乘数。`ladder` 是 (用量倍数, 延迟乘数) 的升序列表。
+
+    **唯一实现**：采集链路（boss.py）与刷新链路（refresh_status_loop.py）
+    都调这一个，避免两份档位表各自漂移。
+
+    档位而非连续函数：连续函数会让减速在越线那一刻几乎无感（1.0x → 1.01x），
+    档位让每一级都真的看得出来，日志里也能一眼认出当前在哪一级。
+
+    `ladder=None` 或空表示不降速（返回 1.0）—— 由调用方决定要不要降速，
+    这里不替它选。
+    """
+    if not ladder or cap <= 0 or used < cap:
+        return 1.0
+    over = used / cap
+    factor = 1.0
+    for threshold, mult in sorted(ladder):
+        if over >= threshold:
+            factor = mult
+    return factor
+
+
 REQ_PER_FETCH = 1
 REQ_PER_RECOVER = 3
 FETCH_WINDOW = 5          # 保守取 5（实测 [6,5,6,5]，取下界免得反复撞挑战页）

@@ -114,6 +114,17 @@ class CollectionConfig(BaseModel):
     # 而 max_requests_per_run 只管单个进程——三个采集脚本各跑一轮就能悄悄
     # 累到 750 次而每一轮都"没超限"。
     max_requests_per_day: int = Field(default=600, ge=1, le=5000)
+    # 越过日线后怎么办：`stop` = 抛 RiskControlStop（历史行为，默认），
+    # `slow` = 按 `over_quota_ladder` 降速继续跑。
+    # **做成开关而不是改死**：日线是我们自设的预算（不是平台给的数字），
+    # 哪种更合适取决于当次任务目标 —— 赶进度时降速跑完，摸边界时该停。
+    # 决策留给调用方（命令行/配置），代码只提供两种都能走的路。
+    over_quota_action: str = Field(default="stop", pattern="^(stop|slow)$")
+    # 降速档位：`用量/日线` 的倍数 → 延迟乘数。用列表而不是写死 if-elif，
+    # 这样调档不需要改代码。默认档来自 2026-08-31 的取值（1.0x→2 倍慢…）。
+    over_quota_ladder: list[tuple[float, float]] = Field(
+        default_factory=lambda: [(1.0, 2.0), (1.25, 3.0), (1.5, 4.0), (2.0, 6.0)]
+    )
     # code=37 重算次数熔断阈值。不是封禁预警（见 boss.py 里的说明），
     # 只是"一轮跑了多少量"的代理指标。激进探测时放开。
     code37_limit: int = Field(default=35, ge=1, le=5000)

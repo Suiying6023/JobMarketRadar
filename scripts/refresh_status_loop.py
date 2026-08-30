@@ -70,7 +70,7 @@ from check_job_status import (  # noqa: E402
 )
 from job_radar.refresh_fetch import (  # noqa: E402
     EXTRACT_JS, FETCH_WINDOW, MIN_JOB_HTML_LEN, REQ_PER_RECOVER,
-    is_closed_status, same_job,
+    is_closed_status, quota_factor, same_job,
 )
 
 # 一条 fetch = 1 次请求。窗口耗尽后重算 stoken 约 3 次，窗口约 5 条 →
@@ -182,24 +182,6 @@ def used_today(con: sqlite3.Connection) -> int:
     return con.execute(
         "SELECT count(*) FROM request_log WHERE day=? AND kind='detail_page'",
         (day,)).fetchone()[0]
-
-
-def over_quota_factor(used: int, cap: int) -> float:
-    """越过日线后的减速倍数（1.0 = 未越线）。与 boss.py 的同名方法同一档位表。
-
-    阶梯而非连续：连续函数在越线那一刻几乎无感（1.0x → 1.01x），
-    阶梯让每一档都真的看得出来，日志里也能一眼认出当前在哪一档。
-    """
-    if cap <= 0 or used < cap:
-        return 1.0
-    over = used / cap
-    if over < 1.25:
-        return 2.0
-    if over < 1.5:
-        return 3.0
-    if over < 2.0:
-        return 4.0
-    return 6.0
 
 
 def probe_exit(port: int, timeout: int = 12) -> int:
@@ -491,6 +473,13 @@ async def main() -> None:
     ap.add_argument("--skip-fresh-hours", type=float, default=12.0,
                     help="跳过 updated_at 在 N 小时内的行（默认 12，0=关闭）。"
                          "无人值守续跑必须开：见选行处的注释")
+    # 越线行为做成开关：日线是我们自设的预算（不是平台给的数字），
+    # 越线后该停还是该降速取决于当次任务目标 —— 摸边界时该停，赶进度时降速跑完。
+    # 默认 stop 保持历史行为，不让既有调用方被动改变语义。
+    ap.add_argument("--over-quota", choices=("stop", "slow"), default="stop",
+                    help="越过 --daily-cap 后：stop=停机（默认），slow=降速跑完")
+    ap.add_argument("--slow-ladder", default="1.0:2,1.25:3,1.5:4,2.0:6",
+                    help="降速档位 用量倍数:延迟乘数，逗号分隔（配合 --over-quota slow）")
     ap.add_argument("--rotate-every", type=int, default=15, help="每 N 条换出口")
     ap.add_argument("--burst", type=int, default=25, help="每 N 条一次长停顿")
     # 节奏档。**随成本重算过**：原先条间 110-170s 是按「一条 14 次请求」定的，
@@ -524,6 +513,14 @@ async def main() -> None:
                          % (REQ_PER_JOB + REQ_PER_RECOVER / FETCH_WINDOW,
                             FETCH_WINDOW, REQ_PER_RECOVER))
     args = ap.parse_args()
+
+    # 解析降速档位。`--over-quota stop` 时传空表 → quota_factor 恒返回 1.0，
+    # 不需要在每个使用点再判一次模式。
+    ladder: list[tuple[float, float]] = []
+    if args.over_quota == "slow":
+        for part in args.slow_ladder.split(","):
+            thr, _, mult = part.partition(":")
+            ladder.append((float(thr), float(mult)))
 
     # timeout：三条链路（刷新 / 补详情 / 标签重打）会并行写同一个库。
     # 库本身是 WAL（允许一写多读 + 写者排队），但**默认 5s 的 busy_timeout
@@ -596,19 +593,22 @@ async def main() -> None:
     affordable = int(room / per_job_req)
     print(f"[账本] 今日已用 {used} 次请求 / 上限 {args.daily_cap}，"
           f"余量 {room} 次 ≈ {affordable} 条（每条摊薄 {per_job_req:.2f} 次）")
-    # ⚠️ 语义变更（2026-08-31，用户要求）：日线是**降速线**，不是停线。
-    # 「达到配额但还没风控的话就降低速度运行，直到该刷新的刷新完毕」。
-    #
-    # 可以这么做的理由：1000 这个数不是平台给的，是我们按「未触发封禁的那轮」
-    # 反推的保守值。真正的风控信号（挑战页连撞、出口被标记 code=31）仍然
-    # 立刻停 —— 放开的只是自设预算。
-    # 降速而非原速：封禁按累计量也按速率算，越线后速率是唯一还能压的旋钮。
-    if affordable <= 0:
-        print(f"[OVER-QUOTA] 今日已用 {used}/{args.daily_cap}，"
-              f"越线后降速继续（不再停机）。风控信号仍会立刻停止。")
+    # 越线行为由 --over-quota 决定（stop=历史行为，slow=降速跑完）。
+    # 1000 这个数不是平台给的，是我们按「未触发封禁的那轮」反推的自设预算，
+    # 所以"越线怎么办"是策略而不是事实 —— 交给调用方，代码两种都支持。
+    # 真正的风控信号（挑战页连撞、出口 code=31）在两种模式下都立刻停。
+    if args.over_quota == "stop":
+        if affordable <= 0:
+            print("[BUDGET-STOP] 今日请求额度已用尽，明天再跑。无需人工介入。")
+            return
+        if len(rows) > affordable:
+            print(f"本轮按额度截到 {affordable} 条（原 {len(rows)} 条）")
+            rows = rows[:affordable]
+    elif affordable <= 0:
+        print(f"[OVER-QUOTA] 今日已用 {used}/{args.daily_cap}，降速继续（--over-quota slow）")
     elif len(rows) > affordable:
         print(f"[OVER-QUOTA] 额度只够 {affordable} 条，其余 "
-              f"{len(rows) - affordable} 条将降速跑完（不再截断）")
+              f"{len(rows) - affordable} 条降速跑完（--over-quota slow）")
 
     # 把节奏换算成请求/分钟打出来，和老链路的安全速率对齐着看。
     # 只报"条间 X 秒"没有意义——风控数的是请求数。
@@ -738,7 +738,7 @@ async def main() -> None:
         clean_windows = 0
         exit_strikes = 0
         # 当前降速倍数。循环里每 10 条按**实际用量**复算一次。
-        slow_factor = over_quota_factor(used, args.daily_cap)
+        slow_factor = quota_factor(used, args.daily_cap, ladder)
         if slow_factor > 1.0:
             print(f"[OVER-QUOTA] 起步即越线，降速 {slow_factor:.0f}x", flush=True)
 
@@ -758,7 +758,15 @@ async def main() -> None:
             # 沿用估值会让降速迟迟不触发。
             if i % 10 == 1:
                 now_used = used_today(con)
-                new_factor = over_quota_factor(now_used, args.daily_cap)
+                if args.over_quota == "stop" and now_used >= args.daily_cap:
+                    print(f"\n[BUDGET-STOP] 日线到顶：已用 {now_used}/"
+                          f"{args.daily_cap}（实测 {now_used/max(i-1,1):.2f} 次/条，"
+                          f"启动估值 {per_job_req:.2f}）。已处理 {i-1}/{len(rows)} 条，"
+                          f"结果都已落库。", flush=True)
+                    print("[BUDGET-STOP] 无需人工介入，明日额度重置后可续跑。",
+                          flush=True)
+                    break
+                new_factor = quota_factor(now_used, args.daily_cap, ladder)
                 if new_factor != slow_factor:
                     slow_factor = new_factor
                     if slow_factor > 1.0:
