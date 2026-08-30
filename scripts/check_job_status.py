@@ -1,5 +1,14 @@
 """批量检测岗位是否关闭（下架/失效），用隔离的隐身浏览器加载公开详情页。
 
+⚠️ **跑批请用 `refresh_status_loop.py`，不要用本脚本**（2026-08-30）。
+本脚本走 `page.goto` 整页加载，实测**一条 102 次 HTTP 请求**；
+`refresh_status_loop` 已改成匿名同源 fetch，一条 **1.86 次**（省 55 倍），
+且带出口体检、stoken 窗口管理与人工验证回环。
+本脚本保留的价值是它的**判定口径**：真浏览器带 CSS 渲染，
+`body.innerText` 就是用户看到的东西，可作为 fetch 判定的对照基准
+（`probe_closed_truth.py` 正是用它验出「在招时 `.job-status` 是『招聘中』」的）。
+`parse_active_status` / `_is_closed` / `ACTIVE_DAYS` 仍被那边复用。
+
 与主采集账号完全隔离：
 - 非持久上下文（无登录 cookie），不携带主账号 .browser-profile
 - 只加载公开的 job_detail 页面，不调用 token 详情接口 → 不叠加主账号风控
@@ -291,11 +300,12 @@ async def main() -> None:
                 if args.refresh_active and page_text:
                     phrase, days = parse_active_status(page_text)
                     if phrase:
+                        # UTC，与 storage.py 的 CURRENT_TIMESTAMP 口径一致。
+                        # 原先写 datetime.now()（本地时间，+8h），同一列两个时区。
                         con.execute(
                             "UPDATE jobs SET recruiter_active_status=?, recruiter_online=?, "
-                            "       updated_at=? WHERE canonical_id=?",
-                            (phrase, 1 if phrase == "在线" else 0,
-                             datetime.now().isoformat(timespec="seconds"), r["canonical_id"]))
+                            "       updated_at=CURRENT_TIMESTAMP WHERE canonical_id=?",
+                            (phrase, 1 if phrase == "在线" else 0, r["canonical_id"]))
                         refreshed += 1
                         if days is not None and days >= args.stale_days:
                             # 降级不等于关闭：岗位还在招，只是招聘者久未上线，

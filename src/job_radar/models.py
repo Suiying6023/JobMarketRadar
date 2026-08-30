@@ -93,6 +93,9 @@ class CollectionConfig(BaseModel):
     # 上限比 pages_per_query 宽（30）：深翻是明确的定向动作，不是默认行为。
     pages_per_keyword: dict[str, int] = Field(default_factory=dict)
     detail_limit_per_query: int = Field(default=30, ge=0, le=200)
+    # ⚠️ 服务端硬上限 30，写大无效（2026-08-30 实测：同一会话发 pageSize=50
+    # 仍只回 30 条且 hasMore=True）。这里的 le=50 只是校验范围，
+    # 不代表平台会兑现 —— 别指望调大它来减少列表请求数。
     page_size: int = Field(default=30, ge=10, le=50)
     request_delay_seconds: tuple[float, float] = (6.0, 12.0)
     # 每抓一条详情后的间隔。详情接口调用量是列表的 N 倍，这里是主要的限速点。

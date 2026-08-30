@@ -26,6 +26,14 @@ output/
 # 留在本地可复跑，但不入库（这个仓库有「不进公开仓」的约定）。
 data/eval/
 
+# 2026-08-30 成本/判据标定的产物：同样含真实公司名、JD 正文与整页 HTML
+# （`sample_job.html` 是一条完整岗位页）。结论已写进记忆与代码注释，
+# 原始件留本地复核用。注意 `data/calibration/*.jsonl` 那批老标定数据是
+# 纯数字，已在仓里，不受影响。
+data/calibration/*.json
+data/calibration/*.html
+data/calibration/*.css
+
 # 探针/调试产物（cookie、token、DOM dump 等，不进仓库）
 data/manual_listen/
 data/token_probe/

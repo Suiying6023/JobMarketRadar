@@ -18,13 +18,25 @@
     ssh -f -N -D 1080 -o ServerAliveInterval=30 bohrium-vm
     uv run python scripts/refresh_status_loop.py --batch 120
 
-⚠️ **成本认知**：整页加载一条 = **13 次以上 HTTP 请求**（实测，含 geetest 与
-   `logapi.zhipin.com` 埋点）。而老的 JSON API 链路一条只有 1 次。
-   所以"条间 5-10s"看着温和，真实速率约 14-26 请求/分钟——
-   而 08-11 那次跑 1025 次未触发封禁的运行是均值 6.7、峰值 12.5 请求/分钟。
-   **估算风险要按请求数，不能按条数**，这是 08-27 被封的根因。
-   （另注：08-11 那轮是 `probe_ban_boundary.py` 的激进档探测，上界未知，
-   不是安全线；别拿它当"1000 次没问题"的依据。）
+⚠️ **成本认知（2026-08-30 实测重写，原先的数字全部偏离）**：
+
+| 取法 | 每条请求数 |
+|---|---:|
+| `page.goto` 整页加载 | **102**（图片 62、xhr 17、script 14…） |
+| 整页 + 拦静态资源 | 39，但风控域 `www.zhipin.com` 只从 21 降到 20 |
+| **同源 fetch HTML**（现用） | **1**，摊薄含 stoken 重算约 **1.58** |
+
+原先文件头写「一条 13 次以上」，那个数是从一张 **verify 页**数出来的 ——
+真实岗位页是 102 次，**低估了 7 倍**。而账本里 `detail_page` 一行都没有，
+说明这条链路自接入账本后从未实跑过，所以那个假设一直没被现实检验。
+
+现在走 `fetch()`：它**不加载子资源**，只发一个文档请求。整页那 20 次自家域请求里
+17 次是 SPA 自己的壳（`city.json`/`industry.json`/banner/popupguides/
+agreement-tip/resume-parser/smsSwitch…），读 JD 一个都不需要。
+详见 `src/job_radar/refresh_fetch.py` 与 `data/calibration/`。
+
+**仍然：估算风险要按请求数，不能按条数**（08-27 被封的根因）。
+只是现在一条真的只值 1-2 次，而不是十几次。
 
 ⚠️ 起之前必须确认没有另一个本脚本在跑（2026-08-27 踩过）：
    两个进程各起浏览器、共用同两个出口 = 实际速率翻倍，十来条就把两个 IP 都打成
@@ -51,17 +63,20 @@ from patchright.async_api import async_playwright
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "data" / "hangzhou_agent.sqlite3"
 
-# 一条岗位页实际发出多少次 HTTP 请求。实测 verify 页就 13 个（www.zhipin.com 4、
-# static.geetest.com 3、api.geetest.com 2、static.zhipin.com 2、img 1、logapi 1），
-# 成功的岗位页更多，取 14 作保守估计。
-# 存在理由：老的 JSON API 链路一条 = 1 次请求，账本直接数条数就行；
-# 这条链路一条 = 十几次，**按条数记账会把风险低估一个数量级**（08-27 就是这样被封的）。
-REQ_PER_JOB = 14
-
+sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 from check_job_status import (  # noqa: E402
     CLOSED_MARKERS, ACTIVE_DAYS, parse_active_status, _is_closed,
 )
+from job_radar.refresh_fetch import (  # noqa: E402
+    EXTRACT_JS, FETCH_WINDOW, MIN_JOB_HTML_LEN, REQ_PER_RECOVER,
+    is_closed_status, same_job,
+)
+
+# 一条 fetch = 1 次请求。窗口耗尽后重算 stoken 约 3 次，窗口约 5 条 →
+# 摊薄 1.6 次/条。账本按**实际发生**记（fetch 记 1，重算记 3），
+# 不再用一个写死的估计值。
+REQ_PER_JOB = 1
 
 # 出口池：(标识, SOCKS 端口)
 EXITS = [("vm", 1080), ("container", 1082)]
@@ -315,8 +330,64 @@ async def wait_manual_verify(port: int, tag: str, job_id: str,
     if not ok:
         print(f"  ⏰ {wait:.0f}s 内未通过。")
     return ok
+async def warm_stoken(page, ctx, job_id: str, timeout: float = 60.0) -> bool:
+    """整页加载一条，等 `__zp_stoken__` 就位。fetch 全靠这个会话 cookie。
+
+    判据是**cookie 真的出现**，不是标题像不像岗位页：
+    关闭岗位的标题同样含「招聘」（实测「…工程师招聘工资_…-BOSS直聘」），
+    而 stoken 才是后面 fetch 实际依赖的东西 —— 直接检查它，
+    比从标题反推「大概拿到了」可靠。这个教训是探针阶段真踩到的：
+    按标题判时冷启动被误报为失败，整轮探测直接退出。
+    """
+    url = f"https://www.zhipin.com/job_detail/{job_id}.html"
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        pass  # 挑战跳转常在 goto 报超时后才完成，继续等 cookie
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    while loop.time() - start < timeout:
+        try:
+            names = {c["name"] for c in await ctx.cookies()}
+        except Exception:
+            await asyncio.sleep(1.0)
+            continue
+        if "__zp_stoken__" in names:
+            return True
+        cur = page.url or ""
+        if "/verify.html" in cur or "/403.html" in cur or "code=31" in cur:
+            return False
+        await asyncio.sleep(1.0)
+    return False
+
+
+async def fetch_job(page, job_id: str, attempts: int = 3) -> dict:
+    """同源 fetch 一条岗位页并按容器取值。返回 refresh_fetch.EXTRACT_JS 的结果。
+
+    ⚠️ evaluate 期间页面可能正在导航（重算 stoken 之后尤其常见），
+    Playwright 会抛 "Execution context was destroyed"。这不是风控，
+    等一下重试即可 —— 采集侧 `boss.py:_evaluate_fetch` 有同一处容错。
+    """
+    url = f"https://www.zhipin.com/job_detail/{job_id}.html"
+    for attempt in range(1, attempts + 1):
+        try:
+            return await page.evaluate(EXTRACT_JS,
+                                       {"url": url, "minLen": MIN_JOB_HTML_LEN})
+        except Exception as exc:
+            if "Execution context was destroyed" not in str(exc) or attempt == attempts:
+                return {"ok": False, "reason": "evaluate_error", "error": str(exc)}
+            await asyncio.sleep(2.5)
+    return {"ok": False, "reason": "evaluate_error"}
+
+
 async def load_and_read(page, job_id: str, max_wait: float = 45.0) -> tuple[bool | None, str]:
-    """加载详情页，返回 (是否关闭, 页面文本)。None = 未判定。"""
+    """【整页加载版，已不用于跑批】返回 (是否关闭, 页面文本)。None = 未判定。
+
+    保留原因：它是「真浏览器带 CSS 渲染」的口径，`body.innerText` 就是用户
+    看到的东西，可作为 fetch 判定的对照基准（探针 `probe_closed_truth.py`
+    正是用它验出 `.job-status` 在招时是「招聘中」的）。
+    跑批不要用：实测一条 102 次请求，是 fetch 的 100 倍。
+    """
     url = f"https://www.zhipin.com/job_detail/{job_id}.html"
     # 波尔链路实测单次首页往返 13-15s，30s 的 goto 超时在这里偏紧。
     # goto 超时不直接返回：挑战跳转常在 goto 报超时后才完成，
@@ -383,15 +454,19 @@ async def main() -> None:
                     help="活跃度换算天数 >= 此值即降级为 sample")
     ap.add_argument("--rotate-every", type=int, default=15, help="每 N 条换出口")
     ap.add_argument("--burst", type=int, default=25, help="每 N 条一次长停顿")
-    # 慢速长跑档。默认值对齐老链路实测的安全速率：
-    # 08-11 那轮（未触发封禁）是均值 6.7、峰值 12.5 请求/分钟，
-    # 而一条岗位页 = 14 次请求 → 要压到 6 请求/分钟以下，条间需 ~140s。
+    # 节奏档。**随成本重算过**：原先条间 110-170s 是按「一条 14 次请求」定的，
+    # 目标压到 6 请求/分钟以下。现在一条摊薄 1.6 次，同样的 6 请求/分钟只需
+    # 条间约 16s。这里取 18-32s（均值 25s ≈ 3.8 请求/分钟），比老链路
+    # 08-11 那轮（均值 6.7、未触发封禁）还保守一半，而 807 条从 53 小时降到约 6 小时。
+    #
+    # ⚠️ 别把它再调快：真正的约束不是请求数而是 stoken 窗口 —— 每约 5 条就要
+    # 重算一次，重算本身是导航（比 fetch 重）。间隔太小只会让重算更密。
     ap.add_argument("--gap", type=float, nargs=2, metavar=("LO", "HI"),
-                    default=[110.0, 170.0],
-                    help="条间间隔秒区间（默认 110-170s ≈ 6 请求/分钟）")
+                    default=[18.0, 32.0],
+                    help="条间间隔秒区间（默认 18-32s ≈ 3.8 请求/分钟）")
     ap.add_argument("--burst-pause", type=float, nargs=2, metavar=("LO", "HI"),
-                    default=[420.0, 900.0],
-                    help="每 --burst 条后的长停顿秒区间（默认 7-15 分钟）")
+                    default=[90.0, 180.0],
+                    help="每 --burst 条后的长停顿秒区间（默认 1.5-3 分钟）")
     ap.add_argument("--verify-wait", type=float, default=300.0,
                     help="每次弹窗等待人工验证的秒数")
     ap.add_argument("--verify", action="store_true",
@@ -399,8 +474,11 @@ async def main() -> None:
                          "默认关闭——被限制期间每访问一次就把解封时间"
                          "重置为「此刻+24h」，所以只在你确实要守着过验证时开")
     ap.add_argument("--daily-cap", type=int, default=1000,
-                    help="单日累计 HTTP 请求上限（跨脚本，靠 request_log 执行）。"
-                         "注意一条岗位页折算 %d 次请求" % REQ_PER_JOB)
+                    help="单日累计 HTTP 请求上限（本链路独立账本，kind='detail_page'）。"
+                         "一条摊薄约 %.1f 次请求（1 次 fetch + 每 %d 条一次 %d 次重算），"
+                         "所以 1000 次约合 600 条"
+                         % (REQ_PER_JOB + REQ_PER_RECOVER / FETCH_WINDOW,
+                            FETCH_WINDOW, REQ_PER_RECOVER))
     args = ap.parse_args()
 
     con = sqlite3.connect(DB)
@@ -434,11 +512,13 @@ async def main() -> None:
         rows = rows[: args.batch]
 
     # 先按请求数体检，别等跑起来才发现今天早就超了。
+    # 摊薄成本 = 1 次 fetch + 每 FETCH_WINDOW 条一次 REQ_PER_RECOVER 次重算。
+    per_job_req = REQ_PER_JOB + REQ_PER_RECOVER / FETCH_WINDOW
     used = used_today(con)
     room = max(0, args.daily_cap - used)
-    affordable = room // REQ_PER_JOB
+    affordable = int(room / per_job_req)
     print(f"[账本] 今日已用 {used} 次请求 / 上限 {args.daily_cap}，"
-          f"余量 {room} 次 ≈ {affordable} 条（每条约 {REQ_PER_JOB} 次）")
+          f"余量 {room} 次 ≈ {affordable} 条（每条摊薄 {per_job_req:.2f} 次）")
     if affordable <= 0:
         print("今日请求额度已用尽，明天再跑。封禁按累计请求量算，不是按条数。")
         return
@@ -447,13 +527,14 @@ async def main() -> None:
         rows = rows[:affordable]
 
     # 把节奏换算成请求/分钟打出来，和老链路的安全速率对齐着看。
-    # 只报"条间 X 秒"没有意义——风控数的是请求数，一条是 14 次。
+    # 只报"条间 X 秒"没有意义——风控数的是请求数。
     gap_avg = sum(args.gap) / 2
     bp_avg = sum(args.burst_pause) / 2
     per_job = gap_avg + (bp_avg - gap_avg) / max(args.burst, 1)
-    rpm = REQ_PER_JOB * 60 / per_job
+    rpm = per_job_req * 60 / per_job
     eta_h = len(rows) * per_job / 3600
-    print(f"本轮待检测: {len(rows)} 条 ≈ {len(rows) * REQ_PER_JOB} 次请求")
+    print(f"本轮待检测: {len(rows)} 条 ≈ {len(rows) * per_job_req:.0f} 次请求"
+          f"（整页加载同样条数需 {len(rows) * 102} 次）")
     print(f"[节奏] 条间 {args.gap[0]:.0f}-{args.gap[1]:.0f}s，"
           f"每 {args.burst} 条停 {args.burst_pause[0]/60:.0f}-"
           f"{args.burst_pause[1]/60:.0f} 分钟")
@@ -499,19 +580,15 @@ async def main() -> None:
                       f"要人工过验证请加 --verify", flush=True)
                 continue
             if verdict == "ok":
-                # 接口说没限制，才起浏览器真读一条确认（接口只答 IP 级状态，
-                # 不保证详情页此刻一定能读到）。
-                verdict = await probe_detail(browser, port, rows[0]["source_job_id"])
-                print(f"[出口] {tag} 详情页复检 {verdict}", flush=True)
-            if verdict == "ok":
+                # ⚠️ 这里**不再**跑 `probe_detail` 复检。
+                # 它起一个无拦截的新 context 整页加载一条详情页 = 实测 102 次请求，
+                # 两个出口就 204 次 —— 比一整批 100 条（约 160 次）还贵。
+                # 而它的判据价值（「接口说 ok 但详情页读不出来」）现在由
+                # 跑批前的 `warm_stoken` 覆盖：暖不起来就是读不了，
+                # 而那次 goto 本来就要发（fetch 依赖它拿 stoken），**不额外花钱**。
                 usable.append((tag, port))
             elif verdict == "blocked":
                 print(f"[出口] {tag} IP 已被硬封，跳过", flush=True)
-            elif verdict == "thin":
-                # 标题是岗位页但正文没填充 = 竞态，不是风控，可以用
-                print(f"[出口] {tag} 正文未填充（竞态，非风控），纳入可用",
-                      flush=True)
-                usable.append((tag, port))
             elif verdict in ("verify", "login") and args.verify:
                 if await wait_manual_verify(port, tag, rows[0]["source_job_id"],
                                             args.verify_wait):
@@ -534,10 +611,45 @@ async def main() -> None:
             if sp.exists():
                 kw["storage_state"] = str(sp)
             c = await browser.new_context(**kw)
-            return c, (c.pages[0] if c.pages else await c.new_page()), tag, port
+            p = c.pages[0] if c.pages else await c.new_page()
+            # 拦静态资源与埋点。只影响 `warm_stoken` 的那次整页导航
+            # （fetch 本身不加载子资源，无所谓）—— 但那一次不拦就是 102 次请求，
+            # 拦掉降到约 10 次。实测拦截省下的全在图片/CDN 域，
+            # 风控主体域 www.zhipin.com 只从 21 降到 20，所以**省的是带宽和时间**；
+            # 真正的降幅来自改用 fetch。
+            # ⚠️ 绝不能拦 script/document/xhr：BOSS 的 JS 挑战靠自家脚本算
+            # `__zp_stoken__`，拦掉脚本等于让挑战永远过不去。
+            # `logapi.zhipin.com` 是 BOSS 自己的埋点上报，拦掉同时少交行为特征。
+            async def _route(route):
+                req = route.request
+                host = (req.url.split("/")[2] if "//" in req.url else "").lower()
+                if req.resource_type in ("image", "media", "font") or any(
+                    b in host for b in ("logapi.zhipin.com", "geetest.com",
+                                        "apm-fe.zhipin.com", "hm.baidu.com",
+                                        "shink.zhipin.com", "t.zhipin.com")
+                ):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await p.route("**/*", _route)
+            return c, p, tag, port
 
         ctx, page, cur_tag, cur_port = await new_ctx(ei)
         print(f"[出口] 使用 {cur_tag}", flush=True)
+        # fetch 依赖会话级 __zp_stoken__，换 context 后必须重新暖一次。
+        warmed = await warm_stoken(page, ctx, rows[0]["source_job_id"])
+        log_requests(con, REQ_PER_RECOVER, outcome="warm")
+        print(f"[stoken] 冷启动 {'就绪' if warmed else '失败'}", flush=True)
+        if not warmed:
+            print("拿不到 stoken，fetch 无从进行。本轮停止。")
+            await ctx.close()
+            await browser.close()
+            return
+        since_warm = 0
+        # 自适应窗口：初值取实测上界，撞墙即收缩、连续顺利则回升。
+        # 窗口是**出口的属性**（随该 IP 累计用量收缩），换出口时要重置。
+        window_now = FETCH_WINDOW
+        clean_windows = 0
 
         for i, r in enumerate(rows, 1):
             if i > 1 and (i - 1) % args.rotate_every == 0 and len(usable) > 1:
@@ -546,11 +658,87 @@ async def main() -> None:
                 ctx, page, cur_tag, cur_port = await new_ctx(ei)
                 print(f"[出口] 切到 {cur_tag}", flush=True)
                 await asyncio.sleep(2.0)
+                # 新出口 = 新 context = 新会话，stoken 要重新暖。
+                if not await warm_stoken(page, ctx, r["source_job_id"]):
+                    print(f"[stoken] {cur_tag} 暖场失败，移出出口池", flush=True)
+                    usable[:] = [(t, p) for t, p in usable if p != cur_port]
+                    if not usable:
+                        print("所有出口都不可用，本轮停止。已处理的结果都已落库。")
+                        break
+                    ei += 1
+                    ctx, page, cur_tag, cur_port = await new_ctx(ei)
+                    if not await warm_stoken(page, ctx, r["source_job_id"]):
+                        print("备用出口也暖不起来，本轮停止。")
+                        break
+                log_requests(con, REQ_PER_RECOVER, outcome="warm")
+                since_warm = 0
+                # 新出口的窗口是它自己的额度，回到上界重新摸。
+                window_now = FETCH_WINDOW
+                clean_windows = 0
 
-            result, text = await load_and_read(page, r["source_job_id"])
-            done += 1
+            # 主动重暖：撞墙那一条**必然浪费一次请求**（拿回 41KB 挑战页，
+            # 什么都判不出来），还要再花一次重试。与其等撞墙，不如在窗口边界前
+            # 主动换 stoken —— 代价相同（都是一次重算），但省掉那两次浪费。
+            #
+            # ⚠️ 窗口大小**会随出口累计用量收缩**，不能写死。实测 40 条那轮：
+            # 前四个窗口干净地 5 条一换，之后只撑 2-4 条就撞墙（5 次 challenged）。
+            # 所以这里用**自适应**阈值：撞一次就把阈值降 1，连续顺利则慢慢回升。
+            # 下限 2 —— 再低就是重算比读还频繁，不如换出口。
+            if since_warm >= window_now:
+                print(f"  [窗口] 已连打 {since_warm} 条（阈值 {window_now}），"
+                      f"主动重算 stoken", flush=True)
+                if await warm_stoken(page, ctx, r["source_job_id"]):
+                    log_requests(con, REQ_PER_RECOVER, outcome="prewarm")
+                    since_warm = 0
+                    clean_windows += 1
+                    # 连续两个窗口没撞墙就试着放宽一格（别一直停在收缩后的低位）
+                    if clean_windows >= 2 and window_now < FETCH_WINDOW:
+                        window_now += 1
+                        clean_windows = 0
+                    await asyncio.sleep(random.uniform(3.0, 5.0))
+
+            rec = await fetch_job(page, r["source_job_id"])
+            since_warm += 1
             log_requests(con, REQ_PER_JOB,
-                         outcome="ok" if result is not None else "unknown")
+                         outcome="ok" if rec.get("ok") else "challenged")
+
+            # 撞挑战页 = stoken 窗口用尽（实测每约 5.5 条一次，与采集链路的
+            # code=37 同构）。重暖一次再重试这一条，而不是记未判定放过去 ——
+            # 放过去等于这条白花一次请求且下轮还要再花。
+            if not rec.get("ok") and rec.get("reason") == "challenged":
+                print(f"  [窗口] 第 {since_warm} 条后撞挑战页，重算 stoken", flush=True)
+                # 撞墙说明当前阈值偏大（窗口随累计用量收缩），收一格。
+                window_now = max(2, window_now - 1)
+                clean_windows = 0
+                if await warm_stoken(page, ctx, r["source_job_id"]):
+                    log_requests(con, REQ_PER_RECOVER, outcome="rewarm")
+                    since_warm = 0
+                    # ⚠️ 重暖成功后不要立刻 fetch。实测（首轮 12 条）两次窗口耗尽
+                    # 的重试**都又撞了挑战页**，两条因此记未判定 —— 而 goto 已经
+                    # 拿到新 cookie 了。原因是新 stoken 需要一小会儿才对
+                    # fetch 生效（导航本身也还在收尾）。等一拍再打，
+                    # 否则每个窗口边界都要白费一条。
+                    await asyncio.sleep(random.uniform(3.0, 5.0))
+                    rec = await fetch_job(page, r["source_job_id"])
+                    log_requests(con, REQ_PER_JOB,
+                                 outcome="ok" if rec.get("ok") else "challenged")
+                    # 还不行就再等久一点试最后一次：一条已经花掉的请求
+                    # 比多等 8 秒贵得多（而且下一轮还要重花）。
+                    if not rec.get("ok") and rec.get("reason") == "challenged":
+                        await asyncio.sleep(random.uniform(7.0, 11.0))
+                        rec = await fetch_job(page, r["source_job_id"])
+                        log_requests(con, REQ_PER_JOB,
+                                     outcome="ok" if rec.get("ok") else "challenged")
+
+            result = is_closed_status(rec.get("job_status")) if rec.get("ok") else None
+            # 身份校验：被重定向时判定会张冠李戴，而降级是**单向**的。
+            # 校验不过就按未判定处理，绝不把别人的状态写到这条上。
+            if result is not None and not same_job(rec.get("h1"), r["title"]):
+                print(f"  [身份不符] 请求 {r['title'][:20]!r} 得到 "
+                      f"{(rec.get('h1') or '')[:20]!r}，按未判定处理", flush=True)
+                result = None
+            text = rec.get("active_time") or "" if rec.get("ok") else ""
+            done += 1
 
             if result is None:
                 unknown += 1
@@ -603,22 +791,37 @@ async def main() -> None:
                 streak = 0
 
             if result is True:
+                # ⚠️ 关闭分支也要写 `updated_at`。原先只有活跃度分支写，
+                # 于是被判关闭的行仍带着上一轮的时间戳 ——
+                # 「这条是什么时候核实为关闭的」就无法回答，
+                # 而这正是判断一条降级结论还新不新的唯一依据。
                 con.execute(
                     "UPDATE jobs SET job_invalid=1, job_status_desc='职位已关闭', "
-                    "retention_status='sample' WHERE canonical_id=? "
-                    "AND retention_status='active'", (r["canonical_id"],))
+                    "retention_status='sample', updated_at=CURRENT_TIMESTAMP "
+                    "WHERE canonical_id=? AND retention_status='active'",
+                    (r["canonical_id"],))
                 con.commit()
                 closed += 1
                 print(f"[关闭] {r['title'][:24]} | {r['company_name']}", flush=True)
             elif result is False and text:
+                # `text` 现在是 `.boss-active-time` 容器的值（单个文案），
+                # 不再是整页 innerText。`parse_active_status` 仍然适用（它做
+                # 子串匹配且按长度降序，避免「本周活跃」被「周活跃」误吃），
+                # 但它「取位置最靠前那条」的设计原本是为了在整页文本里躲开
+                # 推荐位里**别人家**岗位的活跃度 —— 按容器取值后那个风险已经不存在。
                 phrase, days = parse_active_status(text)
                 if phrase:
+                    # ⚠️ 用 SQLite 的 CURRENT_TIMESTAMP（UTC），**不要**
+                    # `datetime.now()`。这一列的既有口径是 UTC：`storage.py` 全程
+                    # 用 CURRENT_TIMESTAMP 写了 8048 行，而两个刷新脚本原先写本地时间
+                    # （+8h）—— 同一列两个时区，61 行已被污染。
+                    # 项目里已有一次同形态的坑（`glm_tags_updated_at` 本地时间硬编码
+                    # 了 `Z` 后缀），教训是**跨字段比时间前先看实际值的格式**；
+                    # 这次更进一步：**同一字段的多个写入方也必须统一口径**。
                     con.execute(
                         "UPDATE jobs SET recruiter_active_status=?, recruiter_online=?, "
-                        "updated_at=? WHERE canonical_id=?",
-                        (phrase, 1 if phrase == "在线" else 0,
-                         datetime.now().isoformat(timespec="seconds"),
-                         r["canonical_id"]))
+                        "updated_at=CURRENT_TIMESTAMP WHERE canonical_id=?",
+                        (phrase, 1 if phrase == "在线" else 0, r["canonical_id"]))
                     refreshed += 1
                     if days is not None and days >= args.stale_days:
                         # 降级 != 关闭：岗位还在招，只是招聘者久未上线，投递价值低。
