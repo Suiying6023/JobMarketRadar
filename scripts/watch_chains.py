@@ -241,23 +241,46 @@ def main() -> None:
 
     print("  出口:")
     tunnel_down = []
+    blocked_exits: list[str] = []
+    healthy_exits: list[str] = []
     for label, port in (("vm", 1080), ("container", 1082), ("家宽", None)):
         s = exit_state(port)
         print(f"    {label:<10} {s}")
         if s.startswith("⛔"):
-            risk = True          # 被风控标记 → 要人工过验证
-        elif s.startswith("⚠️") and port:
+            # ⚠️ **先记账，别立刻判 risk**：只要还有一个出口能用、链路也在
+            # 正常产出，那"某个备用出口坏了"就不是需要半夜叫人的事。
+            # 2026-08-31 实测踩到：vm 撞 verify 而 container 正常、
+            # 刷新进度在递增（10/1119、活跃度 3），巡检仍每 20 分钟报一次
+            # "⛔ 需要人工介入" —— 那是狼来了，会把真正要人的信号淹掉。
+            # 判据在下面统一算：**所有出口都坏 → ⛔；还剩好的 → ⚠️**。
+            blocked_exits.append(label)
+        elif s.startswith("ok") and port:
+            healthy_exits.append(label)
+        if s.startswith("⚠️") and port:
             tunnel_down.append((label, port))   # 隧道断 → 重起即可，不用人
-        elif port and not verify_gate(port):
+        elif port and s.startswith("ok") and not verify_gate(port):
             # ⚠️ **`forbidden-info` 回 code:0 不等于出口能用**（2026-08-31 实测）：
             # 两个出口整整一小时把岗位页 302 到 `verify.html`（geetest 人工层），
             # 而 forbidden-info 全程 code:0 —— 巡检因此一路报"✅ 无风控信号"，
             # 直到一小时后平台才在 forbidden-info 里也标记出来。
             # 那一小时里刷新链路的 ok 归零、136 次请求全废。
             # 判据必须**直接问岗位页要不要人过验证**，不能只信状态接口。
-            risk = True
             print(f"    {'':<10} ⛔ 岗位页 302 → verify.html（geetest 人工层），"
                   f"forbidden-info 尚未标记")
+            blocked_exits.append(label)
+            if label in healthy_exits:
+                healthy_exits.remove(label)
+
+    # 出口坏了要不要叫人，取决于**还有没有能用的**。
+    if blocked_exits and not healthy_exits:
+        risk = True
+        print(f"  ⛔ 所有跳板出口都需要人工验证（{', '.join(blocked_exits)}）——"
+              f"刷新链路无出口可用。")
+    elif blocked_exits:
+        print(f"  ⚠️ {', '.join(blocked_exits)} 需人工验证，但 "
+              f"{', '.join(healthy_exits)} 仍可用 —— 链路能继续，不用半夜叫人。")
+        print(f"     跑批时加 --only-exit {healthy_exits[0]} 避开坏出口"
+              f"（坏出口会连累好的：撞墙 3 次就轮换过去然后空转）。")
     if tunnel_down:
         print("  隧道不通（**不是风控**，重起即可，不需要人工过验证）:")
         for label, port in tunnel_down:
