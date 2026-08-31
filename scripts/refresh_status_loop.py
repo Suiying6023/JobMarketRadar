@@ -639,10 +639,23 @@ async def main() -> None:
     ei = 0
 
     async with async_playwright() as pw:
+        # ⚠️ **绝不能加 `--window-position=-32000,-32000`**（2026-08-31 实测）。
+        # 那个参数的用意是"跑批时别让窗口挡着人"，代价是**整条链路失效**：
+        # 挑战 JS 会读窗口坐标当环境指纹，负的大数被判为异常环境，
+        # 平台于是既不给可自解的挑战、也不给可点的验证页，而是直接把请求
+        # **推到登录页**（`/web/user/?seed=...`，返回 7342 字节）。
+        # 对照实验（同出口、同批岗位、同一段 EXTRACT_JS）：
+        #   在屏          → 4/4 ok，落岗位页
+        #   离屏 -32000   → 0/4，落 /web/user/ 登录页
+        # 这就是那些"验证窗口全是登录页"的真实来源 —— 与 IP 是否被风控无关。
+        # 代价记录：这个参数让我误判成风控，先后归因给"重启压塌窗口"、
+        # "IP 被限制到明早"、"隧道死了"、"冷启动漏等待"，全错，浪费约 8 小时，
+        # 还让用户白点了两轮根本点不动的窗口。
+        # 判据：**任何改变浏览器可见性/几何的参数都可能改变环境指纹**，
+        # 反爬链路里它们不是无害的美化项。
         browser = await pw.chromium.launch(
             channel="chrome", headless=False,   # 必须有头，无头挑战不自解
-            args=["--disable-blink-features=AutomationControlled",
-                  "--window-position=-32000,-32000"],
+            args=["--disable-blink-features=AutomationControlled"],
             ignore_default_args=["--enable-automation"])
 
         # 开跑前体检：**必须真读一条 job_detail**，不能只看首页返回码。
@@ -740,11 +753,20 @@ async def main() -> None:
         warmed = await warm_stoken(page, ctx, rows[0]["source_job_id"])
         log_requests(con, REQ_PER_RECOVER, outcome="warm")
         print(f"[stoken] 冷启动 {'就绪' if warmed else '失败'}", flush=True)
+        # ⚠️ **cookie 出现 ≠ 立刻可用**：REWARM_WAIT 的由来是实测
+        # 「重算后等多久才生效」——0s→0%、1s→33%、5s→100%（见常量注释）。
+        # 重暖路径一直有这个等待，**冷启动却漏了**，于是每轮第一条 fetch
+        # 必然撞挑战页；撞墙又把 window 收一格、strikes +1，三次就换出口，
+        # 换出口后的 warm 同样没等待 → 再撞 → 循环。
+        # 2026-08-31 实测后果：整批 0 ok / 100% challenged，
+        # 而同样的 EXTRACT_JS 在探针里（暖场后自然有间隔）4/4 成功。
+        # 这就是那次被我误判成"IP 被封"的真实原因。
         if not warmed:
             print("拿不到 stoken，fetch 无从进行。本轮停止。")
             await ctx.close()
             await browser.close()
             return
+        await asyncio.sleep(random.uniform(*REWARM_WAIT))
         since_warm = 0
         # 自适应窗口：初值取实测上界，撞墙即收缩（但不低于 MIN_WINDOW）、
         # 连续顺利则回升。窗口是**出口的属性**（随该 IP 累计用量收缩），
@@ -808,6 +830,9 @@ async def main() -> None:
                         print("备用出口也暖不起来，本轮停止。")
                         break
                 log_requests(con, REQ_PER_RECOVER, outcome="warm")
+                # 与冷启动同一个理由：暖完必须等 stoken 生效再 fetch，
+                # 否则轮换后的第一条必然撞墙（0s 生效率实测为 0）。
+                await asyncio.sleep(random.uniform(*REWARM_WAIT))
                 since_warm = 0
                 # 新出口的窗口是它自己的额度，回到上界重新摸。
                 # strikes 也要清零：它记的是「当前出口」的不健康程度，
