@@ -182,9 +182,24 @@ def main() -> None:
     sup = alive(SUPERVISOR)
     if STOP_FLAG.exists():
         risk = True
-        print("  ⛔ 调度器已停机（撞风控），标记内容：")
-        for line in STOP_FLAG.read_text(encoding="utf-8").splitlines()[:4]:
-            print(f"     {line}")
+        # ⚠️ 已知的停机不必每轮重播全文。实测踩到：同一个 code=36 停机
+        # 连续三轮巡检输出一字不差的 4 行标记，而 20 分钟一次的节奏下
+        # 那只是噪音 —— 真正有信息量的是"停了多久""起因是什么"这两点，
+        # 以及**状态有没有变**。重复播报的代价和"狼来了"一样：
+        # 人会开始跳过巡检输出，于是真正的新信号也被跳过。
+        try:
+            mins = (datetime.now().timestamp() - STOP_FLAG.stat().st_mtime) / 60
+        except OSError:
+            mins = 0.0
+        lines = STOP_FLAG.read_text(encoding="utf-8").splitlines()
+        cause = next((l for l in lines if "RISK-STOP" in l or "命中" in l), "")
+        print(f"  ⛔ 调度器已停机 {mins:.0f} 分钟：{cause.strip() or lines[1:2]}")
+        if mins < 25:
+            # 只在刚发生的那一两轮给出完整处置指引，之后不再刷屏。
+            for line in lines[:4]:
+                print(f"     {line}")
+        else:
+            print(f"     处置指引见 {STOP_FLAG.name}；处理完删掉它我才会恢复流水线。")
     elif sup >= 1:
         print("  调度器  运行中   —— 续跑由它决定，**不要手工起新批次**")
     else:
@@ -291,8 +306,13 @@ def main() -> None:
     # ⚠️ 战果判据：出口"看起来干净"不代表链路能干活。
     # 最近一批取值全是 challenged 就是**在等人过验证**，哪怕
     # forbidden-info 回 code:0、冷 curl 只看到 security.html。
+    # ⚠️ 链路没在跑时**别报它的挑战率**：那是历史数据，说的是停机前的事。
+    # 实测踩到：刷新停了一小时后，巡检仍每轮报"最近 40 次里 26 次（65%）"，
+    # 而那 40 次全在停机前。判据必须限定在"当前正在发生的事"，
+    # 否则每轮都会重播一条无法行动的旧警报。
+    refresh_running = alive("refresh_status_loop") >= 1
     ok_n, ch_n = recent_challenge_rate(con)
-    if ok_n + ch_n >= 10:
+    if refresh_running and ok_n + ch_n >= 10:
         rate = ch_n / (ok_n + ch_n)
         if rate >= 0.9:
             risk = True
