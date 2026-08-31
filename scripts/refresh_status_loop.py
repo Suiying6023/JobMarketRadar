@@ -96,6 +96,13 @@ EXIT_STRIKE_LIMIT = 3
 # 探针 `scripts/probe_stoken_recovery.py`，数据 `data/calibration/stoken-recovery.json`。
 REWARM_WAIT = (5.0, 7.0)
 
+# 跑批窗口的落点：主屏之外，**坐标为正**。
+# 目的是不抢焦点（跑批每 15-25 秒新建 context，反复抢焦点会把全屏应用踢出）。
+# ⚠️ 绝不能改成负数：负的大数被挑战 JS 判为异常环境，请求会被推到登录页
+# （2026-08-31 实测 `-32000,-32000` 得 0/4）。正坐标实测 n=14 挑战率 7%。
+# 若你的屏幕分辨率更高、这个位置仍然可见，把数值再调大即可（保持为正）。
+OFFSCREEN_POS = "2400,1400"
+
 # 出口池：(标识, SOCKS 端口)
 EXITS = [("vm", 1080), ("container", 1082)]
 FAIL_STREAK = 10         # 连续这么多条未判定才怀疑出口失效（先探再判，别急着弹窗）
@@ -524,8 +531,9 @@ async def main() -> None:
                     help="每次弹窗等待人工验证的秒数")
     ap.add_argument("--verify", action="store_true",
                     help="遇到可救的 verify 状态时弹窗让人工过。"
-                         "默认关闭——被限制期间每访问一次就把解封时间"
-                         "重置为「此刻+24h」，所以只在你确实要守着过验证时开")
+                         "默认关闭的理由是**没人在场时弹窗等于白开**"
+                         "（窗口零产出还占着出口），"
+                         "**不是**怕加时——「每访问一次 +24h」已于 2026-08-28 实测推翻")
     ap.add_argument("--daily-cap", type=int, default=1000,
                     help="单日累计 HTTP 请求上限（本链路独立账本，kind='detail_page'）。"
                          "一条摊薄约 %.1f 次请求（1 次 fetch + 每 %d 条一次 %d 次重算），"
@@ -668,7 +676,15 @@ async def main() -> None:
         # 反爬链路里它们不是无害的美化项。
         browser = await pw.chromium.launch(
             channel="chrome", headless=False,   # 必须有头，无头挑战不自解
-            args=["--disable-blink-features=AutomationControlled"],
+            args=["--disable-blink-features=AutomationControlled",
+                  # 把窗口挪到主屏之外，**但坐标必须为正**。
+                  # 用户反馈「一直会把我全屏游戏卡出来看 chrome」——跑批每
+                  # 15-25 秒新建一次 context，窗口反复抢焦点会把全屏应用踢出。
+                  # ⚠️ 与被否掉的 `-32000,-32000` 的区别只在**正负**：
+                  # 负的大数被挑战 JS 判为异常环境（实测 0/4，落登录页），
+                  # 正坐标不会。实测 n=14 挑战率 7%，优于健康基线 14-16%。
+                  # 所以「窗口几何一律不能动」那条我说过宽了 —— 有害的是负坐标。
+                  f"--window-position={OFFSCREEN_POS}"],
             ignore_default_args=["--enable-automation"])
 
         # 开跑前体检：**必须真读一条 job_detail**，不能只看首页返回码。
@@ -697,12 +713,19 @@ async def main() -> None:
                       f"而本链路必须免登录），跳过", flush=True)
                 continue
             if verdict == "verify" and not args.verify:
-                # ⚠️ 不要在这里起浏览器"试试看"：被限制期间每访问一次
-                # （浏览器加载 job_detail/verify 页），解封时间就重置成
-                # 此刻 +24h。实测 container 因此被推后 1.5 小时。
-                # 只有 --verify 明确要求时才弹窗，否则直接跳过。
-                print(f"       ⚠️ 被限制期间访问会把解封时间重置为「此刻+24h」。"
-                      f"要人工过验证请加 --verify", flush=True)
+                # ⚠️ 这里原先写着「被限制期间每访问一次，解封时间就重置成此刻+24h」
+                # —— **那条是错的**，2026-08-28 已实测推翻（见 boss-job-radar.md
+                # 「解封时间不是"每访问一次就 +24h"」）：
+                #   · 硬封 IP 开浏览器读一条 job_detail，前后 expireTime 逐毫秒不变
+                #   · verify 态 IP 人工点掉后，限制**当场解除**，不是推后
+                # expireTime 是初次限制时定的固定时刻，不会因访问续期。
+                # 08-27 看到的"推后 1.5 小时"更可能是那次访问触发了**新的**限制
+                # 判定覆盖旧记录，而不是每次访问都续期。
+                # 所以 verify 态**该起浏览器去救**，不必怕加时而干等。
+                # 默认仍不自动弹窗（要人在场才有意义），但理由是"没人点等于白开"，
+                # 不再是"会加时"。
+                print(f"       verify 态可人工过（点掉即当场解除，不会加时）。"
+                      f"要弹窗请加 --verify", flush=True)
                 continue
             if verdict == "ok":
                 # ⚠️ 这里**不再**跑 `probe_detail` 复检。
