@@ -79,7 +79,7 @@ def exit_verdict(port: int | None, timeout: int = 20) -> tuple[str, str]:
     |---|---|---|
     | `ok` | 无限制记录 | 可用 |
     | `verify` | 带 `jumpVerify`，且 tip 没让你登录 | **人工点掉验证即当场解除** |
-    | `login_only` | 带 `jumpVerify`，但 tip 说「请登录后使用」 | **验证组件不会加载**，别弹窗给人点；免登录链路只能等 |
+    | `login_only` | 带 `jumpVerify` 但 tip 说「请登录后使用」，**或**顶层 `code` 是 35/36 且 `zpData` 为空 | **验证组件不会加载**，别弹窗给人点；免登录链路只能等 |
     | `blocked` | 硬封，无 `jumpVerify` | 人工验证无效，只能等 `expireTime` |
     | `dead` | 隧道不通 | 重起 ssh，**这不是风控** |
     | `unknown` | 响应非 JSON 或缺字段 | 别当 ok |
@@ -115,9 +115,23 @@ def exit_verdict(port: int | None, timeout: int = 20) -> tuple[str, str]:
     if not raw:
         return "dead", "隧道无响应（端口可能还在 LISTENING 但转发已失效）"
     try:
-        zp = (json.loads(raw) or {}).get("zpData") or {}
+        body = json.loads(raw) or {}
     except json.JSONDecodeError:
         return "unknown", f"非 JSON 响应: {raw[:60]}"
+    zp = body.get("zpData") or {}
+
+    # ⚠️ **限制码可能在顶层而不在 `zpData` 里**，且 `zpData` 会是空的。
+    # 实测家宽（2026-09-01）：`{"code":35,"message":"您的IP地址存在异常行为.","zpData":{}}`
+    # —— 验证页框架会渲染出来（标题变「安全验证」、正文写「请完成以下验证」），
+    # 但服务端不下发挑战参数，所以**组件永远不出现，人卡在验证页上点不了**。
+    # 只看 `zpData.code` 会因为拿不到 ip 而报 `unknown`，把一个明确的限制
+    # 说成"响应异常"。已知的顶层限制码：35（IP 异常）、36（账号异常）。
+    top = body.get("code")
+    if not zp and top in (35, 36):
+        who = "账号" if top == 36 else "IP"
+        return "login_only", (
+            f"{who}被限制（顶层 code={top}: {body.get('message', '')}）"
+            f"—— 验证页会渲染但不下发挑战，点不了；无解封时间，只能等")
 
     if zp.get("code") != 31:
         ip = zp.get("ip")

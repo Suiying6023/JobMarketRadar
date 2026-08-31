@@ -91,3 +91,44 @@ def test_callers_handle_login_only():
     for rel in ("scripts/refresh_status_loop.py", "scripts/watch_chains.py"):
         src = (ROOT / rel).read_text(encoding="utf-8")
         assert "login_only" in src, f"{rel} 没处理 login_only"
+
+
+# ---- 限制码可能在顶层，且 zpData 为空 ----
+
+@pytest.mark.parametrize("code,who", [(35, "IP"), (36, "账号")])
+def test_top_level_restriction_code_is_login_only(code, who):
+    """实测家宽：`{"code":35,"message":"您的IP地址存在异常行为.","zpData":{}}`。
+
+    验证页框架会渲染（标题变「安全验证」、正文写「请完成以下验证」），
+    但服务端不下发挑战参数 —— **组件永远不出现，人卡在验证页上点不了**。
+    只看 `zpData.code` 会因为拿不到 ip 而报 `unknown`，
+    把一个明确的限制说成"响应异常"。
+    """
+    body = json.dumps({"code": code, "message": f"您的{who}地址存在异常行为.",
+                       "zpData": {}})
+    with patch("subprocess.run", return_value=_Out(body)):
+        verdict, note = exit_verdict(None)
+    assert verdict == "login_only", f"顶层 code={code} 应判 login_only，得到 {verdict}"
+    assert "点不了" in note or "不下发" in note
+
+
+def test_top_level_code_zero_with_zpdata_still_uses_zpdata():
+    """正常响应的顶层 `code` 是 0，限制信息在 `zpData` 里 —— 别把这条也吃掉。
+
+    这是 vm 的真实响应形态（2026-09-01）：tip 同样说「请登录后使用」，
+    但**没有 `jumpVerify`** → 硬封。三种状态的 tip 可以完全一样，
+    区分只在 `jumpVerify` 有无与限制码在哪一层。
+    """
+    hard = json.dumps({"code": 0, "message": "Success",
+                       "zpData": {"code": 31, "ip": "1.2.3.4",
+                                  "expireTime": 1788281044000,
+                                  "tip": "您的 IP 存在异常行为，请登录后使用。"}})
+    with patch("subprocess.run", return_value=_Out(hard)):
+        verdict, _ = exit_verdict(1080)
+    assert verdict == "blocked", "无 jumpVerify 就是硬封，哪怕 tip 提到登录"
+
+    healthy = json.dumps({"code": 0, "message": "Success",
+                          "zpData": {"ip": "1.2.3.4"}})
+    with patch("subprocess.run", return_value=_Out(healthy)):
+        verdict, _ = exit_verdict(1080)
+    assert verdict == "ok"
