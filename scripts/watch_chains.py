@@ -28,6 +28,9 @@ DB = ROOT / "data" / "hangzhou_agent.sqlite3"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 INFO = "https://www.zhipin.com/wapi/zpsecureflow/forbidden-info?"
+# 任意一个真实岗位页，只用来看服务端把它 302 到哪里（见 verify_gate）。
+# 用固定 ID 而不是现查库：这条探测必须在库不可读时也能跑。
+PROBE_JOB_URL = "https://www.zhipin.com/job_detail/5bfc15fbdf3480570nB-2dq0E1NX.html"
 
 # 日志按 glob 取**最新一份**，不写死日期。
 # 写死日期的代价实测过：跨零点续跑后，巡检还在读前一天的日志，
@@ -44,6 +47,10 @@ CHAINS = {
 # 所以巡检必须先报「调度器在跑」，把续跑决定交给它。
 SUPERVISOR = "overnight_supervisor"
 STOP_FLAG = ROOT / "logs" / "SUPERVISOR-STOPPED.txt"
+
+# 人工验证窗口挂多久就该放弃（分钟）。用户 2026-08-31 定的：
+# 「单轮 20min 没有验证就可以停止任务，避免浪费」。
+VERIFY_GIVE_UP_MIN = 20.0
 
 
 def latest_log(pattern: str) -> Path | None:
@@ -101,6 +108,54 @@ def exit_state(port: int | None) -> str:
     return f"⛔ {kind} ip={zp.get('ip', '?')}{when}"
 
 
+def verify_age_minutes() -> float | None:
+    """最老的人工验证窗口已经挂了多少分钟。没有窗口返回 None。
+
+    取**最老**那个而不是最新：判据是"这轮验证等了多久没人管"，
+    而重弹时两个出口的窗口是先后起的，取最新会让计时反复归零。
+    """
+    ps = ("(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*manual_verify_proxy*' } | "
+          "Sort-Object CreationDate | Select-Object -First 1).CreationDate | "
+          "ForEach-Object { [int]((Get-Date) - $_).TotalMinutes }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=60)
+        s = (out.stdout or "").strip()
+        return float(s) if s else None
+    except Exception:
+        return None
+
+
+def verify_gate(port: int, timeout: int = 25) -> bool:
+    """岗位页是否**不需要**人工验证。True=可用，False=撞上 verify.html。
+
+    为什么要单独探这个：`forbidden-info` 有滞后。2026-08-31 实测两个出口
+    整整一小时把岗位页 302 到 `/web/passport/zp/verify.html`，而同期
+    `forbidden-info` 一直回 `code:0`，巡检因此报"无风控信号"，
+    刷新链路那一小时的 136 次请求全部作废。
+
+    `verify.html` 是 geetest 人工层，与可自解的 `security-check.html`
+    **不是一回事**：后者纯计算、脚本自己能过；前者必须人点，静置不会恢复。
+    所以判据只看 Location 里是不是 `verify.html`。
+
+    用 `-o /dev/null -D -` 只取响应头：一次请求、不下载正文，成本最低。
+    """
+    cmd = ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{port}",
+           "--max-time", str(timeout), "-H", f"User-Agent: {UA}",
+           "-o", "/dev/null", "-D", "-", PROBE_JOB_URL]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=timeout + 8)
+    except Exception:
+        return True   # 探不到就别误报风控（隧道问题由 exit_state 那条负责）
+    head = (out.stdout or "").lower()
+    if "verify.html" in head:
+        return False
+    # security.html（可自解那层）不算需要人工 —— 脚本自己会过。
+    return True
+
+
 def main() -> None:
     print(f"===== 巡检 {datetime.now():%H:%M:%S} =====")
 
@@ -115,6 +170,31 @@ def main() -> None:
         print("  调度器  运行中   —— 续跑由它决定，**不要手工起新批次**")
     else:
         print("  调度器  未运行   —— 「已结束」的链路才需要人工判断是否续跑")
+    # 人工验证窗口正开着：这时链路"已结束"是**等人**，不是异常，也绝不能续跑
+    # （新批次会立刻再撞验证，还会和验证窗口抢同一个出口）。
+    #
+    # ⚠️ 但**开着不等于该一直等**（用户 2026-08-31 要求）：
+    # 「单轮 20min 没有验证就可以停止任务，避免浪费」。
+    # 实测代价：那次挂了 4 小时窗口，人在睡觉，12 轮巡检全在重复"仍待验证"，
+    # 窗口零产出还占着出口。所以这里按窗口存活时长给出**明确的停止指令**，
+    # 而不是让下一个巡检自己判断"要不要再续一轮"。
+    nverify = alive("manual_verify_proxy")
+    if nverify >= 1:
+        age = verify_age_minutes()
+        if age is not None and age >= VERIFY_GIVE_UP_MIN:
+            print(f"  ⛔ 人工验证窗口已挂 {age:.0f} 分钟无人处理"
+                  f"（阈值 {VERIFY_GIVE_UP_MIN}）——**停止任务，不要再续窗口**：")
+            print("     powershell -NoProfile -Command \"Get-CimInstance Win32_Process "
+                  "-Filter \\\"Name='python.exe'\\\" | Where-Object "
+                  "{ $_.CommandLine -like '*manual_verify_proxy*' } | "
+                  "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }\"")
+            print("     等人醒了再弹一次即可（重弹成本远低于挂几小时）。")
+            risk = True
+        else:
+            shown = f"{age:.0f} 分钟" if age is not None else "时长未知"
+            print(f"  ⚠️ 人工验证窗口开着（已 {shown}）—— 等人点验证，"
+                  f"**不要起任何批次**；超过 {VERIFY_GIVE_UP_MIN} 分钟就停掉")
+
     for name, (needle, log) in CHAINS.items():
         n = alive(needle)
         p = latest_log(log)
@@ -149,6 +229,16 @@ def main() -> None:
             risk = True          # 被风控标记 → 要人工过验证
         elif s.startswith("⚠️") and port:
             tunnel_down.append((label, port))   # 隧道断 → 重起即可，不用人
+        elif port and not verify_gate(port):
+            # ⚠️ **`forbidden-info` 回 code:0 不等于出口能用**（2026-08-31 实测）：
+            # 两个出口整整一小时把岗位页 302 到 `verify.html`（geetest 人工层），
+            # 而 forbidden-info 全程 code:0 —— 巡检因此一路报"✅ 无风控信号"，
+            # 直到一小时后平台才在 forbidden-info 里也标记出来。
+            # 那一小时里刷新链路的 ok 归零、136 次请求全废。
+            # 判据必须**直接问岗位页要不要人过验证**，不能只信状态接口。
+            risk = True
+            print(f"    {'':<10} ⛔ 岗位页 302 → verify.html（geetest 人工层），"
+                  f"forbidden-info 尚未标记")
     if tunnel_down:
         print("  隧道不通（**不是风控**，重起即可，不需要人工过验证）:")
         for label, port in tunnel_down:

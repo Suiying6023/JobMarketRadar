@@ -29,9 +29,16 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--socks", default="127.0.0.1:1080", help="SOCKS5 出口 host:port")
     ap.add_argument("--tag", default="vm", help="出口标识，决定 state 文件名")
+    # ⚠️ 默认 300s（5 分钟）而不是几小时：用户 2026-08-31 明确要求
+    # 「单轮 20min 没有验证就可以停止任务，避免浪费」。
+    # 实测过代价：那次弹了 4 小时的窗口，用户在睡觉，
+    # 12 轮巡检全在重复"仍待验证"——窗口开着不产出任何东西，只是占着出口。
+    # 人不在就该早停，醒了再弹一次的成本远低于挂着几小时。
     ap.add_argument("--wait", type=float, default=300.0,
-                    help="等待人工完成验证的秒数（默认 300）。期间轮询页面状态，"
-                         "检测到岗位页正常渲染即自动存盘")
+                    help="等待人工完成验证的秒数（默认 300=5 分钟）。期间轮询页面状态，"
+                         "检测到岗位页正常渲染即自动存盘。"
+                         "⚠️ 别设成几小时：人不在时长时间挂窗口是纯浪费，"
+                         "醒了重弹一次更便宜")
     args = ap.parse_args()
 
     con = sqlite3.connect(DB)
