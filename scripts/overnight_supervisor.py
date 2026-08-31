@@ -220,6 +220,11 @@ def main() -> None:
                          "按给定顺序取第一个「有活可做」的阶段执行")
     ap.add_argument("--over-quota", choices=("stop", "slow"), default="stop",
                     help="越过日线后：stop=停机等次日（默认），slow=降速跑完")
+    # 出口选择是策略：某个出口撞验证时，用好的那个继续跑比整体停机划算。
+    # 留空 = 全部出口（默认行为不变）。
+    ap.add_argument("--only-exit", default="",
+                    help="刷新阶段只用指定出口（vm / container）。"
+                         "一个出口撞验证、另一个还好时用它，避免坏出口连累好的")
     ap.add_argument("--done-threshold", type=int, default=DONE_THRESHOLD,
                     help=f"待办低于此数即视为该阶段做完（默认 {DONE_THRESHOLD}）。"
                          "不取 0：总有少数条目反复失败，卡在 0 会让流水线停在原地")
@@ -295,6 +300,8 @@ def main() -> None:
                    "--skip-fresh-hours", str(args.skip_fresh_hours),
                    "--daily-cap", str(args.refresh_cap),
                    "--over-quota", args.over_quota]
+            if args.only_exit:
+                cmd += ["--only-exit", args.only_exit]
             if run_stage("refresh", ROOT / "logs" / f"refresh-slow-{stamp}.log",
                          cmd) == "risk":
                 halt("refresh 命中 [RISK-STOP]")
