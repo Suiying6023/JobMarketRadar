@@ -1,15 +1,26 @@
 """前台检查账号状态：打开搜索页，读登录态/封禁/验证页。
 
-用法: python scripts/check_account_status.py
+**这个脚本会开一个可见浏览器窗口**（那就是它的用途 —— 给人看、让人过验证），
+所以只在需要人看的时候跑。
+
+用法:
+    uv run python scripts/check_account_status.py
+    uv run python scripts/check_account_status.py --hold 120   # 只留 2 分钟
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
+import sys
 from pathlib import Path
 
 from patchright.async_api import async_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from job_radar.refresh_fetch import launch_args  # noqa: E402
+
 PROFILE = ROOT / ".browser-profile"
 ORIGIN = "https://www.zhipin.com"
 # 窗口保持时长。判断"硬封 vs 可人工过验证"要点开几个入口看，30 秒不够。
@@ -17,11 +28,21 @@ HOLD_SECONDS = 600
 
 
 async def main() -> None:
+    # ⚠️ **必须有 argparse**：没有它时 `--help` 会被当普通参数忽略，
+    # 脚本照样开窗口并按设计等 10 分钟 —— 于是「测一下这个脚本能不能跑」
+    # 这个动作本身就弹出了一个验证窗口，看起来像风控事件。踩过一次。
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hold", type=float, default=HOLD_SECONDS,
+                    help="窗口保持秒数（默认 %(default)s）。关窗即退出")
+    args = ap.parse_args()
+
     print("前台打开浏览器检查账号状态...", flush=True)
     async with async_playwright() as pw:
+        # 窗口开在屏幕内：它的用途就是给人看。
         ctx = await pw.chromium.launch_persistent_context(
             str(PROFILE), channel="chrome", headless=False, no_viewport=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=launch_args(""),
             ignore_default_args=["--enable-automation"])
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await page.goto(f"{ORIGIN}/web/geek/jobs?query=AI%20Agent&city=101210100",
@@ -93,7 +114,7 @@ async def main() -> None:
         # 保持窗口打开供人工观察。默认 10 分钟够看完页面各处（原先 30 秒，
         # 判断"是硬封还是可人工过验证"需要点开几个入口，30 秒不够）。
         # 看完直接关浏览器窗口即可，脚本会随之退出。
-        print(f"\n浏览器保持打开 {HOLD_SECONDS // 60} 分钟供观察。")
+        print(f"\n浏览器保持打开 {args.hold / 60:.0f} 分钟供观察。")
         print("若显示安全验证，点掉它即可；脚本会自己发现并告诉你结果。")
         print("看完直接关窗口即可（也可 Ctrl+C 结束脚本）。")
         # ⚠️ 原先只在开头拍一次快照然后干等 10 分钟 —— 人过完验证后
@@ -104,7 +125,7 @@ async def main() -> None:
         # 账号刚被标记时重新 goto 是往已触发的风控上加压（同上方注释）。
         try:
             was = status
-            deadline = asyncio.get_event_loop().time() + HOLD_SECONDS
+            deadline = asyncio.get_event_loop().time() + args.hold
             while asyncio.get_event_loop().time() < deadline:
                 await page.wait_for_timeout(5000)
                 try:

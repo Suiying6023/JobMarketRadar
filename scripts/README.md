@@ -107,7 +107,7 @@
 | `config.hangzhou.yaml` | 600（默认值） | 5 / 90-150s | 13 | 最保守 |
 | `config.steady.yaml` | 900 | 6 / 60-100s | 27 | 日常 |
 | `config.cities3.yaml` | 900 | 6 / 60-100s | 27 × 3 城 | 多城扩量 |
-| `config.aggressive.yaml` | 2000 | 8 / 20-40s | 27 | **仅边界探测**，需授权 |
+| `config.aggressive.yaml` | 2000 | 8 / 20-40s | 13 | **仅边界探测**，需授权 |
 | `config.trial.yaml` / `smoke` | — | — | — | 试跑 / 冒烟 |
 
 `hangzhou` 档没写 `max_requests_per_day`，走 `models.py` 的默认值 600。

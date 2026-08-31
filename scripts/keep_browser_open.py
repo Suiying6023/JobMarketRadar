@@ -1,6 +1,10 @@
-"""打开 BOSS 搜索页并保持浏览器窗口打开（供用户手动操作梳理筛选标签）。"""
+"""打开 BOSS 搜索页并保持浏览器窗口打开（供用户手动操作梳理筛选标签）。
+
+**这个脚本的用途就是开一个可见窗口**，所以没有参数可调。
+"""
 from __future__ import annotations
 
+import argparse
 import asyncio
 from pathlib import Path
 
@@ -11,6 +15,9 @@ ORIGIN = "https://www.zhipin.com"
 
 
 async def main() -> None:
+    # 即使没有参数也要跑一次 argparse：否则 `--help` 会被当普通参数忽略，
+    # 脚本照样开窗口 —— 「测一下能不能跑」这个动作本身就弹出了窗口。踩过一次。
+    argparse.ArgumentParser(description=__doc__).parse_args()
     print("打开 BOSS 搜索页，保持窗口打开 ...")
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
