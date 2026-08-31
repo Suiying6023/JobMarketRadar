@@ -95,7 +95,14 @@ def verify_age_minutes() -> float | None:
 
 
 def recent_challenge_rate(con: sqlite3.Connection, n: int) -> tuple[int, int]:
-    """最近 n 次**取值**里 (ok, challenged) 各多少。链路能不能干活的唯一可靠判据。"""
+    """最近 n 次**取值**里 (ok, challenged) 各多少。链路能不能干活的可靠判据。
+
+    ⚠️ `gone`（岗位已下架）**不计入**：它是正常产出（会被标记关闭），
+    不是取值失败。混进来会把下架率高的批次误报成风控。
+
+    ⚠️ **健康时挑战率约 30%**，不是 15%：窗口 5 条一轮，每轮必有一次撞边界。
+    15% 那个数字来自单条反复取值的探针，不是跑批口径。
+    """
     row = con.execute(
         "SELECT COALESCE(SUM(outcome='ok'),0), COALESCE(SUM(outcome='challenged'),0) "
         "FROM (SELECT outcome FROM request_log WHERE kind='detail_page' "
@@ -159,10 +166,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "挂着不等于该一直等：无人处理的窗口零产出还占着出口")
     ap.add_argument("--challenge-window", type=int, default=40,
                     help="按最近 N 次取值算挑战率")
+    # 健康时挑战率约 30%（窗口 5 条一轮，每轮必有一次撞边界），
+    # 所以 warn 线要留在它上面，否则每轮巡检都会报一次"偏高"。
     ap.add_argument("--challenge-alarm", type=float, default=0.9,
                     help="挑战率超过它就报需人工（默认 %(default)s）")
-    ap.add_argument("--challenge-warn", type=float, default=0.5,
-                    help="挑战率超过它给出提醒（默认 %(default)s）")
+    ap.add_argument("--challenge-warn", type=float, default=0.6,
+                    help="挑战率超过它给出提醒（默认 %(default)s；健康态约 0.3）")
     ap.add_argument("--only-exit", default="", help="只查这个出口")
     ap.add_argument("--skip-exit", default="", help="跳过这些出口（逗号分隔）")
     ap.add_argument("--probe-job-url", default="",
