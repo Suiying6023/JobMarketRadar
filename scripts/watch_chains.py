@@ -257,11 +257,18 @@ def main() -> None:
     except ValueError as exc:
         print(f"    {exc}")
         pool = []
+    # 分开记账：只有 `verify` 是"点一次就能救"的，另两种弹窗都是白弹。
+    savable: list[str] = []
+    must_wait: list[str] = []
     for label, port in pool + [(DIRECT_LABEL, None)]:
         verdict, note = exit_verdict(port)
         print(f"    {label:<10} {verdict} — {note}")
-        if verdict in ("verify", "blocked"):
+        if verdict == "verify":
             blocked.append(label)
+            savable.append(label)
+        elif verdict in ("blocked", "login_only"):
+            blocked.append(label)
+            must_wait.append(label)
         elif verdict == "dead" and port:
             tunnel_down.append((label, port))
         elif verdict == "ok" and port:
@@ -269,17 +276,25 @@ def main() -> None:
                 print(f"    {'':<10} ⛔ 岗位页 302 → verify.html（geetest 人工层），"
                       f"状态接口尚未标记")
                 blocked.append(label)
+                savable.append(label)
             else:
                 healthy.append(label)
 
     if blocked and not healthy:
         risk = True
-        print(f"  ⛔ 所有跳板出口都需要人工验证（{', '.join(blocked)}）——刷新链路无出口可用。")
+        print(f"  ⛔ 所有跳板出口都不可用（{', '.join(blocked)}）——刷新链路无出口可跑。")
     elif blocked:
-        print(f"  ⚠️ {', '.join(blocked)} 需人工验证，但 {', '.join(healthy)} 仍可用 ——"
+        print(f"  ⚠️ {', '.join(blocked)} 不可用，但 {', '.join(healthy)} 仍可用 ——"
               f"链路能继续，不用半夜叫人。")
         print(f"     跑批时加 --only-exit {healthy[0]} 避开坏出口"
               f"（坏出口会连累好的：撞墙几次就轮换过去然后空转）。")
+    if savable:
+        print(f"     {', '.join(savable)} 可人工过验证救回（人在场时才值得弹窗）。")
+    if must_wait:
+        # ⚠️ 这两种状态弹窗都是白弹：硬封没有人工出路，
+        # login_only 的验证页会打开但**组件不加载**（平台只给登录这条路，
+        # 而本链路必须免登录）。别给出"弹窗让人点"的建议。
+        print(f"     {', '.join(must_wait)} **别弹窗**（硬封或只给登录），只能等解封。")
     if tunnel_down:
         print("  隧道不通（**不是风控**，重起即可，不需要人工过验证）:")
         for label, port in tunnel_down:

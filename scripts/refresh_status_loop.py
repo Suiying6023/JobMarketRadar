@@ -641,8 +641,14 @@ async def main() -> None:
                       f"-o ServerAliveInterval=30 bohrium-{tag}", flush=True)
                 continue
             if verdict == "blocked":
-                print(f"       硬封无人工出路（页面只给「登录后使用」，"
-                      f"而本链路必须免登录），跳过", flush=True)
+                print(f"       硬封，人工验证无效，只能等，跳过", flush=True)
+                continue
+            if verdict == "login_only":
+                # 带 jumpVerify 但平台只给「登录」这条路：验证页会打开、
+                # geetest 脚本也在，但**组件不加载**，弹窗给人点是白弹。
+                # 而本链路必须免登录，所以唯一出路是等。
+                print(f"       只给登录这条路，验证组件不会加载 ——"
+                      f"**别弹窗**，本链路必须免登录，只能等，跳过", flush=True)
                 continue
             if verdict == "verify" and not args.verify:
                 # 默认不弹窗的理由是**没人在场时弹窗等于白开**（窗口零产出还占着

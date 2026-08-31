@@ -78,7 +78,8 @@ def exit_verdict(port: int | None, timeout: int = 20) -> tuple[str, str]:
     | verdict | 含义 | 该怎么办 |
     |---|---|---|
     | `ok` | 无限制记录 | 可用 |
-    | `verify` | IP 被标记，响应带 `jumpVerify` | **人工点掉验证即当场解除** |
+    | `verify` | 带 `jumpVerify`，且 tip 没让你登录 | **人工点掉验证即当场解除** |
+    | `login_only` | 带 `jumpVerify`，但 tip 说「请登录后使用」 | **验证组件不会加载**，别弹窗给人点；免登录链路只能等 |
     | `blocked` | 硬封，无 `jumpVerify` | 人工验证无效，只能等 `expireTime` |
     | `dead` | 隧道不通 | 重起 ssh，**这不是风控** |
     | `unknown` | 响应非 JSON 或缺字段 | 别当 ok |
@@ -129,8 +130,20 @@ def exit_verdict(port: int | None, timeout: int = 20) -> tuple[str, str]:
     when = ""
     if isinstance(exp, (int, float)):
         when = f" 解封 {datetime.fromtimestamp(exp / 1000):%m-%d %H:%M}"
-    if zp.get("jumpVerify"):
+    tip = zp.get("tip") or ""
+
+    # ⚠️ **`jumpVerify` 为真也可能过不去** —— 还要看 `tip` 给的是哪条出路。
+    # 实测（2026-09-01，家宽）：`jumpVerify: true` 但 tip 是
+    # 「您的 IP 存在异常行为，**请登录后使用**」，验证页能打开、geetest 脚本也在，
+    # 但**验证组件不加载** —— 平台给这个 IP 的出路是登录，不是过验证。
+    # 只看 `jumpVerify` 会报成「可人工过」，让人对着一个不会出现的组件干等。
+    # 判据加一层：tip 里出现「登录」就说明验证这条路是空的。
+    if zp.get("jumpVerify") and "登录" not in tip:
         return "verify", f"IP {ip} 被标记，可人工过验证当场解除。{when}"
+    if zp.get("jumpVerify"):
+        return "login_only", (
+            f"IP {ip} 被标记且平台只给「登录」这条路（tip: {tip}）——"
+            f"验证页会打开但组件不加载，点也点不了。{when}")
     return "blocked", f"IP {ip} 硬封，人工验证无效，只能等。{when}"
 
 
