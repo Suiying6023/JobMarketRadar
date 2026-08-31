@@ -68,8 +68,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from check_job_status import parse_active_status, _is_closed  # noqa: E402
 from job_radar.exits import UA, exit_pool, exit_verdict  # noqa: E402
 from job_radar.refresh_fetch import (  # noqa: E402
-    DEFAULT_WINDOW_POSITION, EXTRACT_JS, FETCH_WINDOW, MIN_JOB_HTML_LEN,
-    REQ_PER_RECOVER, is_closed_status, launch_args, quota_factor, same_job,
+    DEFAULT_WINDOW_POSITION, EXTRACT_JS, FETCH_WINDOW, REQ_PER_RECOVER,
+    extract_args, is_closed_status, launch_args, quota_factor, same_job,
 )
 
 # 一条 fetch = 1 次请求。窗口耗尽后重算 stoken 约 3 次，窗口约 5 条 →
@@ -360,8 +360,7 @@ async def fetch_job(page, job_id: str, attempts: int = 3) -> dict:
     url = f"https://www.zhipin.com/job_detail/{job_id}.html"
     for attempt in range(1, attempts + 1):
         try:
-            return await page.evaluate(EXTRACT_JS,
-                                       {"url": url, "minLen": MIN_JOB_HTML_LEN})
+            return await page.evaluate(EXTRACT_JS, extract_args(url))
         except Exception as exc:
             if "Execution context was destroyed" not in str(exc) or attempt == attempts:
                 return {"ok": False, "reason": "evaluate_error", "error": str(exc)}
@@ -646,18 +645,9 @@ async def main() -> None:
                       f"而本链路必须免登录），跳过", flush=True)
                 continue
             if verdict == "verify" and not args.verify:
-                # ⚠️ 这里原先写着「被限制期间每访问一次，解封时间就重置成此刻+24h」
-                # —— **那条是错的**，2026-08-28 已实测推翻（见 boss-job-radar.md
-                # 「解封时间不是"每访问一次就 +24h"」）：
-                #   · 硬封 IP 开浏览器读一条 job_detail，前后 expireTime 逐毫秒不变
-                #   · verify 态 IP 人工点掉后，限制**当场解除**，不是推后
-                # expireTime 是初次限制时定的固定时刻，不会因访问续期。
-                # 08-27 看到的"推后 1.5 小时"更可能是那次访问触发了**新的**限制
-                # 判定覆盖旧记录，而不是每次访问都续期。
-                # 所以 verify 态**该起浏览器去救**，不必怕加时而干等。
-                # 默认仍不自动弹窗（要人在场才有意义），但理由是"没人点等于白开"，
-                # 不再是"会加时"。
-                print(f"       verify 态可人工过（点掉即当场解除，不会加时）。"
+                # 默认不弹窗的理由是**没人在场时弹窗等于白开**（窗口零产出还占着
+                # 出口），不是怕加时 —— 解封时刻是初次限制时定的，不因再访问推后。
+                print(f"       verify 态可人工过（点掉即当场解除）。"
                       f"要弹窗请加 --verify", flush=True)
                 continue
             if verdict == "ok":
@@ -842,13 +832,33 @@ async def main() -> None:
 
             rec = await fetch_job(page, r["source_job_id"])
             since_warm += 1
+            reason = rec.get("reason")
             log_requests(con, REQ_PER_JOB,
-                         outcome="ok" if rec.get("ok") else "challenged")
+                         outcome="ok" if rec.get("ok") else (reason or "challenged"))
+
+            # ⚠️ **岗位已下架必须在挑战页之前判**。两者都是短页面（下架约 11KB、
+            # 挑战页约 41KB），旧代码只按长度归成一类 `challenged`，于是对着
+            # 已下架的岗位反复重算 stoken —— 重算变不出内容，表现是「每条都撞
+            # 挑战页」+ 连撞 3 次换出口，**看起来完全像风控**。
+            # 队列按 updated_at 升序取，队头正好积压着一批下架岗位，
+            # 所以这个误判会成批出现。下架的正确动作是标记关闭。
+            gone = reason == "gone"
+            if gone:
+                con.execute(
+                    "UPDATE jobs SET job_invalid=1, job_status_desc='职位已关闭', "
+                    "retention_status='sample', updated_at=CURRENT_TIMESTAMP "
+                    "WHERE canonical_id=? AND retention_status='active'",
+                    (r["canonical_id"],))
+                con.commit()
+                closed += 1
+                print(f"[关闭] {r['title'][:24]} | {r['company_name']}"
+                      f"（页面已不存在）", flush=True)
+                streak = 0
 
             # 撞挑战页 = stoken 窗口用尽（实测每约 5.5 条一次，与采集链路的
             # code=37 同构）。重暖一次再重试这一条，而不是记未判定放过去 ——
             # 放过去等于这条白花一次请求且下轮还要再花。
-            if not rec.get("ok") and rec.get("reason") == "challenged":
+            if not rec.get("ok") and reason == "challenged":
                 print(f"  [窗口] 第 {since_warm} 条后撞挑战页，重算 stoken", flush=True)
                 # 撞墙说明该出口的窗口在缩，但**收阈值的收益有下限**（见上方推导：
                 # 低于 5 就比等撞墙更贵）。所以只收到 MIN_WINDOW 就不再收，
@@ -909,7 +919,11 @@ async def main() -> None:
             text = rec.get("active_time") or "" if rec.get("ok") else ""
             done += 1
 
-            if result is None:
+            # 下架的那条已在上面标记关闭并计数，**跳过判定段** ——
+            # 否则它会被记成「未判定」并累加 streak，连续几条下架就触发假诊断。
+            if gone:
+                pass
+            elif result is None:
                 unknown += 1
                 streak += 1
                 print(f"[未判定] {r['title'][:24]} | {r['company_name']}", flush=True)

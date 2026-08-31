@@ -79,9 +79,58 @@ def test_no_title_only_pass_criterion():
 def test_renav_attempts_are_bounded_small():
     """重新导航的次数要小。
 
-    每次重开都是一次真实请求；原来是 6 次，在被限制期间等于连撞 6 下
-    （而被限制期间每访问一次还会把解封时间重置为此刻+24h）。
+    每次重开都是一次真实请求，而人眼里每次重开就是"验证组件又出现一遍"。
+    原来是 6 次；受限出口上连撞 6 下也换不回权限，只是让人多点 6 次。
     """
     src = (ROOT / "scripts" / "refresh_status_loop.py").read_text(encoding="utf-8")
     assert "renav < 2" in src, "重新导航次数应收紧到 2 次以内"
     assert "renav < 6" not in src, "6 次重开会在受限期间反复撞墙"
+
+
+def test_cookie_hit_breaks_before_any_further_navigation():
+    """拿到风控 cookie 之后**不许再导航** —— 这才是"反复加载"的直接机制。
+
+    判据落在控制流上：在等待循环里，检查 `__zp_stoken__` 的那个分支必须先
+    `break`（或置通过标志后 break），且 `page.goto` 只出现在"没拿到 cookie"
+    的分支里。只要顺序反了，人点成功之后还会被再拉一次验证页。
+    """
+    for rel in TARGETS:
+        lines = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+        hit = next((i for i, ln in enumerate(lines)
+                    if '"__zp_stoken__" in names' in ln), None)
+        assert hit is not None, f"{rel} 找不到风控 cookie 判据"
+        # 命中分支之后 6 行内必须 break，且这段里不能有导航。
+        window = lines[hit: hit + 7]
+        body = "\n".join(window)
+        assert "break" in body, f"{rel}:{hit+1} 命中 cookie 后没有立刻 break"
+        assert "page.goto" not in body, (
+            f"{rel}:{hit+1} 命中 cookie 后仍在导航 —— "
+            "那会让已经点成功的人再看一遍验证组件")
+
+
+def test_no_refuted_expiry_penalty_claim_left():
+    """代码里不许再出现"访问会把解封时间往后推"这个已被推翻的说法。
+
+    它曾让我劝用户别再点验证窗口，而实测结论恰恰相反：解封时刻是初次限制时定的
+    固定时刻，不因再访问而推后，所以 verify 态该救就救。
+    这条说法在代码里清过三处、记忆里还漏过一处 —— 加测试是因为
+    "同一条被推翻的结论散落在多处"本身会自我复活。
+
+    ⚠️ 顺带一条：**清理这类残留时，"原先写着 X，那是错的" 也是残留**。
+    补丁式注释会叠层（下一次修订又会追加一行说明这一行），
+    唯一对症的做法是拿新前提重写那一段。
+    """
+    # 拼出来而不写成字面量，否则这条测试会扫到自己。
+    needles = ("+" "24h", "此刻" "+24", "重置成「此刻")
+    offenders: list[str] = []
+    for sub in ("scripts", "src"):
+        for path in (ROOT / sub).rglob("*.py"):
+            if "_archive" in path.parts:
+                continue
+            for i, ln in enumerate(
+                    path.read_text(encoding="utf-8").splitlines(), 1):
+                if any(n in ln for n in needles):
+                    offenders.append(f"{path.relative_to(ROOT)}:{i}: {ln.strip()[:60]}")
+    assert not offenders, (
+        "解封时刻不会因再访问而推后（实测），这些地方还留着旧说法：\n  "
+        + "\n  ".join(offenders))

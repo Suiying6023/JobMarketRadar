@@ -114,3 +114,41 @@ def test_amortized_cost_reflects_measured_window_and_recovery():
     """
     assert 1.0 < REQ_PER_JOB_AMORTIZED < 2.0
     assert FETCH_WINDOW <= 6, "窗口实测 [6,5,6,5]，取值不能超过下界"
+
+
+# ---- 短页面必须分类，不能一律记 challenged ----
+
+def test_short_pages_are_classified_not_lumped_as_challenged():
+    """岗位下架、JS 挑战页、其它短页要给出不同的 reason。
+
+    三者都 < MIN_JOB_HTML_LEN（下架约 11KB、挑战页约 41KB），而处置完全不同：
+    下架该**标记关闭**，挑战页该**重算 stoken**。混成一类的后果实测过 ——
+    对着已下架的岗位反复重算（重算变不出内容），表现是「每条都撞挑战页」
+    加连撞 3 次换出口，**看起来完全像风控**。而队列按 updated_at 升序取，
+    队头正好积压下架岗位，所以这个误判是成批出现的。
+    """
+    src = (ROOT / "src" / "job_radar" / "refresh_fetch.py").read_text(encoding="utf-8")
+    assert "'gone'" in src or '"gone"' in src, "下架要有独立的 reason"
+    assert "GONE_MARKERS" in src and "CHALLENGE_MARKERS" in src
+    # 顺序要求：下架先判。反了的话 404 页若含挑战字样会被误判成挑战。
+    assert src.index("reason: 'gone'") < src.index("reason: 'challenged'"), \
+        "下架必须在挑战页之前判"
+
+
+def test_gone_rows_are_marked_closed_not_retried():
+    """刷新链路收到 gone 要标记关闭，而不是进重算路径或记未判定。"""
+    src = (ROOT / "scripts" / "refresh_status_loop.py").read_text(encoding="utf-8")
+    assert 'reason == "gone"' in src, "主循环要单独处理 gone"
+    i = src.index('reason == "gone"')
+    window = src[i: i + 700]
+    assert "job_invalid=1" in window, "gone 应当标记岗位关闭"
+    assert "closed += 1" in window, "gone 应当计入关闭数"
+
+
+def test_extract_args_supplies_all_judgment_params():
+    """调用方用 extract_args() 而不是手拼字典 —— 加判据参数时不必改每个调用点。"""
+    from job_radar.refresh_fetch import extract_args
+    a = extract_args("https://example.com/x.html")
+    for k in ("url", "minLen", "goneMarks", "challengeMarks"):
+        assert k in a, f"extract_args 缺 {k}"
+    assert a["goneMarks"] and a["challengeMarks"]

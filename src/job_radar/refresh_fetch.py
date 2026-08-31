@@ -87,15 +87,30 @@ def launch_args(window_position: str = DEFAULT_WINDOW_POSITION) -> list[str]:
         args.append(f"--window-position={window_position}")
     return args
 
-# 挑战页约 41KB，正常岗位页 ≥ 60KB（实测 138-147KB）。用长度做**第一道**判据，
-# 因为挑战页解析出来的 DOM 里什么容器都没有，再往下抠只会得到一串 None。
+# 正常岗位页 ≥ 60KB（实测 138-147KB）。用长度做**第一道**判据，
+# 因为短页面解析出来的 DOM 里什么容器都没有，再往下抠只会得到一串 None。
 MIN_JOB_HTML_LEN = 60_000
+
+# ⚠️ **短页面不止一种，必须分开** —— 混成一个 `challenged` 会让脚本对着
+# 已下架的岗位反复重算 stoken（重算一万次也变不出内容），
+# 表现是「每条都撞挑战页」+ 连撞 3 次换出口，看起来完全像风控。
+# 2026-08-31 实测：队头一批按 `updated_at ASC` 取到的旧岗位已下架，
+# fetch 回 11000 字节的「您访问的页面不存在」，而挑战页是 41KB ——
+# 两者都 < 60KB，旧判据把它们归成了一类。
+#
+# | 短页面 | 长度 | 标志 | 正确动作 |
+# |---|---:|---|---|
+# | 岗位已下架 | 约 11KB | 标题/正文含「页面不存在」 | **标记关闭**，别重算 |
+# | JS 挑战页 | 约 41KB | 含 `security-check` / `请稍候` | 重算 stoken |
+# | 其它短页 | — | — | 记未判定，交给上层诊断 |
+GONE_MARKERS = ("您访问的页面不存在", "页面不存在", "404 Not Found")
+CHALLENGE_MARKERS = ("security-check", "请稍候", "security.html")
 
 # 页面内取值脚本。三件事一次做完：
 #   ① fetch HTML（credentials:'include' —— stoken 在 cookie 里）
 #   ② 用 DOMParser 解析成真 DOM，按容器精确取值
 #   ③ 回 h1 做身份校验：确认拿到的是请求的那条岗位，不是被导到了别处
-EXTRACT_JS = """async ({url, minLen}) => {
+EXTRACT_JS = """async ({url, minLen, goneMarks, challengeMarks}) => {
     let html, status;
     try {
         const r = await fetch(url, {credentials: 'include'});
@@ -105,7 +120,17 @@ EXTRACT_JS = """async ({url, minLen}) => {
         return {ok: false, reason: 'fetch_error', error: String(e)};
     }
     if (!html || html.length < minLen) {
-        return {ok: false, reason: 'challenged', status, len: (html || '').length};
+        const len = (html || '').length;
+        const body = html || '';
+        // 岗位下架先判：它和挑战页都是短页面，但处置完全相反
+        // （下架该标记关闭，重算 stoken 毫无用处）。
+        if (status === 404 || goneMarks.some(m => body.includes(m))) {
+            return {ok: false, reason: 'gone', status, len};
+        }
+        if (challengeMarks.some(m => body.includes(m))) {
+            return {ok: false, reason: 'challenged', status, len};
+        }
+        return {ok: false, reason: 'short', status, len};
     }
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const txt = (sel) => {
@@ -121,6 +146,16 @@ EXTRACT_JS = """async ({url, minLen}) => {
         jd_len: (txt('.job-sec-text') || '').length,
     };
 }"""
+
+
+def extract_args(url: str) -> dict:
+    """`page.evaluate(EXTRACT_JS, extract_args(url))` 的参数包。
+
+    用它而不是在各调用处手拼字典 —— 加一个判据参数时不必改每个调用点。
+    """
+    return {"url": url, "minLen": MIN_JOB_HTML_LEN,
+            "goneMarks": list(GONE_MARKERS),
+            "challengeMarks": list(CHALLENGE_MARKERS)}
 
 # `.job-status` 的已知取值（2026-08-30 实测）：
 #   在招   —— 「招聘中」「最新」
