@@ -94,9 +94,39 @@ async def main() -> None:
         # 判断"是硬封还是可人工过验证"需要点开几个入口，30 秒不够）。
         # 看完直接关浏览器窗口即可，脚本会随之退出。
         print(f"\n浏览器保持打开 {HOLD_SECONDS // 60} 分钟供观察。")
+        print("若显示安全验证，点掉它即可；脚本会自己发现并告诉你结果。")
         print("看完直接关窗口即可（也可 Ctrl+C 结束脚本）。")
+        # ⚠️ 原先只在开头拍一次快照然后干等 10 分钟 —— 人过完验证后
+        # **得不到任何确认**，只能靠自己猜成不成。这轮用户就问了
+        # 「我验证成功后一直重复加载验证组件是什么情况」，
+        # 其中一半的困惑正是"没人告诉我过没过"。
+        # 这里改成轮询：状态一变就播报。**只读不导航** ——
+        # 账号刚被标记时重新 goto 是往已触发的风控上加压（同上方注释）。
         try:
-            await page.wait_for_timeout(HOLD_SECONDS * 1000)
+            was = status
+            deadline = asyncio.get_event_loop().time() + HOLD_SECONDS
+            while asyncio.get_event_loop().time() < deadline:
+                await page.wait_for_timeout(5000)
+                try:
+                    t = await page.title()
+                    u = page.url or ""
+                except Exception:
+                    break          # 窗口被关掉
+                if "verify.html" in u or "安全验证" in t:
+                    now = "🟡 验证页"
+                elif "/web/user" in u or "注册登录" in t:
+                    now = "🔴 登录/认证页"
+                elif "招聘" in t or "找工作" in t:
+                    now = "🟢 正常"
+                else:
+                    continue       # 中间态（"请稍候"/加载中），不播报
+                if now != was:
+                    print(f"  状态变化：{was} → {now}   标题 {t[:40]!r}")
+                    was = now
+                    if now == "🟢 正常":
+                        print("  ✅ 验证已通过，账号页面恢复正常。"
+                              "可以关窗口了，我会重新体检后恢复流水线。")
+                        break
         except Exception:
             # 人工关掉窗口会让 page/context 失效并抛错 —— 那是正常的结束方式，
             # 不该打成一条看起来像故障的 traceback。
