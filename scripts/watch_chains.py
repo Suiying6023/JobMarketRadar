@@ -127,6 +127,25 @@ def verify_age_minutes() -> float | None:
         return None
 
 
+def recent_challenge_rate(con: sqlite3.Connection, n: int = 40) -> tuple[int, int]:
+    """最近 n 次**取值**里 (ok, challenged) 各多少。
+
+    ⚠️ 这是判断"刷新链路还能不能干活"的**唯一可靠判据**，比任何探测都准，
+    因为它就是链路自己的战果记录。
+    2026-08-31 实测踩到：`forbidden-info` 回 code:0、冷 curl 也只看到
+    `security.html`（可自解那层），巡检因此报 ✅——而同期账本里最近 40 次
+    取值是 0 ok / 40 challenged，链路实际一条都判不出来。
+    冷 curl 不带 stoken，**探不出"有会话之后会被弹到 verify.html"**，
+    所以它天然无法回答这个问题；账本能。
+    """
+    row = con.execute(
+        "SELECT COALESCE(SUM(outcome='ok'),0), COALESCE(SUM(outcome='challenged'),0) "
+        "FROM (SELECT outcome FROM request_log WHERE kind='detail_page' "
+        "      AND outcome IN ('ok','challenged') ORDER BY id DESC LIMIT ?)", (n,)
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
 def verify_gate(port: int, timeout: int = 25) -> bool:
     """岗位页是否**不需要**人工验证。True=可用，False=撞上 verify.html。
 
@@ -246,6 +265,25 @@ def main() -> None:
                   f"bohrium-{'vm' if label == 'vm' else 'container'}")
 
     con = sqlite3.connect(DB, timeout=30.0)
+    # ⚠️ 战果判据：出口"看起来干净"不代表链路能干活。
+    # 最近一批取值全是 challenged 就是**在等人过验证**，哪怕
+    # forbidden-info 回 code:0、冷 curl 只看到 security.html。
+    ok_n, ch_n = recent_challenge_rate(con)
+    if ok_n + ch_n >= 10:
+        rate = ch_n / (ok_n + ch_n)
+        if rate >= 0.9:
+            risk = True
+            print(f"  ⛔ 刷新链路最近 {ok_n+ch_n} 次取值 {ch_n} 次撞挑战页"
+                  f"（{rate*100:.0f}%，ok 仅 {ok_n}）——链路实际判不出东西。")
+            print("     出口状态接口可能仍回 code:0（它有滞后），别据此当正常。")
+            print("     需要人工过验证（在**岗位详情页**上点，不要登录）：")
+            print("     uv run python scripts/manual_verify_proxy.py "
+                  "--socks 127.0.0.1:1080 --tag vm")
+            print("     uv run python scripts/manual_verify_proxy.py "
+                  "--socks 127.0.0.1:1082 --tag container")
+        elif rate >= 0.5:
+            print(f"  ⚠️ 刷新链路挑战率偏高：最近 {ok_n+ch_n} 次里 {ch_n} 次"
+                  f"（{rate*100:.0f}%），留意是否在滑向验证态")
     day = datetime.now().strftime("%Y-%m-%d")
     r = con.execute("SELECT count(*) FROM request_log WHERE day=? "
                     "AND kind='detail_page'", (day,)).fetchone()[0]
