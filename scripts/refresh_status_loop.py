@@ -478,6 +478,13 @@ async def main() -> None:
     # 默认 stop 保持历史行为，不让既有调用方被动改变语义。
     ap.add_argument("--over-quota", choices=("stop", "slow"), default="stop",
                     help="越过 --daily-cap 后：stop=停机（默认），slow=降速跑完")
+    # 出口是**策略**：哪个能用取决于当下平台对它的态度，不该写死。
+    # 实测（2026-08-31）两个出口状态可以完全不同 —— vm 正常直达岗位页，
+    # 而 container 在自解后被要求二次验证。混用会让好出口被坏出口连累
+    # （撞墙 3 次就轮换过去，然后一路空转）。
+    ap.add_argument("--only-exit", default="",
+                    help="只用指定出口（vm / container），留空=全部。"
+                         "一个出口坏掉时用它单跑好的那个")
     ap.add_argument("--slow-ladder", default="1.0:2,1.25:3,1.5:4,2.0:6",
                     help="降速档位 用量倍数:延迟乘数，逗号分隔（配合 --over-quota slow）")
     ap.add_argument("--rotate-every", type=int, default=15, help="每 N 条换出口")
@@ -642,7 +649,15 @@ async def main() -> None:
         # 首页 200 而详情页全是「安全验证」是实测存在的状态（见文件头注释），
         # 用首页判会把被标记的出口当成可用，然后一路空转 10 条才发现。
         usable: list[tuple[str, int]] = []
-        for tag, port in EXITS:
+        candidates = EXITS
+        if args.only_exit:
+            candidates = [(t, p) for t, p in EXITS if t == args.only_exit]
+            if not candidates:
+                print(f"[出口] --only-exit {args.only_exit!r} 不认识，"
+                      f"可选 {[t for t, _ in EXITS]}")
+                return
+            print(f"[出口] 只用 {args.only_exit}（--only-exit）", flush=True)
+        for tag, port in candidates:
             # 先用 forbidden-info 接口问一句（2 秒），能明确排除的就不必起浏览器
             # 读一条详情页（90 秒）。硬封的出口连弹窗都不该弹。
             verdict, note = exit_status(port)

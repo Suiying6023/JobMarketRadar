@@ -275,6 +275,18 @@ def main() -> None:
             risk = True
             print(f"  ⛔ 刷新链路最近 {ok_n+ch_n} 次取值 {ch_n} 次撞挑战页"
                   f"（{rate*100:.0f}%，ok 仅 {ok_n}）——链路实际判不出东西。")
+            # ⚠️ **先查隧道，别先怀疑风控**（2026-08-31 实测的根因）：
+            # vm 的 SSH 转发死了（端口仍 LISTENING 但流量不通，curl 20s 超时），
+            # 表现就是 100% 撞挑战页 —— 而 forbidden-info 走同一条死隧道
+            # 拿不到响应、又被旧代码当成 code:0，于是看着像"被限制"。
+            # 我因此弹了两轮无效验证窗口、白等了 8 小时。
+            # 重起隧道后同一条 fetch 路径立刻 4/4 ok。
+            print("     ⚠️ 先排除隧道：端口 LISTENING ≠ 流量通。逐个试")
+            print("        curl -sS --socks5-hostname 127.0.0.1:1080 "
+                  "--max-time 20 -o /dev/null -w '%{http_code}\\n' "
+                  "https://www.zhipin.com/")
+            print("        超时就重起（先杀掉旧 ssh.exe，否则端口占用起不来）：")
+            print("        ssh -f -N -D 1080 -o ServerAliveInterval=30 bohrium-vm")
             print("     出口状态接口可能仍回 code:0（它有滞后），别据此当正常。")
             # ⚠️ **别无条件建议弹窗**：2026-08-31 实测有一种状态是弹了也过不去 ——
             # 免登录访问岗位页被直接推到**登录页**（窗口无人操作也会自己漂过去），
