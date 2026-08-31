@@ -67,8 +67,32 @@ async def main() -> None:
         print(f"出口 socks5://{args.socks}  标识={args.tag}")
         print(f"打开样本岗位：{title} @ {company}")
         print(f"  {url}")
+
+        # ⚠️ **先暖会话再开岗位页**，否则弹出来的是**登录页**而不是验证页。
+        # 实测（2026-08-31，连续三轮都踩到）：隐身 context 是空 cookie，
+        # 免登录直接开 job_detail，平台判定"无会话的匿名请求"→ 推去
+        # `/web/user/`（注册登录页）。那个页面上**没有可点的验证**，
+        # 用户点什么都回到登录页 —— 我因此让用户白点了两轮，还错怪他点错了。
+        # 先访问首页拿到 `__zp_stoken__`（会话级签名 cookie），
+        # 平台才会把后续请求当"有会话的访客"，该验证时给 verify.html。
+        await page.goto("https://www.zhipin.com/", wait_until="domcontentloaded",
+                        timeout=60000)
+        for _ in range(20):
+            if "__zp_stoken__" in {c["name"] for c in await ctx.cookies()}:
+                break
+            await asyncio.sleep(1.0)
+        has_stoken = "__zp_stoken__" in {c["name"] for c in await ctx.cookies()}
+        print(f"会话预热：__zp_stoken__ {'已就位' if has_stoken else '**没拿到**'}")
+
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        print(f"当前标题：{await page.title()!r}")
+        cur_title = await page.title()
+        print(f"当前标题：{cur_title!r}")
+        # 直说这个窗口能不能点，别让用户对着登录页干等。
+        if "注册登录" in cur_title:
+            print()
+            print("⚠️ 这个窗口停在**登录页**，不是验证页 —— 点不了。")
+            print("   说明该出口当前不给匿名访客验证机会，只能等平台的解封时间；")
+            print("   或先用另一个出口跑批（--only-exit <好的那个>）。")
         print()
         print("=" * 66)
         print("请在弹出的浏览器里完成验证（若显示「安全验证」就点按钮/拖滑块）。")
@@ -95,9 +119,19 @@ async def main() -> None:
             except Exception:
                 await asyncio.sleep(2.0)
                 continue
-            if "验证" not in t and "请稍候" not in t and t.strip() and len(body) > 500:
+            # ⚠️ **判据取「风控 cookie 到手」，不取「页面内容够丰富」**
+            # （2026-08-31 用户反馈「我验证成功后一直重复加载验证组件」后修）。
+            # 原判据要求标题不含验证字样 + innerText > 500 字，等于要求
+            # **匿名访客能看到完整岗位页** —— 而这条链路免登录，平台常在
+            # 验证通过后仍把匿名请求送去登录页/再验证一次。于是人明明点成功了，
+            # 脚本却判「还没过」，继续等 → 用户看到验证组件反复出现。
+            # 人的劳动在拿到 __zp_stoken__ 那一刻就完成了，不该被之后
+            # 「能不能看岗位页」这件独立的事否定。
+            names = {c["name"] for c in (await ctx.cookies())}
+            if "__zp_stoken__" in names:
                 passed = True
-                print(f"✅ 验证已通过：标题 {t!r}，innerText {len(body)} 字")
+                print(f"✅ 验证已通过：拿到风控 cookie __zp_stoken__"
+                      f"（当前页 {t!r}，innerText {len(body)} 字）")
                 break
             now = asyncio.get_event_loop().time()
             if now - last_report > 15:

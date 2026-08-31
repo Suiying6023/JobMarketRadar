@@ -309,25 +309,38 @@ async def wait_manual_verify(port: int, tag: str, job_id: str,
                 await asyncio.sleep(2.0)
                 continue
 
-            # 岗位页 = 验证已过且落到了目标页
-            if "招聘" in t and "注册登录" not in t:
+            # ⚠️ **判据取「风控 cookie 到手」，不取「能看到岗位页」**（2026-08-31 修）。
+            # 原先要求标题含「招聘」才算过，那把两件事混成了一件：
+            #   ① 人过掉了验证（拿到 __zp_stoken__ / 风控 cookie）
+            #   ② 匿名访客能看岗位页
+            # 这条链路是免登录的，②**本来就可能再次要求验证**。于是循环变成：
+            # 人点完 → 脚本立刻 goto 岗位页 → 平台又要验证 → 判定"还没过" →
+            # 再 goto → 用户眼里就是「验证组件反复加载」，最多 6 次。
+            # 用户实测反馈：「我验证成功后一直重复加载验证组件」——就是这个。
+            # 人的劳动在第一次就已经完成了，不该被后续导航结果否定。
+            names = {c["name"] for c in (await ctx.cookies())}
+            if "__zp_stoken__" in names:
                 ok = True
-                print(f"  ✅ 已通过：{t!r}")
+                print(f"  ✅ 已通过：拿到风控 cookie（当前页 {t!r}）")
                 break
 
-            # ⚠️ 验证通过后 BOSS 常把你留在登录页（或首页），它**不会自己跳回岗位页**。
-            # 这不是「出口受限」（我一度这样误判）——风控 cookie 已经拿到了，
-            # 只是需要主动再导航一次。所以这里重新 goto，而不是继续傻等。
+            # 没拿到 cookie 时才重新导航，且**次数收紧到 2**：
+            # 每次 goto 都是一次真实请求，多撞只会加重限制。
             if "注册登录" in t or "安全验证" not in t:
-                if renav < 6:
+                if renav < 2:
                     renav += 1
-                    print(f"  验证已过，重新打开岗位页（第 {renav} 次）", flush=True)
+                    print(f"  还没拿到风控 cookie，重开岗位页（第 {renav}/2 次）",
+                          flush=True)
                     try:
                         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     except Exception:
                         pass
                     await asyncio.sleep(3.0)
                     continue
+                # 两次都没拿到就别再撞了 —— 让人知道这个窗口点了也没用。
+                print("  ⚠️ 重开两次仍未拿到风控 cookie，这个出口当前过不去。"
+                      "别再点了，等平台解封或换出口。", flush=True)
+                break
 
             if loop.time() - last > 20:
                 print(f"  等待中… {t!r}  剩余 {int(deadline - loop.time())}s", flush=True)
