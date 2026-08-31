@@ -27,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from patchright.async_api import async_playwright  # noqa: E402
 
+from job_radar.refresh_fetch import (  # noqa: E402
+    DEFAULT_WINDOW_POSITION, launch_args,
+)
 from job_radar.storage import JobStore  # noqa: E402
 
 LABELS = [
@@ -77,6 +80,9 @@ async def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="只富化前 N 家（试跑用）")
     parser.add_argument("--brands", default="", help="只富化指定 brand_id（逗号分隔）")
     parser.add_argument("--force", action="store_true", help="已富化过的也重抓")
+    parser.add_argument("--window-position", default=DEFAULT_WINDOW_POSITION,
+                        help="浏览器窗口落点 x,y（默认 %(default)s，主屏之外不抢焦点）。"
+                             "传空字符串则开在屏幕中央。⚠️ 坐标必须为正。")
     args = parser.parse_args()
 
     db_path = Path("data/hangzhou_agent.sqlite3")
@@ -106,7 +112,7 @@ async def main() -> None:
         channel="chrome",
         headless=False,
         no_viewport=True,
-        args=["--disable-blink-features=AutomationControlled", "--window-position=-32000,-32000"],
+        args=launch_args(args.window_position),
         ignore_default_args=["--enable-automation"],
     )
     page = await ctx.new_page()

@@ -5,6 +5,7 @@ from pathlib import Path
 from patchright.async_api import Browser, BrowserContext, Playwright, async_playwright
 
 from ..models import BrowserConfig, BrowserMode
+from ..refresh_fetch import launch_args
 
 
 class BrowserSession:
@@ -49,17 +50,8 @@ class BrowserSession:
             headless=self.config.headless,
             slow_mo=self.config.slow_mo_ms,
             no_viewport=True,
-            # ⚠️ 这里原有 `--window-position=-32000,-32000`（为了不抢焦点），
-            # 已移除：2026-08-31 在刷新链路实测它会**让挑战过不去** ——
-            # 挑战 JS 读窗口坐标当环境指纹，负的大数被判异常环境，平台直接把
-            # 请求推到登录页（`/web/user/?seed=...`）而不给可自解的挑战。
-            # 对照实验（同出口、同批岗位、同一段 fetch）：在屏 4/4 ok，离屏 0/4。
-            # 采集链路同样依赖 security-check 自解，所以同一个坑对它成立；
-            # 它没暴露出来只是因为带账号 cookie 时平台更宽容——不代表没有代价
-            # （code=37 重算频率可能一直被这个参数抬高）。
-            # 判据：反爬链路里改变窗口可见性/几何的参数属于**指纹面**，
-            # 不是无害的美化项。抢焦点的问题另找办法（比如虚拟桌面）。
-            args=["--disable-blink-features=AutomationControlled"],
+            # 窗口落点见 `BrowserConfig.window_position`（坐标必须为正，那是指纹面）。
+            args=launch_args(self.config.window_position),
             ignore_default_args=["--enable-automation"],
         )
         self.context.set_default_timeout(self.config.navigation_timeout_ms)

@@ -72,13 +72,25 @@ class AutoChatPolicy(BaseModel):
 
 
 class BrowserConfig(BaseModel):
-    mode: BrowserMode = BrowserMode.CDP
+    # ⚠️ 用 PERSISTENT，别用 CDP：BOSS 前端会扫调试端口并触发刷新循环。
+    # CDP 保留只为兼容旧配置。
+    mode: BrowserMode = BrowserMode.PERSISTENT
     cdp_url: str = "http://127.0.0.1:9222"
     user_data_dir: str = ".browser-profile"
     channel: str = "chrome"
     headless: bool = False
     navigation_timeout_ms: int = 30_000
     slow_mo_ms: int = 0
+    # 窗口落点 `x,y`。默认放在主屏之外，跑批时不抢焦点（否则每次新建 context
+    # 都会把全屏应用踢出来）。空字符串 = 不传参，由 Chrome 自己决定。
+    #
+    # ⚠️ **坐标必须为正**。挑战 JS 把窗口几何当环境指纹：负的大数被判为异常环境，
+    # 请求会被推去登录页而不给可自解的挑战（实测 `-32000,-32000` 0/4，
+    # 正坐标 `2400,1400` 挑战率 7%/n=14，优于在屏基线 14-16%）。
+    # 同理不要用最小化（Windows 会把坐标写成 -21333）或零尺寸。
+    # 屏幕分辨率更高、这个位置仍可见时，调大数值即可，保持为正。
+    window_position: str = Field(default="2400,1400",
+                                 pattern=r"^$|^\d+,\d+$")
 
 
 class CollectionConfig(BaseModel):

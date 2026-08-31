@@ -28,6 +28,8 @@ banner、popupguides、agreement/tip、resume/parser、smsSwitch…），读 JD 
 """
 from __future__ import annotations
 
+from .normalization import CLOSED_MARKERS
+
 # 一条 fetch 的请求数，以及窗口耗尽后重算 stoken 的开销。
 # 用于账本折算——**别再用一个写死的 14**，那个数是从 verify 页数出来的。
 def quota_factor(used: int, cap: int,
@@ -58,6 +60,32 @@ REQ_PER_RECOVER = 3
 FETCH_WINDOW = 5          # 保守取 5（实测 [6,5,6,5]，取下界免得反复撞挑战页）
 # 摊薄后的单条成本，给日线换算用。
 REQ_PER_JOB_AMORTIZED = REQ_PER_FETCH + REQ_PER_RECOVER / FETCH_WINDOW  # 1.6
+
+# 窗口默认落点 `x,y`：主屏之外，跑批时不抢焦点。
+DEFAULT_WINDOW_POSITION = "2400,1400"
+
+
+def launch_args(window_position: str = DEFAULT_WINDOW_POSITION) -> list[str]:
+    """浏览器启动参数。刷新链路各脚本共用，别在调用处另拼一份。
+
+    `--disable-blink-features=AutomationControlled` 是反检测必需项，
+    同时也是 `cleanup_browsers.py` 认「这个浏览器是我们起的」的特征之一。
+
+    ⚠️ **`window_position` 的坐标必须为正**。挑战 JS 把窗口几何当环境指纹：
+    负的大数被判为异常环境，请求会被推去登录页（`/web/user/?seed=...`）而
+    **不给可自解的挑战、也不给可点的验证页**——那种窗口人是点不动的。
+    实测 `-32000,-32000` 得 0/4，正坐标 `2400,1400` 挑战率 7%（n=14），
+    优于在屏基线 14-16%。最小化同样不行（Windows 把坐标写成 -21333）。
+    传空字符串 = 不指定位置，窗口开在屏幕中央会抢焦点。
+    """
+    args = ["--disable-blink-features=AutomationControlled"]
+    if window_position:
+        if window_position.startswith("-") or ",-" in window_position:
+            raise ValueError(
+                f"窗口坐标必须为正，收到 {window_position!r}。"
+                "负坐标会让挑战 JS 判为异常环境，请求被推去登录页（实测 0/4）。")
+        args.append(f"--window-position={window_position}")
+    return args
 
 # 挑战页约 41KB，正常岗位页 ≥ 60KB（实测 138-147KB）。用长度做**第一道**判据，
 # 因为挑战页解析出来的 DOM 里什么容器都没有，再往下抠只会得到一串 None。
@@ -100,8 +128,9 @@ EXTRACT_JS = """async ({url, minLen}) => {
 # 只把**明确的关闭文案**当关闭，其余一律按在招处理。
 # 方向刻意如此：误判关闭会**单向降级**一个在招岗位（不可逆），
 # 而误判在招只是下一轮再刷一次（可逆且便宜）。
-CLOSED_VALUES = ("职位已关闭", "该职位已关闭", "已下线", "职位已下线",
-                 "职位已结束", "暂停招聘", "招聘已结束")
+# 关闭文案的真源在 `normalization`，这里只引用 —— 两份各自维护必然漂移，
+# 而漂移的代价是误降一个在招岗位（不可逆）。
+CLOSED_VALUES = CLOSED_MARKERS
 OPEN_VALUES = ("招聘中", "最新")
 
 

@@ -35,12 +35,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from job_radar.refresh_fetch import DEFAULT_WINDOW_POSITION  # noqa: E402
+from job_radar.storage import JobStore  # noqa: E402
+
 DB = ROOT / "data" / "hangzhou_agent.sqlite3"
 STOP_FLAG = ROOT / "logs" / "SUPERVISOR-STOPPED.txt"
 
-# 采集链路的日线口径。与 storage.JobStore.COLLECT_KINDS 一致：
-# 免登录刷新链路的 `detail_page` **不算在内**（不同 IP、不同登录态、独立风控主体）。
-COLLECT_KINDS = ("list", "detail", "security_check", "recommend")
+# 采集链路的日线口径。**从 storage 取，别在这里另写一份**：
+# 免登录刷新链路的 `detail_page` 不算在内（不同 IP、不同登录态、独立风控主体）。
+COLLECT_KINDS = tuple(JobStore.COLLECT_KINDS)
 
 # 一条详情实测约 1.2 次（含 code=37 重算），与 daily_cycle.py 同一标定值。
 # 只用于日志里估算，不再用来截断队列（日线已改成降速线）。
@@ -202,9 +205,11 @@ def main() -> None:
     ap.add_argument("--refresh-cap", type=int, default=1000)
     ap.add_argument("--collect-cap", type=int, default=900)
     ap.add_argument("--skip-fresh-hours", type=float, default=12.0)
-    ap.add_argument("--gap", type=float, nargs=2, default=[15.0, 25.0])
+    # 节奏默认值与 refresh_status_loop.py 保持一致，
+    # 否则手工跑和调度跑用两套节奏而日志里看不出差别。
+    ap.add_argument("--gap", type=float, nargs=2, default=[18.0, 32.0])
     ap.add_argument("--burst", type=int, default=25)
-    ap.add_argument("--burst-pause", type=float, nargs=2, default=[90.0, 150.0])
+    ap.add_argument("--burst-pause", type=float, nargs=2, default=[90.0, 180.0])
     ap.add_argument("--rotate-every", type=int, default=15)
     ap.add_argument("--collect-config", default="config.cities3.yaml")
     ap.add_argument("--collect-limit", type=int, default=400)
@@ -225,6 +230,24 @@ def main() -> None:
     ap.add_argument("--only-exit", default="",
                     help="刷新阶段只用指定出口（vm / container）。"
                          "一个出口撞验证、另一个还好时用它，避免坏出口连累好的")
+    ap.add_argument("--skip-exit", default="",
+                    help="刷新阶段跳过这些出口（逗号分隔）")
+    # 下面这些都只是透传给刷新脚本。默认值与被调脚本保持一致，
+    # 否则「手工跑」和「调度跑」会用两套节奏，而日志里看不出差别。
+    ap.add_argument("--slow-ladder", default="1.0:2,1.25:3,1.5:4,2.0:6",
+                    help="降速档位（配合 --over-quota slow），透传给刷新脚本")
+    ap.add_argument("--stale-days", type=int, default=60,
+                    help="活跃度换算天数 >= 此值降级为 sample，透传")
+    ap.add_argument("--include-no-jd", action="store_true",
+                    help="刷新阶段也刷还没抓 JD 的岗位，透传")
+    ap.add_argument("--window-position", default=DEFAULT_WINDOW_POSITION,
+                    help="浏览器窗口落点 x,y（默认 %(default)s，主屏之外不抢焦点），透传")
+    # ⚠️ 无人值守**默认不弹**验证窗：没人点的窗口零产出，还占着出口。
+    # 但人在场时必须有路可走 —— 那就是这个开关。
+    ap.add_argument("--verify", action="store_true",
+                    help="允许刷新阶段撞验证时弹窗（默认不弹）。只在人确认在场时加")
+    ap.add_argument("--verify-wait", type=float, default=300.0,
+                    help="配合 --verify：每次弹窗等待人工的秒数")
     ap.add_argument("--done-threshold", type=int, default=DONE_THRESHOLD,
                     help=f"待办低于此数即视为该阶段做完（默认 {DONE_THRESHOLD}）。"
                          "不取 0：总有少数条目反复失败，卡在 0 会让流水线停在原地")
@@ -299,9 +322,20 @@ def main() -> None:
                    "--rotate-every", str(args.rotate_every),
                    "--skip-fresh-hours", str(args.skip_fresh_hours),
                    "--daily-cap", str(args.refresh_cap),
-                   "--over-quota", args.over_quota]
+                   "--over-quota", args.over_quota,
+                   "--slow-ladder", args.slow_ladder,
+                   "--stale-days", str(args.stale_days),
+                   "--window-position", args.window_position]
             if args.only_exit:
                 cmd += ["--only-exit", args.only_exit]
+            if args.skip_exit:
+                cmd += ["--skip-exit", args.skip_exit]
+            if args.include_no_jd:
+                cmd += ["--include-no-jd"]
+            # 无人值守默认不弹验证窗（没人点等于白开，还占着出口）。
+            # 人在场时用 --verify 显式打开。
+            if args.verify:
+                cmd += ["--verify", "--verify-wait", str(args.verify_wait)]
             if run_stage("refresh", ROOT / "logs" / f"refresh-slow-{stamp}.log",
                          cmd) == "risk":
                 halt("refresh 命中 [RISK-STOP]")

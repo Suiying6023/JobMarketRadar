@@ -41,25 +41,26 @@ from urllib.parse import quote, urlsplit
 from patchright.async_api import async_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from job_radar.normalization import (  # noqa: E402
+    ACTIVE_DESC_DAYS, CLOSED_MARKERS,
+)
+from job_radar.refresh_fetch import (  # noqa: E402
+    DEFAULT_WINDOW_POSITION, launch_args,
+)
+
 DB = ROOT / "data" / "hangzhou_agent.sqlite3"
 # 并行 mihomo 实例（独立于主 clash）：走 7899 代理 + 9098 API，节点轮换不影响主 clash
 CLASH_PROXY = "http://127.0.0.1:7899"
 CLASH_API = "http://127.0.0.1:9098"
 CLASH_SECRET = "set-your-secret"
 
-CLOSED_MARKERS = ("职位已关闭", "该职位已关闭", "已下线", "职位已下线", "职位已结束", "暂停招聘", "招聘已结束")
-
-# 招聘者活跃度：库里出现过的全部文案（2026-08-27 现场统计，共 13 种非空值），
-# 映射到"距今约多少天"用于判定长期不活跃。是有限枚举，所以精确匹配而不用模糊正则。
-# ⚠️ 必须按长度降序匹配："本周活跃" 与 "2周内活跃" 都含"周活跃"，短的会误吃长的。
-ACTIVE_DAYS = {
-    "在线": 0, "刚刚活跃": 0, "今日活跃": 1, "日内活跃": 1,
-    "3日内活跃": 3, "本周活跃": 7, "2周内活跃": 14,
-    "本月活跃": 30, "月内活跃": 30, "2月内活跃": 60, "3月内活跃": 90,
-    "4月内活跃": 120, "5月内活跃": 150, "近半年活跃": 180, "半年前活跃": 999,
-}
-# 按文案长度降序，保证先匹配更具体的
-ACTIVE_PATTERNS = sorted(ACTIVE_DAYS.items(), key=lambda kv: -len(kv[0]))
+# 活跃度文案表与关闭文案表的真源都在 `job_radar.normalization`。
+# 这里只做别名，**不要在这个文件里另写一份** —— 曾经各写一份并漂开过
+# （`今日活跃` 一处 1 天一处 0 天），后果是同一岗位在两条链路得出不同降级结论。
+ACTIVE_PATTERNS = ACTIVE_DESC_DAYS          # 已按短语长度降序
+ACTIVE_DAYS = dict(ACTIVE_DESC_DAYS)        # 探针按 dict 用它
 
 
 def parse_active_status(text: str) -> tuple[str | None, int | None]:
@@ -192,6 +193,9 @@ async def main() -> None:
     parser.add_argument("--burst", type=int, default=25, help="每 N 条做一次长停顿（时间段性限速）")
     parser.add_argument("--burst-pause", type=float, default=0, help="批间长停顿秒（0=随机 45-120s）")
     parser.add_argument("--window", default="", help="运行时段 HH-HH（如 09-23），之外等待；默认不限")
+    parser.add_argument("--window-position", default=DEFAULT_WINDOW_POSITION,
+                        help="浏览器窗口落点 x,y（默认 %(default)s，主屏之外不抢焦点）。"
+                             "传空字符串则开在屏幕中央。⚠️ 坐标必须为正。")
     parser.add_argument("--storage-state", default="",
                         help="人工过验证后保存的 storage_state json（见 manual_verify_proxy.py）。"
                              "被标记的出口 IP 必须带它，否则每条都会撞「安全验证」页")
@@ -228,7 +232,7 @@ async def main() -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             channel="chrome", headless=args.headless,
-            args=["--disable-blink-features=AutomationControlled", "--window-position=-32000,-32000"],
+            args=launch_args(args.window_position),
             ignore_default_args=["--enable-automation"])
         ctx = await browser.new_context(viewport={"width": 1366, "height": 768})
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()

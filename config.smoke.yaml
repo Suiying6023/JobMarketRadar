@@ -23,7 +23,7 @@ database_path: data/smoke.sqlite3
 raw_dir: data/raw
 output_dir: output
 browser:
-  mode: cdp
+  mode: persistent
   cdp_url: http://127.0.0.1:9222
   headless: false
   navigation_timeout_ms: 30000

@@ -65,12 +65,11 @@ DB = ROOT / "data" / "hangzhou_agent.sqlite3"
 
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
-from check_job_status import (  # noqa: E402
-    CLOSED_MARKERS, ACTIVE_DAYS, parse_active_status, _is_closed,
-)
+from check_job_status import parse_active_status, _is_closed  # noqa: E402
+from job_radar.exits import UA, exit_pool, exit_verdict  # noqa: E402
 from job_radar.refresh_fetch import (  # noqa: E402
-    EXTRACT_JS, FETCH_WINDOW, MIN_JOB_HTML_LEN, REQ_PER_RECOVER,
-    is_closed_status, quota_factor, same_job,
+    DEFAULT_WINDOW_POSITION, EXTRACT_JS, FETCH_WINDOW, MIN_JOB_HTML_LEN,
+    REQ_PER_RECOVER, is_closed_status, launch_args, quota_factor, same_job,
 )
 
 # 一条 fetch = 1 次请求。窗口耗尽后重算 stoken 约 3 次，窗口约 5 条 →
@@ -96,16 +95,6 @@ EXIT_STRIKE_LIMIT = 3
 # 探针 `scripts/probe_stoken_recovery.py`，数据 `data/calibration/stoken-recovery.json`。
 REWARM_WAIT = (5.0, 7.0)
 
-# 跑批窗口的落点：主屏之外，**坐标为正**。
-# 目的是不抢焦点（跑批每 15-25 秒新建 context，反复抢焦点会把全屏应用踢出）。
-# ⚠️ 绝不能改成负数：负的大数被挑战 JS 判为异常环境，请求会被推到登录页
-# （2026-08-31 实测 `-32000,-32000` 得 0/4）。正坐标实测 n=14 挑战率 7%。
-# 若你的屏幕分辨率更高、这个位置仍然可见，把数值再调大即可（保持为正）。
-OFFSCREEN_POS = "2400,1400"
-
-# 出口池：(标识, SOCKS 端口)
-EXITS = [("vm", 1080), ("container", 1082)]
-FAIL_STREAK = 10         # 连续这么多条未判定才怀疑出口失效（先探再判，别急着弹窗）
 PROBE_URL = "https://www.zhipin.com/"
 
 # ⚠️ 首页返回码是**假绿灯**，不要用它判「能不能读岗位页」（2026-08-27 实测推翻）。
@@ -118,46 +107,8 @@ PROBE_URL = "https://www.zhipin.com/"
 #    所以裸 curl 无法区分「正常挑战」和「已被标记」。
 
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-INFO_URL = "https://www.zhipin.com/wapi/zpsecureflow/forbidden-info?"
-
-
-def exit_status(port: int, timeout: int = 20) -> tuple[str, str]:
-    """查出口封禁状态，一条 curl，不起浏览器。返回 (verdict, 说明)。
-
-    verdict: ok / verify（可人工救）/ blocked（硬封只能等）/ dead / unknown
-
-    判据来自 BOSS 自己的接口，比"起浏览器读一条详情页"快一个数量级
-    （90s → 2s），而且直接给出精确解封时间和真实出口 IP。
-    """
-    try:
-        out = subprocess.run(
-            ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{port}",
-             "--max-time", str(timeout), "-H", f"User-Agent: {UA}",
-             "-H", "X-Requested-With: XMLHttpRequest", INFO_URL],
-            capture_output=True, text=True, timeout=timeout + 6)
-        raw = (out.stdout or "").strip()
-    except Exception:
-        return "dead", "隧道不通"
-    if not raw:
-        return "dead", "隧道无响应"
-    try:
-        zp = (json.loads(raw) or {}).get("zpData")
-    except json.JSONDecodeError:
-        return "unknown", f"非 JSON: {raw[:60]}"
-    if not zp or zp.get("code") != 31:
-        return "ok", "无限制记录"
-    exp = zp.get("expireTime")
-    when = ""
-    if isinstance(exp, (int, float)):
-        d = datetime.fromtimestamp(exp / 1000)
-        left = (d - datetime.now()).total_seconds() / 3600
-        when = f"解封 {d:%m-%d %H:%M}（还剩 {left:.1f}h）"
-    ip = zp.get("ip") or "?"
-    if zp.get("jumpVerify"):
-        return "verify", f"IP {ip} 被标记，可人工验证。{when}"
-    return "blocked", f"IP {ip} 硬封，验证无效。{when}"
+# 连续这么多条未判定就怀疑出口失效（先探再判，别急着弹窗）。
+FAIL_STREAK = 10
 
 
 def log_requests(con: sqlite3.Connection, n: int, outcome: str = "ok",
@@ -486,8 +437,8 @@ async def main() -> None:
     ap.add_argument("--all", action="store_true", help="不限条数，跑到没有为止")
     ap.add_argument("--include-no-jd", action="store_true",
                     help="也刷还没抓 JD 的岗位（默认只刷已进投递池的）。"
-                         "默认关闭的理由：一条刷新 14 次请求，而无 JD 的岗位"
-                         "页面上看不见，刷了没收益 —— 实测占了 70%")
+                         "无 JD 的岗位在投递池页面上看不见，刷了拿不到可用结论；"
+                         "它们曾占待刷队列的七成。")
     ap.add_argument("--stale-days", type=int, default=60,
                     help="活跃度换算天数 >= 此值即降级为 sample")
     ap.add_argument("--skip-fresh-hours", type=float, default=12.0,
@@ -505,6 +456,8 @@ async def main() -> None:
     ap.add_argument("--only-exit", default="",
                     help="只用指定出口（vm / container），留空=全部。"
                          "一个出口坏掉时用它单跑好的那个")
+    ap.add_argument("--skip-exit", default="",
+                    help="跳过这些出口（逗号分隔）。出口多于两个时比 --only-exit 好写")
     ap.add_argument("--slow-ladder", default="1.0:2,1.25:3,1.5:4,2.0:6",
                     help="降速档位 用量倍数:延迟乘数，逗号分隔（配合 --over-quota slow）")
     ap.add_argument("--rotate-every", type=int, default=15, help="每 N 条换出口")
@@ -530,16 +483,19 @@ async def main() -> None:
     ap.add_argument("--verify-wait", type=float, default=300.0,
                     help="每次弹窗等待人工验证的秒数")
     ap.add_argument("--verify", action="store_true",
-                    help="遇到可救的 verify 状态时弹窗让人工过。"
-                         "默认关闭的理由是**没人在场时弹窗等于白开**"
-                         "（窗口零产出还占着出口），"
-                         "**不是**怕加时——「每访问一次 +24h」已于 2026-08-28 实测推翻")
+                    help="撞上可救的 verify 态时弹出浏览器让人工过（默认不弹）。"
+                         "只在人确认在场时加：无人点的窗口零产出，还占着出口。"
+                         "弹窗本身不会推后解封时刻，人点掉即当场解除。")
+    ap.add_argument("--window-position", default=DEFAULT_WINDOW_POSITION,
+                    help="浏览器窗口落点 x,y（默认 %(default)s，主屏之外不抢焦点）。"
+                         "传空字符串则开在屏幕中央。"
+                         "⚠️ 坐标必须为正——负坐标会被挑战 JS 判为异常环境。")
+    _amort = REQ_PER_JOB + REQ_PER_RECOVER / FETCH_WINDOW
     ap.add_argument("--daily-cap", type=int, default=1000,
-                    help="单日累计 HTTP 请求上限（本链路独立账本，kind='detail_page'）。"
-                         "一条摊薄约 %.1f 次请求（1 次 fetch + 每 %d 条一次 %d 次重算），"
-                         "所以 1000 次约合 600 条"
-                         % (REQ_PER_JOB + REQ_PER_RECOVER / FETCH_WINDOW,
-                            FETCH_WINDOW, REQ_PER_RECOVER))
+                    help=f"单日累计 HTTP 请求上限（本链路独立账本，"
+                         f"kind='detail_page'）。一条摊薄约 {_amort:.1f} 次请求"
+                         f"（1 次 fetch + 每 {FETCH_WINDOW} 条一次 "
+                         f"{REQ_PER_RECOVER} 次重算），所以 1000 次约合 600 条")
     args = ap.parse_args()
 
     # 解析降速档位。`--over-quota stop` 时传空表 → quota_factor 恒返回 1.0，
@@ -660,49 +616,26 @@ async def main() -> None:
     ei = 0
 
     async with async_playwright() as pw:
-        # ⚠️ **绝不能加 `--window-position=-32000,-32000`**（2026-08-31 实测）。
-        # 那个参数的用意是"跑批时别让窗口挡着人"，代价是**整条链路失效**：
-        # 挑战 JS 会读窗口坐标当环境指纹，负的大数被判为异常环境，
-        # 平台于是既不给可自解的挑战、也不给可点的验证页，而是直接把请求
-        # **推到登录页**（`/web/user/?seed=...`，返回 7342 字节）。
-        # 对照实验（同出口、同批岗位、同一段 EXTRACT_JS）：
-        #   在屏          → 4/4 ok，落岗位页
-        #   离屏 -32000   → 0/4，落 /web/user/ 登录页
-        # 这就是那些"验证窗口全是登录页"的真实来源 —— 与 IP 是否被风控无关。
-        # 代价记录：这个参数让我误判成风控，先后归因给"重启压塌窗口"、
-        # "IP 被限制到明早"、"隧道死了"、"冷启动漏等待"，全错，浪费约 8 小时，
-        # 还让用户白点了两轮根本点不动的窗口。
-        # 判据：**任何改变浏览器可见性/几何的参数都可能改变环境指纹**，
-        # 反爬链路里它们不是无害的美化项。
         browser = await pw.chromium.launch(
             channel="chrome", headless=False,   # 必须有头，无头挑战不自解
-            args=["--disable-blink-features=AutomationControlled",
-                  # 把窗口挪到主屏之外，**但坐标必须为正**。
-                  # 用户反馈「一直会把我全屏游戏卡出来看 chrome」——跑批每
-                  # 15-25 秒新建一次 context，窗口反复抢焦点会把全屏应用踢出。
-                  # ⚠️ 与被否掉的 `-32000,-32000` 的区别只在**正负**：
-                  # 负的大数被挑战 JS 判为异常环境（实测 0/4，落登录页），
-                  # 正坐标不会。实测 n=14 挑战率 7%，优于健康基线 14-16%。
-                  # 所以「窗口几何一律不能动」那条我说过宽了 —— 有害的是负坐标。
-                  f"--window-position={OFFSCREEN_POS}"],
+            args=launch_args(args.window_position),
             ignore_default_args=["--enable-automation"])
 
         # 开跑前体检：**必须真读一条 job_detail**，不能只看首页返回码。
         # 首页 200 而详情页全是「安全验证」是实测存在的状态（见文件头注释），
         # 用首页判会把被标记的出口当成可用，然后一路空转 10 条才发现。
         usable: list[tuple[str, int]] = []
-        candidates = EXITS
-        if args.only_exit:
-            candidates = [(t, p) for t, p in EXITS if t == args.only_exit]
-            if not candidates:
-                print(f"[出口] --only-exit {args.only_exit!r} 不认识，"
-                      f"可选 {[t for t, _ in EXITS]}")
-                return
-            print(f"[出口] 只用 {args.only_exit}（--only-exit）", flush=True)
+        try:
+            candidates = exit_pool(only=args.only_exit, skip=args.skip_exit)
+        except ValueError as exc:
+            print(f"[出口] {exc}")
+            return
+        if args.only_exit or args.skip_exit:
+            print(f"[出口] 本轮只用 {[t for t, _ in candidates]}", flush=True)
         for tag, port in candidates:
             # 先用 forbidden-info 接口问一句（2 秒），能明确排除的就不必起浏览器
             # 读一条详情页（90 秒）。硬封的出口连弹窗都不该弹。
-            verdict, note = exit_status(port)
+            verdict, note = exit_verdict(port)
             print(f"[出口] {tag}(:{port}) {verdict} — {note}", flush=True)
             if verdict == "dead":
                 print(f"       起隧道: ssh -f -N -D {port} "
@@ -984,7 +917,7 @@ async def main() -> None:
                 # 诊断也要用详情页判据，首页码只够回答隧道通不通。
                 if streak >= FAIL_STREAK:
                     await ctx.close()
-                    verdict, note = exit_status(cur_port)
+                    verdict, note = exit_verdict(cur_port)
                     print(f"[诊断] 连续 {streak} 条未判定，{cur_tag} {verdict} — {note}",
                           flush=True)
                     if verdict == "dead":

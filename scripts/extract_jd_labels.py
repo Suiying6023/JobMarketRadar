@@ -156,9 +156,13 @@ def main() -> None:
                 # 导出增强 CSV
                 import csv as _csv
                 from job_radar.collectors.boss import RISK_CODES  # noqa: F401
-                p0 = [r for r in rows if r["recruiter_active_status"] in
-                      ("刚刚活跃", "在线", "今日活跃", "3日内活跃")]
-                p1 = [r for r in rows if r["recruiter_active_status"] == ""]
+                # 按天数判而非文案白名单（真源 profile.ACTIVE_P0_MAX_DAYS）：
+                # 白名单漏掉中间档，那些行在任何一份 CSV 里都不出现。
+                from job_radar.profile import ACTIVE_P0_MAX_DAYS
+                p0 = [r for r in rows
+                      if (r["recruiter_active_days"] is not None
+                          and r["recruiter_active_days"] <= ACTIVE_P0_MAX_DAYS)]
+                p1 = [r for r in rows if r["recruiter_active_days"] is None]
                 for name, subset in (("投递池_P0优先_标签", p0), ("投递池_P1待确认_标签", p1)):
                     with open(f"output/{name}.csv", "w", encoding="utf-8-sig", newline="") as f:
                         w = _csv.DictWriter(f, fieldnames=[

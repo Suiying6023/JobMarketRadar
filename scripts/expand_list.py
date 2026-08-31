@@ -31,7 +31,9 @@ from job_radar.collectors.boss import (  # noqa: E402
     BossCollector,
 )
 from job_radar.config import load_config  # noqa: E402
-from job_radar.refresh_fetch import quota_factor  # noqa: E402
+from job_radar.refresh_fetch import (  # noqa: E402
+    DEFAULT_WINDOW_POSITION, launch_args, quota_factor,
+)
 from job_radar.storage import JobStore  # noqa: E402
 from job_radar.throttle import gaussian  # noqa: E402
 
@@ -94,6 +96,9 @@ async def main() -> None:
     # 越线行为是策略，由调用方给。默认 None = 用配置文件的值（当前 stop）。
     parser.add_argument("--over-quota", choices=("stop", "slow"), default=None,
                         help="越过 max_requests_per_day 后：stop=停止（默认），slow=降速继续")
+    parser.add_argument("--window-position", default=DEFAULT_WINDOW_POSITION,
+                        help="浏览器窗口落点 x,y（默认 %(default)s，主屏之外不抢焦点）。"
+                             "传空字符串则开在屏幕中央。⚠️ 坐标必须为正。")
     parser.add_argument("--restart", action="store_true",
                         help="忽略断点进度，所有关键词从第 1 页重新翻"
                              "（平台岗位有轮换，隔一段时间重扫浅层有意义）")
@@ -122,7 +127,7 @@ async def main() -> None:
         ctx = await pw.chromium.launch_persistent_context(
             str(Path(cfg.browser.user_data_dir).resolve()),
             channel="chrome", headless=False, no_viewport=True,
-            args=["--disable-blink-features=AutomationControlled", "--window-position=-32000,-32000"],
+            args=launch_args(args.window_position),
             ignore_default_args=["--enable-automation"])
         collector.context = ctx
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()

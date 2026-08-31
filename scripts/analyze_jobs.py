@@ -18,9 +18,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-DB = "data/hangzhou_agent.sqlite3"
+from job_radar.profile import ACTIVE_P0_MAX_DAYS  # noqa: E402
 
-P0_ACTIVE = ("刚刚活跃", "在线", "今日活跃", "3日内活跃")
+DB = "data/hangzhou_agent.sqlite3"
 
 
 def dist(rows, field, top=8):
@@ -48,8 +48,13 @@ def main() -> None:
     rows = con.execute(
         "SELECT * FROM jobs WHERE retention_status='active' AND job_description != ''"
     ).fetchall()
-    p0 = [r for r in rows if r["recruiter_active_status"] in P0_ACTIVE]
-    print(f"  投递池(active+JD): {len(rows)} | P0优先(3日内活跃): {len(p0)}")
+    # 按天数判而非文案白名单：白名单会漏掉中间档（本周/2周内/本月…），
+    # 那些行既不进 P0 也不进 P1，在统计里凭空消失。
+    p0 = [r for r in rows
+          if (r["recruiter_active_days"] is not None
+              and r["recruiter_active_days"] <= ACTIVE_P0_MAX_DAYS)]
+    print(f"  投递池(active+JD): {len(rows)} | "
+          f"P0优先(≤{ACTIVE_P0_MAX_DAYS}天活跃): {len(p0)}")
 
     # 2. 投递池画像
     print("\n[投递池画像 active={}]".format(len(rows)))

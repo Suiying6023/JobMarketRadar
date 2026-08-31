@@ -51,7 +51,7 @@ raw_dir: data/raw
 output_dir: output
 
 browser:
-  mode: cdp
+  mode: persistent
   cdp_url: http://127.0.0.1:9222
   user_data_dir: .browser-profile
   channel: chrome

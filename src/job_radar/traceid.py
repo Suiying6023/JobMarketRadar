@@ -4,7 +4,7 @@ BOSS 的 detail.json 请求头带 traceid（格式 F-<19位uuid><3位checksum>�
 浏览器后无法调用页面里的 JS 函数，只能本地复刻。本模块用相同算法本地生成，
 已用页面真值对验证（8/8 通过）。
 
-相关：scripts/pure_http_client.py、scripts/probe_cdp_network.py
+相关：scripts/pure_http_client.py
 """
 from __future__ import annotations
 
