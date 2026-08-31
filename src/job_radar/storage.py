@@ -495,6 +495,18 @@ class JobStore:
     #: `total` 只累计这些——它是 `max_requests_per_day` 的执行口径。
     COLLECT_KINDS = frozenset({"list", "detail", "security_check", "recommend"})
 
+    #: 抓 1 条详情的账面请求开销，**用于把日线余量换算成"还能抓多少条"**。
+    #: 全库实测 `(detail + security_check) / detail` = 1.19
+    #: （code=37 每约 5.3 条一次，每次重算记 1 次）。
+    #:
+    #: ⚠️ 这是**账面**口径，不是真实上网次数：每次 stoken 重算真实发约 37 次请求，
+    #: 而账本按设计只记 1 行。闸门按账面设，真实压力另行标定 ——
+    #: 所以别拿这个数估"打了平台多少次"。
+    #:
+    #: ⚠️ 把 list 请求也摊进来是 1.38，但闸门不该用那个：list 与 detail
+    #: 对账号的压力不等价，且 list 一次能得约 11 条岗位。
+    REQ_PER_DETAIL = 1.2
+
     def request_counts(self, day: str | None = None) -> dict[str, int]:
         """某天各类请求数（默认今天本地日）。返回 {'list': n, ..., 'total': n}。
 

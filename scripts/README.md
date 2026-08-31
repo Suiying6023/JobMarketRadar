@@ -15,13 +15,20 @@
 | 端点 | `/wapi/zpgeek/*.json` JSON API | `job_detail/*.html` 同源 fetch |
 | 登录态 | 带账号 cookie（**仅本机**） | **必须免登录** |
 | 出口 | 本机直连家宽 | 波尔 SOCKS 跳板（1080 / 1082） |
-| 账本 `kind` | `list` / `detail` / `security_check` | `detail_page` |
-| 一条详情的账面成本 | 约 1.5 次请求 | 约 1.6 次请求 |
+| 账本 `kind` | `list`/`detail`/`security_check`/`recommend`（真源 `JobStore.COLLECT_KINDS`） | `detail_page` |
+| 一条详情的账面成本 | 约 **1.2** 次请求 | 约 **1.6** 次请求 |
 
-⚠️ **账面成本不等于真实上网次数**。采集侧每次 stoken 重算真实发约 37 次请求，
-而账本按设计只记 1 行（闸门按账面口径设，真实成本另行标定）。
-所以拿账本数字估「打了平台多少次」会低估一个量级——要估真实压力看
-`data/calibration/recover-cost-*.json`。
+上面那两个数是**账面**口径（用来把日线余量换算成"还能抓多少条"），
+真源分别是 `JobStore.REQ_PER_DETAIL` 与 `refresh_fetch.REQ_PER_JOB_AMORTIZED`。
+它们和现场有两层差：
+
+⚠️ **一、账面 ≠ 真实上网次数。** 采集侧每次 stoken 重算真实发约 **37** 次请求，
+而账本按设计只记 1 行。闸门按账面设，真实压力另行标定（`data/calibration/recover-cost-*.json`）。
+所以拿账本估「打了平台多少次」会低估一个量级。
+
+⚠️ **二、账面不含重试。** 刷新侧账面 1.6，而实测一轮会到 **2.04 次/条** ——
+撞挑战页后的重试、换出口后的重暖都不在那个估值里。
+所以按 1.6 排的计划会超，估容量时留三成余量。
 
 ## 状态刷新（免登录，走波尔）
 

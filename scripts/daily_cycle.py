@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from job_radar.config import load_config  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
-REQ_PER_DETAIL = 1.2  # 每条详情的实际请求开销（含 code=37 重算），标定值
+REQ_PER_DETAIL = JobStore.REQ_PER_DETAIL  # 真源在 storage，别另写一份
 
 
 def log(msg: str) -> None:

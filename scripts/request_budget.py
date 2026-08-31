@@ -21,9 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from job_radar.config import load_config  # noqa: E402
 from job_radar.storage import JobStore  # noqa: E402
 
-# 每抓 1 条详情的实际请求开销。2026-08-10 标定：code=37 每约 5.3 条一次，
-# 每次重算再发 1 次导航请求 → 1 + 1/5.3 ≈ 1.19。
-REQ_PER_DETAIL = 1.2
+# 单条详情的账面开销：真源是 `JobStore.REQ_PER_DETAIL`，别在这里另写一份。
+REQ_PER_DETAIL = JobStore.REQ_PER_DETAIL
 
 
 def main() -> None:

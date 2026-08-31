@@ -75,7 +75,7 @@ def launch_args(window_position: str = DEFAULT_WINDOW_POSITION) -> list[str]:
     负的大数被判为异常环境，请求会被推去登录页（`/web/user/?seed=...`）而
     **不给可自解的挑战、也不给可点的验证页**——那种窗口人是点不动的。
     实测 `-32000,-32000` 得 0/4，正坐标 `2400,1400` 挑战率 7%（n=14），
-    优于在屏基线 14-16%。最小化同样不行（Windows 把坐标写成 -21333）。
+    优于在屏的 14-16%（这两个数是窗口探针口径，只用于组间比较）。最小化同样不行（Windows 把坐标写成 -21333）。
     传空字符串 = 不指定位置，窗口开在屏幕中央会抢焦点。
     """
     args = ["--disable-blink-features=AutomationControlled"]

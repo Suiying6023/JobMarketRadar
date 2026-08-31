@@ -47,7 +47,7 @@ COLLECT_KINDS = tuple(JobStore.COLLECT_KINDS)
 
 # 一条详情实测约 1.2 次（含 code=37 重算），与 daily_cycle.py 同一标定值。
 # 只用于日志里估算，不再用来截断队列（日线已改成降速线）。
-REQ_PER_DETAIL = 1.2
+REQ_PER_DETAIL = JobStore.REQ_PER_DETAIL
 
 # 阶段推进的判据阈值：待办降到这个数以下就算该阶段做完，进下一阶段。
 # 不取 0 是因为总有少数条目会反复失败（岗位已下架但标记没落、
