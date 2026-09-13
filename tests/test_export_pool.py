@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import sys
+import pytest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +21,33 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import _pool_template as T  # noqa: E402
 import export_pool as E  # noqa: E402
 import export_pool_html as L  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def synthetic_pool(tmp_path, monkeypatch):
+    """Exercise every display bucket without a private account or collected data."""
+    from job_radar.models import JobRecord, Platform
+    from job_radar.storage import JobStore
+    path = tmp_path / "pool.sqlite3"
+    tech = "、".join(L.P.AI_TECH)
+    description = "合成测试岗位，非真实招聘。负责软件开发、接口和质量验证。" + tech + "。" + "通过测试与日志核实结果。" * 20
+    with JobStore(path) as store:
+        for key, low, high, days, retention in [
+            ("p0", 10, 14, 0, "active"), ("p2", 10, 14, 10, "active"),
+            ("high", 18, 24, 0, "active"), ("low", 4, 6, 0, "active"),
+            ("over", 30, 50, 0, "sample"), ("risk", 10, 14, 0, "active"),
+        ]:
+            store.upsert(JobRecord(platform=Platform.BOSS, source_job_id=key, title="AI Agent 开发 " + key,
+                                   company_name="合成示例科技 " + key, city="杭州", job_url=f"https://www.zhipin.com/job_detail/{key}.html",
+                                   salary_text=f"{low}-{high}K", salary_min_k=low, salary_max_k=high, salary_months=12,
+                                   experience="经验不限", education="本科", recruiter_title="研发负责人", recruiter_active_days=days,
+                                   recruiter_active_status="今日活跃" if days == 0 else "本月活跃", job_description=description,
+                                   retention_status=retention, detail_fetched_at=datetime.now(timezone.utc).isoformat()))
+        store.conn.execute("UPDATE jobs SET glm_tags_json=?", (json.dumps({"match":"keep", "job_type":"开发岗", "tech_req":[tech]},ensure_ascii=False),))
+        store.conn.execute("UPDATE jobs SET company_reg_json=? WHERE source_job_id='risk'", (json.dumps({"注册资本":"10万人民币", "企业类型":"个人独资企业", "成立日期":"2020-01-01"},ensure_ascii=False),))
+        store.conn.commit()
+    monkeypatch.setattr(E, "DB", path)
+    monkeypatch.setattr(L, "DB", path)
 
 
 def test_reuses_the_legacy_predicates_instead_of_redefining_them():

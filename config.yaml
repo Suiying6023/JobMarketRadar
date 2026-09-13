@@ -1,31 +1,35 @@
-# 安全的首次验证配置。跑通后再参考 config.example.yaml 扩大关键词与筛选。
+# 经验参考配置：预算、页深和关键词数不是平台安全界限。
+# reference 模式到线仅提示；enforce 模式才执行用户明确选择的限制。
+# 当前在线访问关闭，账号冻结由本地 access-policy.json 单独控制。
 platforms:
-  - boss
+- boss
 cities:
-  - name: 杭州
-    boss_code: "101210100"
-  - name: 深圳
-    boss_code: "101280600"
-  - name: 上海
-    boss_code: "101020100"
+- name: 杭州
+  boss_code: '101210100'
+- name: 深圳
+  boss_code: '101280600'
+- name: 上海
+  boss_code: '101020100'
 keywords:
-  - AI Agent
-  - 大模型应用开发
-  - AI应用工程师
+- AI Agent
+- 大模型应用开发
+- AI应用工程师
 pages_per_query: 1
 detail_limit_per_query: 5
 page_size: 30
 collect_details: true
-request_delay_seconds: [6, 12]
+request_delay_seconds:
+- 6
+- 12
 filters:
-  - {}
+- {}
 exclude_title_keywords:
-  - 销售
-  - 主播
-  - 培训讲师
+- 销售
+- 主播
+- 培训讲师
 exclude_company_keywords:
-  - 猎头
-  - 劳务派遣
+- 猎头
+- 劳务派遣
 database_path: data/jobs.sqlite3
 raw_dir: data/raw
 output_dir: output
@@ -45,3 +49,7 @@ auto_chat:
   greeting: 您好，我对这个岗位感兴趣，方便进一步沟通吗？
   min_delay_seconds: 8
   max_delay_seconds: 15
+network_enabled: false
+budget_mode: reference
+max_page_number: 10
+max_keywords_per_run: 3

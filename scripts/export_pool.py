@@ -275,7 +275,8 @@ def row_to_record(r, bucket: str, tier: str, risky: bool) -> dict:
 
 def collect() -> tuple[list[dict], dict]:
     """读库 → 应用与旧导出**完全相同**的过滤分桶 → 扁平记录表 + 统计。"""
-    con = sqlite3.connect(DB)
+    from job_radar.analysis.market import connect_readonly
+    con = connect_readonly(DB)
     con.row_factory = sqlite3.Row
 
     main_rows = con.execute(

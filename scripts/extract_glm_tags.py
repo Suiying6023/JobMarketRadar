@@ -259,7 +259,14 @@ def call_glm(env: dict, jd: str, title: str = "", salary: str = "",
         # 剥 ``` 围栏的兜底也必须保留：实测同一模型会偶发加围栏（3 次里 2 次）。
         "response_format": {"type": "json_object"},
     }).encode("utf-8")
-    req = urlreq.Request(env["LLM_API_URL"], data=body, headers={
+    api_url = env["LLM_API_URL"]
+    if not api_url.rstrip("/").endswith("/chat/completions"):
+        if api_url.rstrip("/").endswith("/v1"):
+            api_url = api_url.rstrip("/") + "/chat/completions"
+        else:
+            api_url = api_url.rstrip("/") + "/v1/chat/completions"
+
+    req = urlreq.Request(api_url, data=body, headers={
         "Authorization": f"Bearer {env['LLM_API_KEY']}",
         "Content-Type": "application/json",
         # ⚠️ 必须伪装 UA：网关在 Cloudflare 后面，默认的 `Python-urllib/3.12`
@@ -269,11 +276,16 @@ def call_glm(env: dict, jd: str, title: str = "", salary: str = "",
         # curl 能通是因为它默认发 `curl/x.y`，恰好不在拦截名单里。
         "User-Agent": USER_AGENT,
     })
+    opener = None
+    if any(k in api_url for k in ("100.", "127.0.0.1", "localhost", "192.168.", "10.")):
+        opener = urlreq.build_opener(urlreq.ProxyHandler({}))
+
     attempt = 0
     while attempt < max_retries:
         attempt += 1
         try:
-            with urlreq.urlopen(req, timeout=90) as resp:
+            resp_cm = opener.open(req, timeout=90) if opener else urlreq.urlopen(req, timeout=90)
+            with resp_cm as resp:
                 raw = resp.read().decode("utf-8")
             data = json.loads(raw)
             content = ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()

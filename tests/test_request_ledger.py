@@ -14,6 +14,7 @@ from job_radar.collectors import boss as boss_module
 from job_radar.collectors.boss import ORIGIN, BossCollector, RiskControlStop
 from job_radar.models import CollectionConfig
 from job_radar.storage import JobStore
+from tests.fakes import configure_offline_collector
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +43,7 @@ def make_collector(page: FakePage, store: JobStore | None = None, **overrides):
     payload = {
         "cities": [{"name": "杭州", "boss_code": "101210100"}],
         "keywords": ["AI Agent"],
+        "budget_mode": "enforce",
         **overrides,
     }
     collector = BossCollector(CollectionConfig.model_validate(payload))
@@ -49,7 +51,7 @@ def make_collector(page: FakePage, store: JobStore | None = None, **overrides):
     if store is not None:
         collector.ledger = store
         collector.ledger_script = "test"
-    return collector
+    return configure_offline_collector(collector, store)
 
 
 @pytest.fixture
@@ -95,15 +97,16 @@ def test_daily_budget_stops_across_processes(store):
     assert page.requested_urls == []
 
 
-def test_slow_mode_lets_requests_through(store):
-    """slow 模式下越线不阻断请求 —— 请求照发，只是节奏变慢。"""
+def test_slow_mode_cannot_spend_above_budget(store):
+    """旧 slow 参数不再增加请求额度。"""
     for _ in range(5):
         store.log_request("detail", script="other_script")
     page = FakePage()
     collector = make_collector(page, store, max_requests_per_day=5)
     collector.config.over_quota_action = "slow"
-    asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
-    assert len(page.requested_urls) == 1
+    with pytest.raises(RiskControlStop):
+        asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
+    assert page.requested_urls == []
 
 
 def test_per_run_cap_still_hard_stops(store):
@@ -129,17 +132,18 @@ def test_daily_budget_allows_under_cap(store):
     assert len(page.requested_urls) == 1
 
 
-def test_ledger_absent_does_not_break_collection():
-    """没注入账本时行为不变——账本不能成为采集的硬依赖。"""
+def test_ledger_absent_stops_before_fetch():
+    """不能核对跨进程预算时不发请求。"""
     page = FakePage()
     collector = make_collector(page)  # 不传 store
-    asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
-    assert len(page.requested_urls) == 1
-    assert collector.kind_counts == {"list": 1}
+    collector.ledger = None
+    with pytest.raises(RiskControlStop):
+        asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
+    assert page.requested_urls == []
 
 
-def test_ledger_write_failure_does_not_break_collection(store):
-    """账本写失败也不能打断采集：请求已经发出去了，记不上账是观测问题。"""
+def test_ledger_write_failure_stops_before_fetch(store):
+    """账本不可用时必须在网络动作之前停止。"""
     page = FakePage()
     collector = make_collector(page, store)
 
@@ -151,8 +155,9 @@ def test_ledger_write_failure_does_not_break_collection(store):
             return {"total": 0}
 
     collector.ledger = BrokenLedger()  # type: ignore[assignment]
-    asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
-    assert len(page.requested_urls) == 1
+    with pytest.raises(RiskControlStop):
+        asyncio.run(collector._same_origin_fetch("/wapi/zpgeek/search/joblist.json"))
+    assert page.requested_urls == []
 
 
 def test_risk_outcome_backfilled_onto_last_row(store):
@@ -237,11 +242,8 @@ def test_over_quota_action_defaults_to_stop(store):
         collector._check_daily_budget()
 
 
-def test_over_quota_slow_mode_never_stops(store):
-    """显式选 slow 时越线只降速、永不抛异常，倍数按配置的档位表上升。
-
-    档位表从 `config.over_quota_ladder` 读而不是写死在代码里 —— 调档不该改代码。
-    """
+def test_over_quota_ladder_does_not_disable_hard_stop(store):
+    """保留旧倍数计算的兼容性，同时禁止任何档位越过预算。"""
     page = FakePage(body={"code": 0, "zpData": {}})
     collector = make_collector(page, store, max_requests_per_day=100)
     collector.config.over_quota_action = "slow"
@@ -253,7 +255,8 @@ def test_over_quota_slow_mode_never_stops(store):
         f = collector.over_quota_factor()
         seen.append(f)
         assert f == expect, f"用量 {target} 时应降速 {expect}x，实际 {f}x"
-        collector._check_daily_budget()   # 任何档位都不抛
+        with pytest.raises(RiskControlStop):
+            collector._check_daily_budget()
     assert seen == sorted(seen), "倍数必须单调不减"
 
 

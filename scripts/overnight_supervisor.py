@@ -167,6 +167,8 @@ def run_stage(name: str, log_path: Path, cmd: list[str]) -> str:
         return "risk"
     if rc != 0:
         log(f"⚠️ {name} 退出码 {rc}")
+        if rc in (2, 3):
+            return "risk"
         return "error" if verdict == "ok" else verdict
     log(f"✅ {name} 结束（{verdict}）")
     return verdict
@@ -445,4 +447,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from _online_guard import guard
+    guard()
     main()

@@ -480,7 +480,7 @@ def test_whitelisted_cities_pass_hard_drop():
     """杭州/上海/深圳都在投递池范围内；名单外的城市才剔除。"""
     for city in ("杭州", "上海", "深圳"):
         assert E.hard_drop(row(city=city)) == "", city
-    assert P.city_score("杭州") > P.city_score("上海") > P.city_score("成都")
+    assert P.city_score("杭州") == P.city_score("上海") == P.city_score("深圳") > P.city_score("成都")
 
 
 def test_anonymous_detected_by_field_then_name():

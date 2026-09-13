@@ -7,10 +7,12 @@ from collections import Counter
 from pathlib import Path
 
 from .analysis.classifier import classify, extract_skills
+from .analysis.market import connect_readonly
+from .analysis.decisions import safe_job_url
 
 
 def generate_html_report(database: str, output: str) -> Path:
-    conn = sqlite3.connect(database)
+    conn = connect_readonly(database)
     conn.row_factory = sqlite3.Row
     rows = list(conn.execute("SELECT * FROM jobs ORDER BY city, company_name, title"))
     conn.close()
@@ -27,6 +29,10 @@ def generate_html_report(database: str, output: str) -> Path:
             f"<tr><td>{html.escape(k)}</td><td>{v}</td></tr>" for k, v in counter.most_common(limit)
         )
 
+    def job_link(value: str) -> str:
+        url = safe_job_url(value)
+        return f"<a href='{html.escape(url)}' rel='noopener noreferrer'>原链接</a>" if url else "链接不可用"
+
     rows_html = "".join(
         "<tr>"
         f"<td>{html.escape(row['city'])}</td>"
@@ -35,7 +41,7 @@ def generate_html_report(database: str, output: str) -> Path:
         f"<td>{html.escape(row['salary_text'])}</td>"
         f"<td>{html.escape(row['experience'])}</td>"
         f"<td>{html.escape(row['education'])}</td>"
-        f"<td><a href='{html.escape(row['job_url'])}'>原链接</a></td>"
+        f"<td>{job_link(row['job_url'])}</td>"
         "</tr>"
         for row in rows[:500]
     )
@@ -49,7 +55,7 @@ th,td{{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}} th
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px}}
 .card{{border:1px solid #ddd;border-radius:10px;padding:16px}} .muted{{color:#666}}
 </style></head><body>
-<h1>杭州 / 深圳 / 上海 AI 岗位聚合报告</h1>
+<h1>本地岗位采样报告</h1>
 <p class='muted'>记录数：{len(rows)}。该报告反映采集时点的搜索结果样本，不代表平台完整库存。</p>
 <div class='grid'>
 <div class='card'><h2>城市岗位数</h2><table><tr><th>城市</th><th>岗位</th></tr>{list_items(city_counter)}</table></div>

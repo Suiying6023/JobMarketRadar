@@ -1,116 +1,78 @@
-# 杭州 AI/Agent 开发岗位多关键词采集，增量库版本。
-# 关键词按覆盖面重构：保留原有 6 个高产词 + AI算法工程师（跑题率 6%，可接受）。
-# 曾试过 RAG工程师/Prompt工程师/MCP开发，跑题率 20-26%（被平台推荐算法带进
-# 量化开发、鸿蒙开发等无关岗位），2026-07-30 实测后砍掉，不再使用。
+# 经验参考配置：预算、页深和关键词数不是平台安全界限。
+# reference 模式到线仅提示；enforce 模式才执行用户明确选择的限制。
+# 当前在线访问关闭，账号冻结由本地 access-policy.json 单独控制。
 platforms:
-  - boss
+- boss
 cities:
-  - name: 杭州
-    boss_code: "101210100"
+- name: 杭州
+  boss_code: '101210100'
 keywords:
-  # 2026-08-02 整合：去重叠。BOSS 搜索是模糊匹配，"AI应用开发"能覆盖原
-  # 大模型应用开发/AI应用工程师/LLM应用开发/AI开发工程师 四个高度重叠词的
-  # 公共结果，故合并为一个。Agent 向保留 AI Agent + 智能体开发 + Agent应用开发。
-  - AI Agent
-  - 智能体开发
-  - Agent应用开发
-  - AI应用开发
-  - AI算法工程师
-  # 全栈/后端是开发向细分，有量且低跑跑；多模态已删（易带CV算法跑题）。
-  # AIGC 2026-08-03 已删：JD 提及虽多但词太宽，带出大量纯设计/内容岗（美工/AIGC导演）。
-  - AI全栈工程师
-  - AI后端工程师
-  # 2026-08-05 内容词/技术栈词试验（BOSS 可搜 JD 内容）：
-  # langgraph 60条/67%对口、opencode 42条/83%、python 60条/77%、RAG/向量数据库/PyTorch
-  # 由库内 tech_req 高频词选定。宽泛词（python/RAG）跑题靠 GLM match + active/sample 分层过滤。
-  - langgraph
-  - opencode
-  - python
-  - RAG
-  - 向量数据库
-  - PyTorch
+- AI Agent
+- 智能体开发
+- Agent应用开发
+- AI应用开发
+- AI算法工程师
+- AI全栈工程师
+- AI后端工程师
+- langgraph
+- opencode
+- python
+- RAG
+- 向量数据库
+- PyTorch
 pages_per_query: 5
 detail_limit_per_query: 150
 page_size: 30
 collect_details: true
-request_delay_seconds: [6, 12]
-# 详情接口节流。
-# ⚠️ 2026-08-10 重标定（`scripts/calibrate_quota.py`，43 条样本，3 轮）。
-# 此前所有数字都是在 fetch header bug 下测的（等于不带任何自定义头的裸配额），
-# 带上正确的 zp_token + x-requested-with 后重测，结论**推翻了旧的时间制假设**：
-#
-#   间隔 10-14s : 12 条, code37 0 次
-#   间隔  7-10s : 12 条, code37 3 次  (25%)
-#   间隔   5-7s : 11 条, code37 2 次  (18%)
-#   间隔 3.5-5s :  8 条, code37 1 次  (12%)
-#
-# code=37 出现位置三轮完全一致（第 5-6、9-10、14-15 条），相邻间距
-# [6,5,6,6,4,5] 平均 5.3 条 —— **是每约 5 条一次的 cookie 配额窗口，
-# 与条内间隔无关**。最快档比中间档 code37 更少，纯属位置巧合。
-# 推论：拉长条内延迟并不减少 code=37，只是等更久。旧的 [8,12] 是按"时间制"
-# 假设配的，属于纯浪费吞吐。降到 [4,6]：同样约每 5 条一次 code=37
-# （每次重算约 10s 即恢复，非硬风控），吞吐约翻倍。
-# 真正的安全线是**单日累计请求量**（封禁按累计量+信任度算），由 request_log
-# 账本跨进程执行，不靠条内间隔。
-detail_delay_seconds: [4, 6]
+request_delay_seconds:
+- 6
+- 12
+detail_delay_seconds:
+- 4
+- 6
 max_requests_per_run: 250
-# 节流参数（2026-08-10 从 throttle.py 默认值搬到配置，按账号信任度调档不用改代码）。
-# burst 是连续 N 条后额外冷却，打破"稳定高速"的机器特征（惩罚叠加在常规延迟之上）。
-#
-# ⚠️ detail_cooldown 2026-08-10 标定后从 [900,1500]（15-25 分钟）降到 [90,150]。
-# 旧值的前提是"配额窗口要等很久才恢复"，但标定确认 code=37 触发后走
-# security-check 重算约 10s 即完整重置窗口（三轮各 2-3 次，全部一次成功），
-# 根本不需要等冷却。等 25 分钟不换来任何安全收益，只是把一轮 150 条从
-# 40 分钟拖到 12 小时——反而因为会话拉长、需要更多次页面保鲜而更可疑。
-# 保留 1.5-2.5 分钟量级作为"批间喘息"（拟人化，非配额需要）。
 detail_batch: 5
-detail_cooldown_seconds: [90, 150]
+detail_cooldown_seconds:
+- 90
+- 150
 burst_threshold: 8
-burst_penalty_seconds: [60, 120]
+burst_penalty_seconds:
+- 60
+- 120
 filters:
-  # 2026-08-01 数据源筛选（用户手动在搜索页点选确认，码从 URL 实测）：
-  # - jobType 全职（1901）；degree 本科及以下（209,208,206,202,203）
-  # - experience 应届生+经验不限+1年以内+1-3年（102,101,103,104）
-  # 薪资待遇 BOSS 单选，暂不启用（需要时改为 salary: "10-20K" 单值）。
-  - jobType: 全职
-    degree: "初中及以下,中专/中技,高中,大专,本科"
-    experience: "应届生,经验不限,1年以内,1-3年"
+- jobType: 全职
+  degree: 初中及以下,中专/中技,高中,大专,本科
+  experience: 应届生,经验不限,1年以内,1-3年
 exclude_title_keywords:
-  - 销售
-  - 主播
-  - 客服
-  - 电话
-  - 实习
-  # 2026-08-04 抽查发现：标题直接标外包/外派/驻场的外包岗
-  - 外包
-  - 外派
-  - 驻场
-  # 2026-08-05 用户确认：AIGC 岗位不要（易带内容/设计/运营跑题）
-  - AIGC
+- 销售
+- 主播
+- 客服
+- 电话
+- 实习
+- 外包
+- 外派
+- 驻场
+- AIGC
 exclude_company_keywords:
-  - 猎头
-  - 劳务派遣
-  # 2026-08-03 确认的 IT/人力外包服务公司，采集时命中即标 sample（不进投递池）
-  - 外企德科
-  - 万宝盛华
-  - 软通动力
-  - 博彦科技
-  - 易宝软件
-  - 紫光云数
-  - 中软国际
-  - 文思海辉
-  - 中电金信
-  - 法本信息
-  - 东软
-  - 凯捷
-  - 勇冠睿智
+- 猎头
+- 劳务派遣
+- 外企德科
+- 万宝盛华
+- 软通动力
+- 博彦科技
+- 易宝软件
+- 紫光云数
+- 中软国际
+- 文思海辉
+- 中电金信
+- 法本信息
+- 东软
+- 凯捷
+- 勇冠睿智
 database_path: data/hangzhou_agent.sqlite3
 raw_dir: data/raw
 output_dir: output
 browser:
-  # 2026-08-01 改：persistent 模式用 patchright 直接启动 Chrome（不连调试端口，
-  # 规避 BOSS 端口扫描 + Runtime.enable 检测），复用 .browser-profile 登录态。
-  # 旧 cdp 模式保留兼容但会触发刷新循环。
   mode: persistent
   user_data_dir: .browser-profile
   channel: chrome
@@ -121,3 +83,7 @@ auto_chat:
   enabled: false
   dry_run: true
   require_manual_confirm: true
+network_enabled: false
+budget_mode: reference
+max_page_number: 10
+max_keywords_per_run: 3

@@ -146,7 +146,11 @@ async def main() -> None:
         eligible = []
         skipped: dict[str, int] = {}
         for r in candidates:
-            demote, why = should_demote(r)
+            if cfg.candidate is not None:
+                from job_radar.candidate import passes_list_facts
+                demote, why = not passes_list_facts(dict(r), cfg.candidate), "配置画像"
+            else:
+                demote, why = should_demote(r)
             if demote:
                 key = why.split("(")[0].split("[")[0]
                 skipped[key] = skipped.get(key, 0) + 1
@@ -177,7 +181,6 @@ async def main() -> None:
         collector.ledger = store
         collector.ledger_script = "backfill_details"
         print(f"今日账本：{store.request_counts()}")
-        await collector.start()
         # 页面停在 about:blank 时 _settle_on_origin 会卡住，先导航到搜索页建立
         # zhipin 域环境（详情接口的同源 fetch 依赖页面已在 zhipin 域）。
         first_city = cfg.cities[0]
@@ -185,7 +188,12 @@ async def main() -> None:
         nav_params = collector._params(first_city, cfg.keywords[0], first_filter, 1)
         nav_visible = {k: v for k, v in nav_params.items() if k not in ("pageSize", "scene")}
         from urllib.parse import urlencode as _urlencode
-        await collector._goto_search(f"{SEARCH_BASE}?{_urlencode(nav_visible)}")
+        try:
+            await collector.start()
+            await collector._goto_search(f"{SEARCH_BASE}?{_urlencode(nav_visible)}")
+        except Exception:
+            await collector.close()
+            raise
         print(f"已导航到搜索页: {collector.page.url[:80]}")
         done = 0
         failed = 0
@@ -247,7 +255,11 @@ async def main() -> None:
                         # 已被别的进程补过，别重复花配额
                         stale_skipped["已有JD"] = stale_skipped.get("已有JD", 0) + 1
                         continue
-                    demote, why = should_demote(fresh)
+                    if cfg.candidate is not None:
+                        from job_radar.candidate import passes_list_facts
+                        demote, why = not passes_list_facts(dict(fresh), cfg.candidate), "配置画像"
+                    else:
+                        demote, why = should_demote(fresh)
                     if demote:
                         key = why.split("(")[0].split("[")[0]
                         stale_skipped[key] = stale_skipped.get(key, 0) + 1
@@ -266,6 +278,9 @@ async def main() -> None:
                         job.job_invalid = True
                         store.upsert(job)
                         print(f"[下架] {job.title} | {job.company_name}")
+                    elif "code=35" in str(exc) or "IP地址存在异常" in str(exc):
+                        print(f"[IP频控] 命中 code=35 IP 临时限频，拟人等待 15s 后重试下一条: {exc}")
+                        await asyncio.sleep(15.0)
                     else:
                         print(f"[跳过] {job.title} | {job.company_name}: {exc}")
                     continue
@@ -291,9 +306,9 @@ async def main() -> None:
             else:
                 print("!" * 68, flush=True)
                 print(f"[RISK-STOP] 命中风控，已停止：{msg}", flush=True)
-                print("[RISK-STOP] 若是 code=36/32，需要人工过验证："
-                      "uv run python scripts/check_account_status.py", flush=True)
+                print("[RISK-STOP] 已保留本地暂停状态，请人工核对平台提示；本程序不会自动重试。", flush=True)
                 print("!" * 68, flush=True)
+            raise SystemExit(2) from exc
         finally:
             print(f"完成 {done} 条，失败 {failed} 条，共发起请求 {collector.request_count} 次，code=37 重算 {collector.code37_count} 次")
             if stale_skipped:

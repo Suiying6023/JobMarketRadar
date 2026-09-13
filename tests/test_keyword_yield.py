@@ -69,10 +69,8 @@ def test_keyword_absent_from_config_is_not_labelled_disabled_wrongly():
     assert v == "未启用"
 
 
-def test_default_config_covers_the_expanded_keyword_set():
-    """默认配置不能再写死 13 词的 hangzhou——否则 14 个新词全被误标"未启用"，
-    其中 `后端开发工程师` 是全库最强的词（命中率 76.7%、独占画像内 177）。"""
-    kws = mod.current_keywords("config.steady.yaml")
-    assert "后端开发工程师" in kws
-    assert "Python开发工程师" in kws
-    assert len(kws) > 13
+def test_keyword_set_comes_from_the_selected_config(tmp_path):
+    """配置选择是输入，测试不依赖用户的私有关键词档。"""
+    path = tmp_path / "custom.yaml"
+    path.write_text("cities:\n  - name: 杭州\nkeywords:\n  - 自定义岗位\n  - Python开发工程师\n", encoding="utf-8")
+    assert mod.current_keywords(str(path)) == {"自定义岗位", "Python开发工程师"}

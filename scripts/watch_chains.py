@@ -343,4 +343,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from _online_guard import guard
+    guard()
     main()

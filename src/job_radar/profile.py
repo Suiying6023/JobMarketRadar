@@ -22,8 +22,20 @@ COHORT_YEAR = 2026          # 用户毕业届；标题含更晚届数（27届+�
 #   set JOB_RADAR_CITIES=*              # 不限城市
 #   set JOB_RADAR_CITIES=杭州,上海,深圳,苏州
 import os as _os
+from pathlib import Path as _Path
 
 _env_cities = (_os.environ.get("JOB_RADAR_CITIES") or "").strip()
+if not _env_cities:
+    _dotenv_path = _Path(__file__).resolve().parents[2] / ".env"
+    if _dotenv_path.exists():
+        try:
+            for _line in _dotenv_path.read_text(encoding="utf-8").splitlines():
+                if _line.strip().startswith("JOB_RADAR_CITIES="):
+                    _env_cities = _line.strip().split("=", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
 if _env_cities == "*":
     CITY_WHITELIST: set[str] | None = None      # None = 不限城市（全国）
 elif _env_cities:
@@ -31,9 +43,9 @@ elif _env_cities:
 else:
     CITY_WHITELIST = {"杭州", "上海", "深圳"}
 
-# 池内排序偏好：同等条件下这些城市优先展示（杭州本地 > 长三角 > 其他）。
+# 池内排序偏好：杭州、上海、深圳同等优先。
 # 与白名单是两件事——白名单决定「能不能进池」，这里决定「排多前」。
-CITY_PREFERENCE = {"杭州": 1.0, "上海": 0.6, "深圳": 0.5}
+CITY_PREFERENCE = {"杭州": 1.0, "上海": 1.0, "深圳": 1.0}
 CITY_PREFERENCE_DEFAULT = 0.0
 
 

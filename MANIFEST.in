@@ -1,0 +1,13 @@
+include config.example.yaml config.yaml config.hangzhou.yaml config.smoke.yaml
+include uv.lock SOURCES.md
+recursive-include src/job_radar/web *.html *.css *.js
+recursive-include tests *.py *.json
+recursive-include scripts *.py *.md *.ps1
+recursive-include docs *.md
+prune scripts/_archive
+prune data
+prune output
+prune work
+prune .browser-profile
+prune .browser-profile-reg
+global-exclude __pycache__ *.pyc .env *.sqlite3 *.local.yaml

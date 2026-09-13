@@ -1,99 +1,35 @@
-# Job Market Radar
+# JobMarketRadar
 
-自用的 BOSS 直聘岗位采集与筛选工具。抓岗位列表和详情入本地 SQLite，用 LLM 读 JD
-判断岗位是否够得着，导出成一个可浏览的投递池页面。
+本地招聘数据工作台：先分析全国采样池，再用可调整的求职画像生成岗位复核队列。
 
-**这是一套由人（或 LLM）调控的工具集，不是一键跑完的流水线。** 脚本负责执行，
-策略（跑多快、跑哪些、越过配额怎么办）一律通过启动参数表达。日常操作看
-[`scripts/README.md`](scripts/README.md)，那里有全部脚本的索引和两条链路的对照。
+- 全国整库的城市、行业、薪资、经验与技能统计，明确显示分母和采样偏差。
+- 岗位搜索、原文阅读、可解释的复核排序，以及单独保存的收藏、已投和备注。
+- 关键词覆盖、独有覆盖、翻页配置与候选画像编辑；配置校验、冲突检测和版本备份。
+- 经验参考线默认只提示，可显式选择强制执行；两种方式都不代表平台安全额度。
+- 持久暂停、请求记账和故障停止；默认离线，保存配置不会启动浏览器或采集。
+- 原 SQLite 只读分析；原始数据、账号状态、个人配置和浏览器会话留在本机。
 
-## 安装
+## 运行
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-```
-
-依赖以 `pyproject.toml` 为准。其中 **`patchright` 必装**——它是 playwright 的反检测
-分支，`collectors/boss.py` 直接 import 它，缺了会在 import 阶段就 `ModuleNotFoundError`。
-
-浏览器用**系统装的 Chrome**（配置里 `channel: chrome`），不需要
-`playwright install chromium`。
-
-本机环境由 `uv` 管理，命令前缀是 `uv run`：
+Python 3.11+。使用 uv：
 
 ```powershell
-uv run python scripts/<脚本>.py --help
+uv sync --extra dev
+
+# 用合成数据体验（不会联网，不含真实岗位）
+uv run job-radar demo --directory demo
+uv run job-radar serve --config demo/config.local.yaml
 ```
 
-## 快速开始
-
-复制 `config.example.yaml` 改成自己的城市与关键词，然后：
+打开 `http://127.0.0.1:8765/`。已有数据库时：
 
 ```powershell
-uv run job-radar doctor  --config config.yaml   # 校验配置
-uv run job-radar collect --config config.yaml   # 采集入库
-uv run job-radar summary --config config.yaml   # 看统计
-uv run job-radar export  --config config.yaml   # 导出 CSV/JSON
-uv run job-radar report  --config config.yaml   # 生成 HTML 报告
+uv run job-radar init --config config.local.yaml --database data/jobs.sqlite3
+uv run job-radar serve --config config.local.yaml
+uv run job-radar analyze --config config.local.yaml --output output/market-analysis.json
+uv run job-radar db-backup --config config.local.yaml --destination data/backups/jobs-copy.sqlite3
 ```
 
-首次 `collect` 会打开 Chrome 并复用 `.browser-profile` 里的登录态，需要先在那个
-profile 里登录一次。输出落在 `data/`（SQLite）和 `output/`（CSV/JSON/HTML）。
+`init` 仅创建配置，不抓取数据；数据库应为本项目的 SQLite schema。相对数据库路径在工作台中按配置文件所在目录解析。
 
-## 两条采集链路
-
-这两条链路的端点、登录态、出口 IP、风控主体**各自独立**，日线也各算各的。
-混用脚本或合并计数会得出错误结论。
-
-| | 采集链路 | 状态刷新链路 |
-|---|---|---|
-| 抓什么 | 岗位列表 + JD 详情 | 岗位是否关闭、招聘者活跃度 |
-| 端点 | `/wapi/zpgeek/*.json` | `job_detail/*.html` |
-| 登录态 | **带账号 cookie** | **必须免登录** |
-| 出口 | 本机家宽 | Bohrium SOCKS 跳板 |
-| 账本 `kind` | `list` / `detail` / `security_check` | `detail_page` |
-
-**账号只在本机跑，不要带着登录态走跳板 IP**——那等于用陌生 IP 操作主账号。
-两条链路的脚本都有守卫会拒绝这种组合。
-
-## 配置档
-
-`config.*.yaml` 是同一套结构的不同强度档，按需选，**不要改代码**：
-`hangzhou`（最保守）、`steady`（日常）、`cities3`（三城扩量）、
-`aggressive`（仅边界探测，明知会触发风控）、`trial` / `smoke`（试跑 / 冒烟）。
-
-各档的日线、节奏、关键词数见 [`scripts/README.md` 的配置档强度表](scripts/README.md#配置档强度)
-—— **那是唯一一份**，这里不复制，免得两处各自漂移。
-
-## 安全与自动化边界
-
-- **自动开聊默认关闭**，需要显式开启并二次确认才会发出真实消息。
-- 遇到平台验证或风控提示**立即停止，不重试**。
-- 撞上人工验证时默认**不弹**浏览器窗口，只在显式加 `--verify` 时弹——
-  没人在场的窗口零产出，还占着出口。
-- 浏览器窗口默认落在主屏之外以免抢焦点。**坐标必须为正**：负坐标会被平台的挑战
-  脚本判为异常环境，请求被推去登录页，那种窗口人是点不动的。
-
-## 结构
-
-```text
-src/job_radar/
-├── collectors/       平台适配器（boss.py 是采集主体，browser.py 管浏览器会话）
-├── analysis/         岗位分类与技能抽取
-├── profile.py        ★ 所有筛选阈值、名单、评分权重的单一真源
-├── refresh_fetch.py  状态刷新链路的取值判据与成本常量
-├── models.py         配置与数据模型（pydantic）
-├── storage.py        SQLite 读写、字段保护语义、请求账本
-├── normalization.py  文案→结构化（活跃度、薪资、学历）
-├── runner.py         采集编排
-├── report.py         HTML 报告
-└── cli.py            命令行入口
-
-scripts/              可复用工具集，见 scripts/README.md
-tests/                回归测试，钉住实测校准出来的判据
-data/calibration/     实测原始数据（探针产出）
-```
-
-改筛选阈值只改 `profile.py`；改节奏与配额只改 config 或启动参数。
+[操作与配置](docs/OPERATIONS.md) · [数据口径](docs/DATA_MODEL.md) · [脚本索引](scripts/README.md)

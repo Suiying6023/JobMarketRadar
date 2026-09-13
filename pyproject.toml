@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "job-market-radar"
-version = "0.1.0"
-description = "国内 AI 岗位聚合、筛选与可选自动开聊的本地工具"
+version = "0.2.0"
+description = "本地招聘数据分析、配置和岗位复核工作台"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -27,6 +27,9 @@ job-radar = "job_radar.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+job_radar = ["web/*.html", "web/*.css", "web/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

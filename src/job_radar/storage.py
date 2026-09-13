@@ -95,12 +95,12 @@ CREATE TABLE IF NOT EXISTS collection_runs (
     stats_json TEXT NOT NULL DEFAULT '{}'
 );
 
--- 请求账本（2026-08-10 加）。封禁是**累计量制**（同 IP 累计请求量 + 账号信任度），
--- 不是频率制——所以「单日 ≤N 次」这条安全线必须跨进程累计才有意义。
+-- 请求账本用于本地计划与审计，不是平台的官方额度或风控机制说明。
+-- 历史采样不足以证明任何频率、累计量或延迟值能保证账号安全。
 -- 原先只有 collection_runs 表且 record_run() 零调用，实查 0 行，等于没有账本：
 -- expand_list / backfill_details / backfill_activity 各跑各的，谁也不知道今天
 -- 一共发了多少请求，"今天已经很克制了"完全是凭感觉。
--- 一行 = 一次真实 HTTP 请求，kind 区分 list/detail/security_check（三者风险不同）。
+-- 一行 = 一次业务尝试，kind 区分 list/detail/security_check；不含整页资源总数。
 -- ⚠️ 两条链路都写这张表，但**各有独立日线**：采集链路（list/detail/security_check，
 -- 带账号 cookie + 家宽 IP）由 `max_requests_per_day` 卡，口径见
 -- `JobStore.COLLECT_KINDS`；状态刷新链路（detail_page，免登录 + 波尔机房 IP）
@@ -170,6 +170,94 @@ CREATE INDEX IF NOT EXISTS idx_request_log_day ON request_log(day, kind);
 """
 
 
+class BudgetExceeded(RuntimeError):
+    """严格日线到顶：额度**没有**预留成功，这次请求绝不能发出去。
+
+    ⚠️ 与「账本读不出来」区分：那是观测失败，这是预算用尽。两者都不许发请求，
+    但处置不同 —— 前者要查库/查锁，后者等次日或调档。
+    """
+
+
+def current_local_day() -> str:
+    """账本的「今天」= **本地日历日**。
+
+    平台给的解封时刻按北京时间，用 UTC 会让早上 8 点前的「今天」错位到前一天，
+    把昨天的额度算进今天（`log_request` 与 `request_counts` 都按这个口径）。
+    """
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def budget_scope(kind: str) -> tuple[str, ...]:
+    """某类请求受哪一条日线约束。
+
+    采集链路（`JobStore.COLLECT_KINDS`：list/detail/security_check/recommend）
+    共用一条线，因为它们同账号、同出口、同风控主体；
+    其余 kind（如 `detail_page`）各算各的 —— 两条链路既不同登录态也不同 IP，
+    合并计数只会让彼此凭空少掉额度。
+    """
+    if kind in JobStore.COLLECT_KINDS:
+        return tuple(sorted(JobStore.COLLECT_KINDS))
+    return (kind,)
+
+
+def reserve_request_on(conn: sqlite3.Connection, kind: str, daily_cap: int | None,
+                       script: str = "", note: str = "") -> int:
+    """在**一个事务里**统计并预留一次请求额度，返回预留行 id。
+
+    为什么必须是 `BEGIN IMMEDIATE` 而不是「先 SELECT 再 INSERT」：
+    三个脚本各跑各的进程（也有同机并行的时候），先读后写在并发下会双花 ——
+    两个进程都看到 used=cap-1，然后各插一行。IMMEDIATE 先把写锁拿到手，
+    读与写在同一个事务里，跨进程不会超额。
+    ⚠️ 调用点必须在**请求发出之前**；预留失败（BudgetExceeded）时一个字节都不许发。
+    ⚠️ 一行 = 一次**业务尝试**，不是真实 HTTP 资源总数：stoken 重算/挑战页子资源
+    不在这里逐条计数（口径说明见 `REQ_PER_DETAIL` 与 `REQ_PER_RECOVER`）。
+    """
+    if daily_cap is not None and daily_cap <= 0:
+        raise ValueError(f"daily_cap 必须是正数或 None（None=本次不设线），收到 {daily_cap!r}")
+    scope = budget_scope(kind)
+    marks = ",".join("?" * len(scope))
+    now = datetime.now().astimezone()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        used = int(cur.execute(
+            f"SELECT COUNT(*) FROM request_log WHERE day = ? AND kind IN ({marks})",
+            (current_local_day(), *scope)).fetchone()[0])
+        if daily_cap is not None and used >= daily_cap:
+            conn.rollback()
+            raise BudgetExceeded(
+                f"今日累计请求已达 {used}/{daily_cap}（{kind} 口径，跨进程账本预留），"
+                f"额度未预留，请求不发出，主动停止")
+        cur.execute(
+            "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"),
+             kind, "pending", None, script, note))
+        rowid = int(cur.lastrowid or 0)
+        conn.commit()
+        return rowid
+    except BaseException:
+        if conn.in_transaction:      # BudgetExceeded 分支已 rollback，这里兜其他异常
+            conn.rollback()
+        raise
+
+
+def mark_outcome_on(conn: sqlite3.Connection, rowid: int | None,
+                    outcome: str, code: int | None = None) -> bool:
+    """回填**自己预留的那一行**的最终结果，返回是否命中。
+
+    ⚠️ 不能用 `WHERE id = (SELECT MAX(id))`：并发下（补详情 + 刷新 + 另一个采集进程）
+    最后一行很可能是别人的，风控结论会写到无关请求上 —— 真封禁因此可能被记成 ok。
+    """
+    if not rowid:
+        return False
+    cur = conn.execute(
+        "UPDATE request_log SET outcome = ?, code = ? WHERE id = ?",
+        (outcome, code, int(rowid)))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 class JobStore:
     # 列名 -> (SQLite 类型声明, 用于 ALTER TABLE 的默认值表达式)。
     # CREATE TABLE IF NOT EXISTS 不会给已存在的旧库补列，所以老库（比如上次
@@ -200,8 +288,15 @@ class JobStore:
         ("company_reg_updated_at", "TEXT NOT NULL DEFAULT ''", "''"),
     )
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
         self.path = Path(path)
+        if read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"数据库不存在：{self.path}")
+            self.conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA query_only=ON")
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # timeout=30：采集（补详情）常与刷新链路、标签重打并行跑，
         # 三方写同一个库。库是 WAL（写者排队而非直接失败），但默认 5s 的
@@ -468,15 +563,19 @@ class JobStore:
         code: int | None = None,
         script: str = "",
         note: str = "",
-    ) -> None:
-        """记一次真实 HTTP 请求。kind: list / detail / security_check。
+    ) -> int:
+        """记一次业务请求尝试，返回行 id（便于事后回填 outcome）。
 
         `day` 用**本地日历日**而不是 UTC：封禁的自动解锁时间是按平台所在时区
         （北京时间）给的，用 UTC 会让"今天"在早上 8 点前错位到前一天，
         把昨天的额度算进今天。
+
+        ⚠️ 这个方法**不参与日线执行**（它是"先记账再发请求"，读与写不在同一事务里，
+        并发下会双花）。严格的日线执行点是 `reserve_request()`；本方法留着是给
+        刷新链路按摊薄系数批量记账、以及测试直接构造账本用的。
         """
         now = datetime.now().astimezone()
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -490,6 +589,27 @@ class JobStore:
             ),
         )
         self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def reserve_request(self, kind: str, daily_cap: int | None,
+                        script: str = "", note: str = "") -> int:
+        """严格日线：同一事务里统计 + 预留一行，返回行 id。**发请求之前必须调用**。
+
+        与 `log_request` 的区别就是这个方法**会在超额时抛 BudgetExceeded**，
+        所以它是唯一能保证"跨进程不超额"的入口（`BEGIN IMMEDIATE` 见模块级实现）。
+        调用方的动作是：拿到 BudgetExceeded → 停止，不降速、不重试、不换 kind 绕过。
+        """
+        if self.conn.in_transaction:
+            # 调用方留了未提交的事务；BEGIN IMMEDIATE 会直接报 "cannot start a
+            # transaction within a transaction"。账本行是"请求已经花掉"的记录，
+            # 先落盘比冒着手工事务边界出错更安全。
+            self.conn.commit()
+        return reserve_request_on(self.conn, kind, daily_cap, script=script, note=note)
+
+    def mark_outcome(self, rowid: int | None, outcome: str,
+                     code: int | None = None) -> bool:
+        """回填预留行的最终结果（只改自己那一行，见模块级 `mark_outcome_on`）。"""
+        return mark_outcome_on(self.conn, rowid, outcome, code)
 
     #: 采集链路的 kind（带账号 cookie、走本机家宽、打 /wapi JSON 接口）。
     #: `total` 只累计这些——它是 `max_requests_per_day` 的执行口径。

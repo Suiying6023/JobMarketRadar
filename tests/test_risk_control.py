@@ -8,6 +8,7 @@ import pytest
 from job_radar.collectors import boss as boss_module
 from job_radar.collectors.boss import ORIGIN, BossCollector, RiskControlStop
 from job_radar.models import CollectionConfig
+from tests.fakes import configure_offline_collector
 
 
 @pytest.fixture(autouse=True)
@@ -69,11 +70,12 @@ def make_collector(page: FakePage, **overrides) -> BossCollector:
     payload = {
         "cities": [{"name": "杭州", "boss_code": "101210100"}],
         "keywords": ["AI Agent"],
+        "budget_mode": "enforce",
         **overrides,
     }
     collector = BossCollector(CollectionConfig.model_validate(payload))
     collector.page = page  # type: ignore[assignment]
-    return collector
+    return configure_offline_collector(collector)
 
 
 def test_fetch_uses_absolute_url():
@@ -139,6 +141,23 @@ def test_ordinary_api_error_is_not_a_risk_stop():
     with pytest.raises(RuntimeError) as excinfo:
         asyncio.run(collector._same_origin_fetch("/x"))
     assert not isinstance(excinfo.value, RiskControlStop)
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_non_json_http_restriction_still_stops(status):
+    page = FakePage(status=status, raw_text="Forbidden")
+    collector = make_collector(page)
+    with pytest.raises(RiskControlStop):
+        asyncio.run(collector._same_origin_fetch("/x"))
+    assert collector.gate.read_state().mode == "paused"
+
+
+def test_collector_rejects_cross_origin_before_page_fetch():
+    page = FakePage()
+    collector = make_collector(page)
+    with pytest.raises(ValueError):
+        asyncio.run(collector._same_origin_fetch("https://example.invalid/collect"))
+    assert page.requested_urls == []
 
 
 class FlakyPage(FakePage):

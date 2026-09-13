@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .candidate import CandidateProfile, clean_terms
 
 
 class Platform(StrEnum):
@@ -33,6 +35,7 @@ BOSS_CITY_CODES = {
 
 
 class CityConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str
     boss_code: str | None = None
 
@@ -43,6 +46,7 @@ class CityConfig(BaseModel):
 
 
 class SearchFilters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     salary: str | None = None
     experience: str | None = None
     degree: str | None = None
@@ -54,6 +58,7 @@ class SearchFilters(BaseModel):
 
 
 class AutoChatPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     enabled: bool = False
     dry_run: bool = True
     require_manual_confirm: bool = True
@@ -72,6 +77,7 @@ class AutoChatPolicy(BaseModel):
 
 
 class BrowserConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     # ⚠️ 用 PERSISTENT，别用 CDP：BOSS 前端会扫调试端口并触发刷新循环。
     # CDP 保留只为兼容旧配置。
     mode: BrowserMode = BrowserMode.PERSISTENT
@@ -95,6 +101,13 @@ class BrowserConfig(BaseModel):
 
 
 class CollectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Online access is opt-in, additionally controlled by a persistent local hold.
+    network_enabled: bool = False
+    candidate: CandidateProfile | None = None
+    budget_mode: Literal["reference", "enforce"] = "reference"
+    max_page_number: int = Field(default=10, ge=1, le=30)
+    max_keywords_per_run: int = Field(default=3, ge=1, le=50)
     platforms: list[Platform] = Field(default_factory=lambda: [Platform.BOSS])
     cities: list[CityConfig]
     keywords: list[str]
@@ -173,6 +186,37 @@ class CollectionConfig(BaseModel):
     def pages_for(self, keyword: str) -> int:
         """该关键词本轮翻多少页。未单独配置的用 pages_per_query。"""
         return self.pages_per_keyword.get(keyword, self.pages_per_query)
+
+    @field_validator("keywords", "include_title_keywords", "exclude_title_keywords", "exclude_company_keywords")
+    @classmethod
+    def validate_terms(cls, values: list[str]) -> list[str]:
+        return clean_terms(values)
+
+    @field_validator("request_delay_seconds", "detail_delay_seconds", "detail_cooldown_seconds", "burst_penalty_seconds")
+    @classmethod
+    def validate_range(cls, value: tuple[float, float]) -> tuple[float, float]:
+        import math
+        if not all(math.isfinite(v) and 0 <= v <= 86400 for v in value) or value[0] > value[1]:
+            raise ValueError("等待区间必须为 0–86400 秒，且下限不大于上限")
+        return value
+
+    @model_validator(mode="after")
+    def validate_plan(self):
+        if not self.cities or not self.keywords or not self.platforms or not self.filters:
+            raise ValueError("城市、关键词、平台和筛选组合不能为空")
+        if len(self.keywords) > 200 or len(self.cities) > 200:
+            raise ValueError("城市或关键词数量不能超过 200")
+        if any(not c.name.strip() for c in self.cities):
+            raise ValueError("城市名称不能为空")
+        if len({c.name for c in self.cities}) != len(self.cities):
+            raise ValueError("城市不能重复")
+        import math
+        last = 0.0
+        for threshold, factor in self.over_quota_ladder:
+            if not math.isfinite(threshold) or not math.isfinite(factor) or threshold <= last or factor < 1:
+                raise ValueError("降速档位必须按阈值递增，倍数必须为大于等于 1 的有限数")
+            last = threshold
+        return self
 
 
 class JobRecord(BaseModel):

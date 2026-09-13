@@ -82,3 +82,19 @@ config.smoke.yaml
 proxies.*.txt
 HANDOFF.md
 job-market-radar-v*/
+
+# Local analysis, preferences, state and pending data batches
+batch_*.json
+config.national.yaml
+open_login.bat
+.config-history/
+*.local.yaml.lock
+*.tmp
+data/*-state.sqlite3*
+data/access-policy.json*
+data/*.lock
+work/
+resumes/
+demo/
+data/**/*.sqlite3*
+data/**/*.manifest.json

@@ -45,6 +45,23 @@ agreement-tip/resume-parser/smsSwitch…），读 JD 一个都不需要。
 
 ⚠️ 全程免登录。绝不要在弹出的验证窗口里登录 BOSS 账号——
    带账号 cookie 走跳板 IP 的风控风险远大于收益。
+
+## 在线入口状态（2026-09-13，封禁事故后）
+
+**本脚本的联网默认关闭**：不带 `--enable-online` 时，`main()` 在起浏览器之前
+就被访问策略闸门拦住（`AccessGate.require_online`），一个请求都不会发出。
+放行需要两个条件同时成立：命令行 `--enable-online` + `<库目录>/access-policy.json`
+里 `mode=ready`（人工 `release(confirmation)` 之后才会是 ready）。
+策略里的 `resume_after` 到期**不会**自动放行 —— 到期只是"最早可以人工解除"。
+
+为什么做成默认关，而不是"保留原来的自动恢复"：
+本链路的历史自动恢复（`warm_stoken` / 主动重暖 / 撞墙后换出口重算）是
+在被标记的出口上**再发导航去重算 stoken**。采集链路正是因为同一类动作
+（`boss._recover_code37`）在事故中被停用；而这条链路的恢复路径与 warm 细节
+深度耦合，改一半会留下一条"看着停了其实还在自动恢复"的隐路径 ——
+那比明说"这个入口先关着"危险得多。所以：**默认关，文档化，后续人工复核**
+（复核内容：出口是否干净、账号是否解封、自动重暖是否要保留，然后把结论写进
+访问策略再 `--enable-online` 跑一小批）。
 """
 from __future__ import annotations
 
@@ -71,6 +88,36 @@ from job_radar.refresh_fetch import (  # noqa: E402
     DEFAULT_WINDOW_POSITION, EXTRACT_JS, FETCH_WINDOW, REQ_PER_RECOVER,
     extract_args, is_closed_status, launch_args, quota_factor, same_job,
 )
+from job_radar.safety import AccessBlocked, AccessGate  # noqa: E402
+from job_radar.storage import BudgetExceeded, mark_outcome_on, reserve_request_on  # noqa: E402
+
+# 本次运行的严格日线（kind='detail_page'，由 main() 依据 --daily-cap 设置）。
+# `log_requests()` 用它做原子预留 —— 于是**所有** 9 个记账点自动受日线约束，
+# 不需要在每个调用点再判一次（少一处漏判就少一条越线路径）。
+# None = 未初始化（单测直接调用记账函数时），按"不设线"记，保持老行为。
+_DAILY_CAP: int | None = None
+
+
+def gate() -> AccessGate:
+    """访问策略闸门。状态文件固定为 <库目录>/access-policy.json。"""
+    return AccessGate(DB)
+
+
+def pause_gate(reason: str) -> None:
+    """把风控结论写进**持久**策略文件：重启之后仍然拦得住。
+
+    这是本链路唯一的跨进程熔断手段，所以**写不进去就不许继续跑**：
+    打印 `[SAFETY-FAIL]` 后直接 `SystemExit(2)` 停止本进程。
+    "写不进去就算了、先 break 出去"正是事故形态 —— 停了一次，重启又跑；
+    而策略锁被占用时更不能降级为无锁写（会与人工 release 交错，
+    把刚落地的冻结覆盖回 ready，见 `safety.AccessPolicyLocked`）。
+    """
+    try:
+        gate().pause(reason, source="refresh_status_loop")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SAFETY-FAIL] 访问策略未写入（{type(exc).__name__}: {exc}）；"
+              f"拒绝在无持久熔断的情况下继续，停止本进程。", flush=True)
+        raise SystemExit(2) from exc
 
 # 一条 fetch = 1 次请求。窗口耗尽后重算 stoken 约 3 次，窗口约 5 条 →
 # 摊薄 1.6 次/条。账本按**实际发生**记（fetch 记 1，重算记 3），
@@ -119,14 +166,38 @@ def log_requests(con: sqlite3.Connection, n: int, outcome: str = "ok",
     走波尔机房 IP，与采集链路（带账号 cookie、家宽直连）的风控主体完全不同。
     两侧各按自己的 kind 记账 —— 见 `used_today()` 与
     `JobStore.request_counts()` 的 `COLLECT_KINDS`。
+
+    ⚠️ **严格日线在这里执行**（`_DAILY_CAP` 由 main 设置）：每一条都先
+    `reserve_request_on()` 原子预留，预留不满就抛 BudgetExceeded。
+    这条改动专治"`--over-quota slow` 把日线当软线"：降速只影响节奏，
+    额度不会再因为跑得慢而凭空增加。
+    用 SystemExit(0) 而不是 return，是因为调用点有 9 处（含循环内部）——
+    预算到顶时**任何一处**都不能继续发请求，而"停下来"是全局决定。
+    退出码 0 + `[BUDGET-STOP]` 是既有的"正常预算行为"约定（无需人工介入）。
     """
-    now = datetime.now().astimezone()
-    con.executemany(
-        "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
-        "VALUES (?,?,?,?,?,?,?)",
-        [(now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"),
-          "detail_page", outcome, code, "refresh_status_loop", "")] * n)
-    con.commit()
+    if _DAILY_CAP is None:
+        # 未经过 main 初始化：按老行为记（测试/单次调用），不设线。
+        now = datetime.now().astimezone()
+        con.executemany(
+            "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [(now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"),
+              "detail_page", outcome, code, "refresh_status_loop", "")] * n)
+        con.commit()
+        return
+    rows: list[int] = []
+    try:
+        for _ in range(max(0, int(n))):
+            rows.append(reserve_request_on(con, "detail_page", _DAILY_CAP,
+                                           script="refresh_status_loop"))
+    except BudgetExceeded as exc:
+        for rid in rows:                      # 已预留的几行如实回填，不留 pending
+            mark_outcome_on(con, rid, outcome, code)
+        print(f"\n[BUDGET-STOP] {exc}", flush=True)
+        print("[BUDGET-STOP] 无需人工介入，明日额度重置后可续跑。", flush=True)
+        raise SystemExit(0) from exc
+    for rid in rows:
+        mark_outcome_on(con, rid, outcome, code)
 
 
 def used_today(con: sqlite3.Connection) -> int:
@@ -491,11 +562,31 @@ async def main() -> None:
                          "⚠️ 坐标必须为正——负坐标会被挑战 JS 判为异常环境。")
     _amort = REQ_PER_JOB + REQ_PER_RECOVER / FETCH_WINDOW
     ap.add_argument("--daily-cap", type=int, default=1000,
-                    help=f"单日累计 HTTP 请求上限（本链路独立账本，"
-                         f"kind='detail_page'）。一条摊薄约 {_amort:.1f} 次请求"
-                         f"（1 次 fetch + 每 {FETCH_WINDOW} 条一次 "
-                         f"{REQ_PER_RECOVER} 次重算），所以 1000 次约合 600 条")
+                    help="本地日参考线（业务尝试口径，不是平台安全额度）")
+    ap.add_argument("--budget-mode", choices=("reference", "enforce"), default="reference",
+                    help="reference=到线提示；enforce=执行明确的本地上限")
+    # 在线入口默认关闭：见文件头「在线入口状态」。加了它，这条链路才可能联网。
+    ap.add_argument("--enable-online", action="store_true",
+                    help="显式启用联网（默认关闭）。必须同时满足访问策略 "
+                         "mode=ready（<库目录>/access-policy.json），否则不启动浏览器")
     args = ap.parse_args()
+
+    global _DAILY_CAP
+    if args.daily_cap <= 0:
+        ap.error("--daily-cap 必须为正数")
+    _DAILY_CAP = args.daily_cap if args.budget_mode == "enforce" else None
+
+    # ⚠️ 联网前置检查必须在**起浏览器之前**：冻结期连窗口都不该出现
+    # （窗口一起来，前端自己就会发请求，那些请求不进任何账本）。
+    # 两个条件同时成立才放行：--enable-online 且策略文件 mode=ready。
+    # ⚠️ 策略里的 resume_after 到期**不会**自动放行 —— 必须人工 release。
+    try:
+        state = gate().require_online(args.enable_online)
+        print(f"[ACCESS] 访问策略 mode={state.mode}，已放行（{state.reason or '无备注'}）",
+              flush=True)
+    except AccessBlocked as exc:
+        print(f"[ACCESS-BLOCKED] {exc}", flush=True)
+        raise SystemExit(2) from exc
 
     # 解析降速档位。`--over-quota stop` 时传空表 → quota_factor 恒返回 1.0，
     # 不需要在每个使用点再判一次模式。
@@ -580,7 +671,7 @@ async def main() -> None:
     # 1000 这个数不是平台给的，是我们按「未触发封禁的那轮」反推的自设预算，
     # 所以"越线怎么办"是策略而不是事实 —— 交给调用方，代码两种都支持。
     # 真正的风控信号（挑战页连撞、出口 code=31）在两种模式下都立刻停。
-    if args.over_quota == "stop":
+    if args.budget_mode == "enforce":
         if affordable <= 0:
             print("[BUDGET-STOP] 今日请求额度已用尽，明天再跑。无需人工介入。")
             return
@@ -676,6 +767,7 @@ async def main() -> None:
                         usable.append((tag, port))
         if not usable:
             # 统一的可 grep 标记，长跑监控只认它（见 backfill_details 的同名标记）
+            pause_gate("刷新链路没有可用出口（被标记或隧道不通）")
             print("[RISK-STOP] 没有可用出口（出口被标记或隧道不通），退出。")
             await browser.close()
             return
@@ -760,7 +852,7 @@ async def main() -> None:
             # 沿用估值会让降速迟迟不触发。
             if i % 10 == 1:
                 now_used = used_today(con)
-                if args.over_quota == "stop" and now_used >= args.daily_cap:
+                if args.budget_mode == "enforce" and now_used >= args.daily_cap:
                     print(f"\n[BUDGET-STOP] 日线到顶：已用 {now_used}/"
                           f"{args.daily_cap}（实测 {now_used/max(i-1,1):.2f} 次/条，"
                           f"启动估值 {per_job_req:.2f}）。已处理 {i-1}/{len(rows)} 条，"
@@ -787,6 +879,7 @@ async def main() -> None:
                     print(f"[stoken] {cur_tag} 暖场失败，移出出口池", flush=True)
                     usable[:] = [(t, p) for t, p in usable if p != cur_port]
                     if not usable:
+                        pause_gate("刷新链路所有出口都不可用（暖场连续失败）")
                         print("[RISK-STOP] 所有出口都不可用，本轮停止。已处理的结果都已落库。")
                         break
                     ei += 1
@@ -956,6 +1049,7 @@ async def main() -> None:
                         print(f"{cur_tag} IP 已被硬封（见上面的解封时间），移出出口池",
                               flush=True)
                         if not usable:
+                            pause_gate("刷新链路所有出口都被硬封（IP 级 blocked）")
                             print("[RISK-STOP] 所有出口都不可用，本轮停止。已处理的结果都已落库。")
                             break
                         streak = 0
