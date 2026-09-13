@@ -72,7 +72,7 @@ async def run_collection(config: CollectionConfig) -> CollectionStats:
                 if hasattr(collector, "skip_detail_ids"):
                     collector.skip_detail_ids = store.detailed_ids()
                     console.print(f"[dim]已有详情 {len(collector.skip_detail_ids)} 条，本轮跳过其详情请求[/]")
-                # 注入请求账本：单日累计上限跨进程生效（封禁按累计量算，不是频率）
+                # 共享请求账本，跨进程记录业务请求与所选预算模式
                 if hasattr(collector, "ledger"):
                     collector.ledger = store
                     collector.ledger_script = "runner"

@@ -12,7 +12,6 @@ from urllib.parse import urlencode, urlsplit
 from patchright.async_api import BrowserContext, Page
 from patchright.async_api import Error as PlaywrightError
 
-from .. import profile
 from ..models import AutoChatPolicy, CityConfig, CollectionConfig, JobRecord, Platform, SearchFilters
 from ..normalization import (
     active_days_from_desc,
@@ -89,7 +88,11 @@ REQ_PER_RECOVER = 37
 
 
 class RiskControlStop(RuntimeError):
-    """命中平台风控。必须立刻停止整轮采集，不重试。"""
+    """A collection operation stopped by a local limit or platform response."""
+
+
+class PlatformRiskStop(RiskControlStop):
+    """An actual platform response that can require interactive verification."""
 
 
 # 浏览器对 DNS / 连接 / TLS 失败的统一报法。**与账号状态无关**，重试即可自愈。
@@ -217,6 +220,9 @@ class BossCollector(Collector):
 
     def _online_enabled(self) -> bool:
         """`CollectionConfig.network_enabled`，缺字段按**关闭**处理（默认拒绝）。"""
+        check = getattr(self, "online_check", None)
+        if check is not None:
+            return bool(check())
         return bool(getattr(self.config, "network_enabled", False))
 
     def _require_online(self) -> None:
@@ -281,9 +287,11 @@ class BossCollector(Collector):
 
     async def close(self) -> None:
         # 只关闭自己开的页签，不动用户原有的登录页。
-        if self.page and self.owns_page:
-            await self.page.close()
-        await self.browser_session.close()
+        try:
+            if self.page and self.owns_page:
+                await self.page.close()
+        finally:
+            await self.browser_session.close()
 
     async def _goto_search(self, url: str, attempts: int = 3) -> None:
         """打开搜索页。页面可能瞬时停在 about:blank，重试即可恢复。
@@ -295,6 +303,10 @@ class BossCollector(Collector):
         self._require_online()
         self._require_ledger_ready(check_budget=True)
         for attempt in range(1, attempts + 1):
+            pace = getattr(self, "pace", None)
+            if pace is not None:
+                await pace("list")
+            self._require_online()
             await self.page.goto(url, wait_until="domcontentloaded")
             await self.page.wait_for_timeout(random.randint(2500, 4000))
             if ORIGIN in (self.page.url or ""):
@@ -577,6 +589,10 @@ class BossCollector(Collector):
             self._require_online()
             # ② 账本检查 + 参考线/硬线（reference 只提示；enforce 到线即停）。
             self._require_ledger_ready(check_budget=True)
+            pace = getattr(self, "pace", None)
+            if pace is not None:
+                await pace(self._kind_of(url))
+                self._require_online()
             # ③ 原子记账（enforce 下同时预留硬线额度）。记账失败会在这里抛
             #    RiskControlStop —— 此时 page.evaluate 一次都没被调用过。
             rowid = self._reserve_request(url)
@@ -714,7 +730,7 @@ class BossCollector(Collector):
             try:
                 gate.pause(
                     f"{detail}（script={self.ledger_script or 'collector'}）",
-                    source=f"boss:{self.ledger_script or 'collector'}")
+                    source=getattr(self, "gate_source", f"boss:{self.ledger_script or 'collector'}"))
                 persisted = True
             except Exception as exc:  # noqa: BLE001 - 写盘失败必须显形但不掩盖风控
                 # 策略锁被占用 / 磁盘错误：**拒绝无锁写**（详见 AccessPolicyLocked）。
@@ -722,7 +738,7 @@ class BossCollector(Collector):
                 print(f"[SAFETY-FAIL] 访问策略未写入（{type(exc).__name__}: {exc}）；"
                       f"冻结未持久化，本进程停止，需人工确认账号状态。", flush=True)
         note = "" if persisted else "（访问策略未写入，见 [SAFETY-FAIL]）"
-        raise RiskControlStop(f"{detail}{note}")
+        raise PlatformRiskStop(f"{detail}{note}")
 
     async def _recover_code37(self, seed: str, name: str, ts: str) -> None:
         """**已停用**：自动 stoken 重算一律不执行。
@@ -797,71 +813,19 @@ class BossCollector(Collector):
         )
 
     def _should_keep(self, job: JobRecord) -> bool:
-        """列表阶段的准入判定 —— **这是唯一花不可退配额的一环**。
-
-        ⚠️ 判据必须与 `profile` 同源。原先只读 config 的 YAML 名单，而
-        `profile.py` 开头声称"各脚本一律 from job_radar.profile import"，
-        采集侧是唯一没收敛进来的一环，于是两份名单各自漂移：
-        实测 profile 有而 YAML 缺 `猎头`/`劳务派遣`（标题）、
-        `人力资源`/`华钦`/`新致软件`/`汉得`（公司）。
-
-        更贵的是**城市与薪资从不在这里判**，而它们在列表响应里就已知。
-        实测代价（2026-08-30）：3207 条注定被 clean_local_db 降级的岗位里，
-        **828 条已经花掉了详情配额**（超纲 596、匿名 112、公司 69、标题 30、
-        非目标城市 10）—— 一条详情就是一次不可退的请求。
-        超纲一项就占 596 条，而 `salary_min_k`/`salary_max_k` 全部来自列表。
-
-        YAML 名单保留为**追加**而非替代：配置可以按轮次临时加词，
-        但不能让它成为绕过 profile 基线的通道。
-        """
-        title = job.title.lower()
-        company = job.company_name.lower()
-        if self.config.candidate is not None:
+        """Apply explicit collection rules and optional configured candidate facts."""
+        title, company = job.title.casefold(), job.company_name.casefold()
+        if self.config.include_title_keywords and not any(word.casefold() in title for word in self.config.include_title_keywords):
+            return False
+        if any(word.casefold() in title for word in self.config.exclude_title_keywords):
+            return False
+        if any(word.casefold() in company for word in self.config.exclude_company_keywords):
+            return False
+        if self.config.service.candidate_filtering and self.config.candidate is not None:
             from ..candidate import passes_list_facts
-            if self.config.include_title_keywords and not any(word.lower() in title for word in self.config.include_title_keywords):
-                return False
-            if any(word.lower() in title for word in self.config.exclude_title_keywords):
-                return False
-            if any(word.lower() in company for word in self.config.exclude_company_keywords):
-                return False
             data = job.model_dump()
             data["anonymous"] = job.raw.get("anonymous", 0)
             return passes_list_facts(data, self.config.candidate)
-        if self.config.include_title_keywords and not any(
-            word.lower() in title for word in self.config.include_title_keywords
-        ):
-            return False
-        # profile 基线 + config 追加，两份都要过
-        if profile.match_keyword(job.title, profile.EXCLUDE_TITLE):
-            return False
-        if any(word.lower() in title for word in self.config.exclude_title_keywords):
-            return False
-        if profile.match_keyword(job.company_name, profile.EXCLUDE_COMPANY):
-            return False
-        if any(word.lower() in company for word in self.config.exclude_company_keywords):
-            return False
-        # OD 要按词边界判（裸子串会吃掉 Coding，见 profile.outsourced_od）
-        if profile.outsourced_od(job.title):
-            return False
-        # 届别错位：只能从标题识别，JD 正文里没有
-        if profile.future_cohort(job.title):
-            return False
-        # 匿名公司在列表阶段就能判（raw.anonymous），必须在这里拦：
-        # 标成 active 就会去抓详情，而投递前无法核实公司身份的岗位最终一定被
-        # clean_local_db 降级 —— 等于每条白花一次详情配额。
-        if profile.is_anonymous(job.raw, job.company_name):
-            return False
-        # 城市与薪资：列表响应里就已知，**前移到这里能省下最大一笔配额**
-        if not profile.city_allowed(job.city or ""):
-            return False
-        if profile.salary_out_of_range(job.salary_min_k, job.salary_max_k,
-                                      job.salary_months):
-            return False
-        # 日薪岗基本都是实习/日结，即使标题没写“实习”也按薪资口径排除。
-        if is_daily_rate(job.salary_text):
-            return False
-        if profile.is_daily_salary(job.salary_min_k, job.salary_max_k):
-            return False
         return bool(job.title and job.job_url)
 
     async def _collect_detail(self, job: JobRecord) -> JobRecord:
@@ -967,7 +931,8 @@ class BossCollector(Collector):
         # 乘在**条内延迟**上而不是只乘批间冷却：条内延迟是每条都走的路径，
         # 乘它才能真正把速率压下去。
         f = self.over_quota_factor()
-        await asyncio.sleep(gaussian(lo * f, hi * f))
+        if getattr(self, "pace", None) is None:
+            await asyncio.sleep(gaussian(lo * f, hi * f))
         return job
 
     async def _maybe_chat(self, job: JobRecord) -> str:

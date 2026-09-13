@@ -12,6 +12,17 @@ from .candidate import CandidateProfile
 from .config import load_config
 from .local_files import atomic_write, file_mutex
 from .models import CollectionConfig
+from .service_config import SECRET_PATHS, public_config
+
+APPLY_POLICY = {
+    "llm": "下一批次", "service.batch_size": "下一批次", "request_delay_seconds": "下一批次",
+    "detail_delay_seconds": "下一批次", "network_enabled": "下一次请求前检查",
+    "browser": "新任务", "refresh": "新任务", "keywords": "新任务", "cities": "新任务",
+    "filters": "新任务", "candidate": "保存后更新岗位复核；采集选行在新任务生效",
+    "service.candidate_filtering": "新任务", "service.event_retention": "新任务",
+    "budget_mode": "下一批次", "max_requests_per_run": "下一批次", "max_requests_per_day": "下一批次",
+    "database_path": "服务重启",
+}
 
 
 class RevisionConflict(ValueError):
@@ -53,20 +64,29 @@ class SettingsStore:
             cfg.candidate = CandidateProfile()
         return cfg, hashlib.sha256(raw).hexdigest()
 
-    def save(self, payload: dict, expected_revision: str) -> tuple[CollectionConfig, str]:
+    def save(self, payload: dict, expected_revision: str, clear_secrets: list[str] | None = None) -> tuple[CollectionConfig, str]:
         cfg = CollectionConfig.model_validate(payload)
+        allowed = {f"{group}.{key}" for group, key in SECRET_PATHS}
+        if not isinstance(clear_secrets or [], list) or set(clear_secrets or []) - allowed:
+            raise ValueError("密钥清除字段无效")
         with self._lock, file_mutex(self.path.with_name(self.path.name + ".lock")):
             current, revision = self.read()
             if not expected_revision or expected_revision != revision:
                 raise RevisionConflict("配置已被其他页面或程序修改，请重新载入后再保存")
-            if cfg.database_path != current.database_path or cfg.browser != current.browser:
-                raise ValueError("工作台不能改变数据库或浏览器路径；请在本机配置文件中修改后重启")
-            if cfg.network_enabled or cfg.auto_chat.enabled or not cfg.auto_chat.dry_run:
-                raise ValueError("工作台仅保存离线配置；在线访问与真实开聊不能在此启用")
+            if cfg.database_path != current.database_path:
+                raise ValueError("数据库位置在服务启动时确定，修改位置请重启服务")
+            if cfg.auto_chat.enabled or not cfg.auto_chat.dry_run:
+                raise ValueError("数据服务配置使用关闭的自动联系策略")
+            for group, key in SECRET_PATHS:
+                target = getattr(cfg, group)
+                if f"{group}.{key}" in (clear_secrets or []):
+                    setattr(target, key, "")
+                elif not getattr(target, key):
+                    setattr(target, key, getattr(getattr(current, group), key))
             history = self.path.parent / ".config-history"
             history.mkdir(exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             backup = history / f"{self.path.stem}-{stamp}-{revision[:10]}.yaml"
-            atomic_write(backup, self.path.read_text(encoding="utf-8-sig"))
+            atomic_write(backup, yaml.safe_dump(public_config(current), allow_unicode=True, sort_keys=False))
             atomic_write(self.path, yaml.safe_dump(cfg.model_dump(mode="json"), allow_unicode=True, sort_keys=False))
             return self.read()

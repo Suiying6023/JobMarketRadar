@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from urllib.request import urlopen
@@ -14,8 +13,12 @@ from .report import generate_html_report
 from .storage import JobStore
 
 
-app = typer.Typer(no_args_is_help=True, help="本地岗位数据分析、配置与求职复核工作台")
+app = typer.Typer(no_args_is_help=True, help="岗位数据服务：采集、存储、任务、配置与日志")
 console = Console()
+from .service_cli import tasks as task_commands, settings as config_commands, run_task
+app.add_typer(task_commands, name="task")
+app.add_typer(config_commands, name="config")
+app.command(name="run")(run_task)
 
 
 @app.command()
@@ -34,26 +37,19 @@ def doctor(config: str = "config.yaml") -> None:
             console.print(f"CDP 可用：{payload.get('Browser', 'Chromium')}" )
         except Exception as exc:
             console.print(f"[yellow]CDP 暂不可用：{exc}。请先运行独立浏览器启动脚本。[/]")
-    if cfg.auto_chat.enabled and not cfg.auto_chat.dry_run:
-        console.print("[bold yellow]警告：配置请求真实自动开聊；collect 仍要求额外传入 --allow-live-chat。[/]")
 
 
 @app.command()
 def collect(
     config: str = "config.yaml",
-    allow_live_chat: bool = typer.Option(False, "--allow-live-chat", help="允许执行真实开聊；不传时真实开聊配置会被拒绝"),
+    allow_live_chat: bool = typer.Option(False, "--allow-live-chat", hidden=True),
+    limit: int = 100,
+    dry_run: bool = False,
 ) -> None:
-    """运行采集任务。"""
-    cfg = load_config(config)
-    from .runner import run_collection
-    if cfg.auto_chat.enabled and not cfg.auto_chat.dry_run and not allow_live_chat:
-        raise typer.BadParameter(
-            "配置已启用真实自动开聊，但未传入 --allow-live-chat。请先使用 dry_run。"
-        )
-    stats = asyncio.run(run_collection(cfg))
-    console.print(stats.model_dump_json(indent=2))
-    if stats.stopped_reason:
-        raise typer.Exit(2)
+    """独立运行采集（与 run collect 共用任务核心）。"""
+    if allow_live_chat:
+        raise typer.BadParameter("数据服务任务处理岗位数据；联系动作使用独立流程")
+    run_task("collect", config, limit, dry_run)
 
 
 @app.command(name="init")
@@ -150,6 +146,8 @@ def export(
 ) -> None:
     """从 SQLite 导出 CSV 和 JSON。"""
     cfg = load_config(config)
+    from .settings import resolve_database
+    cfg.database_path = str(resolve_database(cfg, Path(config).resolve()))
     with JobStore(cfg.database_path, read_only=True) as store:
         console.print(f"CSV: {store.export_csv(csv_path)}")
         console.print(f"JSON: {store.export_json(json_path)}")
@@ -159,6 +157,8 @@ def export(
 def report(config: str = "config.yaml", output: str = "output/report.html") -> None:
     """生成本地 HTML 市场报告。"""
     cfg = load_config(config)
+    from .settings import resolve_database
+    cfg.database_path = str(resolve_database(cfg, Path(config).resolve()))
     path = generate_html_report(cfg.database_path, output)
     console.print(f"报告已生成: {path}")
 
@@ -167,6 +167,8 @@ def report(config: str = "config.yaml", output: str = "output/report.html") -> N
 def summary(config: str = "config.yaml") -> None:
     """显示城市汇总。"""
     cfg = load_config(config)
+    from .settings import resolve_database
+    cfg.database_path = str(resolve_database(cfg, Path(config).resolve()))
     with JobStore(cfg.database_path, read_only=True) as store:
         rows = store.city_summary()
     table = Table("城市", "岗位数", "公司数", "平均薪资中点(K)", "初级岗位", "本科可投")

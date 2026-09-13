@@ -72,6 +72,8 @@ data/targets_*.json
 # 风控响应正文可能含账号相关信息，不入库不上传
 data/risk_dumps/
 .browser-profile-reg/
+.browser-refresh/
+*.service.lock
 
 # Local run variants and probe pools (machine-specific, not for the public repo)
 config.aggressive.yaml
@@ -102,3 +104,11 @@ data/**/*.manifest.json
 # Local archives, handoffs, private research and organization records
 local/
 data/batches/
+
+# SQLite data remains local regardless of configured location
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm

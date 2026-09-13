@@ -17,6 +17,7 @@ from job_radar.storage import JobStore
 
 NOW = datetime(2026, 9, 13, tzinfo=timezone.utc)
 PROFILE = CandidateProfile(cities=["杭州", "上海", "深圳"], preferred_cities=["杭州", "上海", "深圳"],
+                           education="本科", max_experience_years=0, exclude_internships=True, exclude_staffing=True,
                            graduation_year=2026, roles=["Agent", "大模型"], skills=["Python"], salary_min_k=10, salary_max_k=28)
 
 
@@ -124,11 +125,17 @@ def test_config_revision_validation_and_backup(tmp_path):
     assert store.read()[1] == new_rev
 
 
-def test_workbench_cannot_enable_online_or_change_database(tmp_path):
+def test_workbench_online_toggle_preserves_persistent_hold_and_database(tmp_path):
+    from job_radar.safety import AccessGate
+    from job_radar.settings import resolve_database
     path = init_config(tmp_path / "config.local.yaml")
     store = SettingsStore(path)
     cfg, rev = store.read()
-    for change in ({"network_enabled": True}, {"database_path": "elsewhere.sqlite3"}, {"budget_mode": "unknown"}):
+    gate = AccessGate(resolve_database(cfg, path))
+    gate.pause("人工复核中")
+    cfg, rev = store.save({**cfg.model_dump(mode="json"), "network_enabled": True}, rev)
+    assert cfg.network_enabled and gate.read_state().mode == "paused"
+    for change in ({"database_path": "elsewhere.sqlite3"}, {"budget_mode": "unknown"}):
         with pytest.raises(ValueError):
             store.save({**cfg.model_dump(mode="json"), **change}, rev)
     assert store.read()[1] == rev

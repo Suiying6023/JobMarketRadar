@@ -384,6 +384,9 @@ class AccessGate:
                     f"策略锁被占用（{self.state_path.name}{LOCK_SUFFIX}），"
                     f"拒绝无锁写入；本进程应停止并由人工确认（不得当作已熔断）")
             current = self.read_state()                    # 锁内读，判断才是原子的
+            if (current.mode == MODE_PAUSED and source.startswith("managed-task:")
+                    and current.source != source):
+                return current
             previous = current if current.mode == MODE_PAUSED else None
             state = AccessState(
                 mode=MODE_PAUSED,
@@ -397,7 +400,7 @@ class AccessGate:
             _write_atomic(self.state_path, state.as_dict())
         return state
 
-    def release(self, confirmation: str) -> AccessState:
+    def release(self, confirmation: str, *, expected_source: str | None = None) -> AccessState:
         """人工解除冻结 → 写 `ready`。
 
         `confirmation` 必须非空：它是「谁 / 依据什么判断可以恢复」的审计痕迹，
@@ -415,6 +418,8 @@ class AccessGate:
                     f"请稍后重试 release")
             # 拿锁之后**重新读**：用过期状态判断"期限到没到"会放走一次提前解除。
             current = self.read_state()
+            if expected_source is not None and current.source != expected_source:
+                raise AccessBlocked("当前暂停来自另一项操作，请在访问控制中确认后恢复")
             blocked = release_blocked_reason(current.resume_after)
             if blocked:
                 raise AccessBlocked(f"拒绝解除：{blocked}")

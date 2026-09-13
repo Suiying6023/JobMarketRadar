@@ -25,14 +25,14 @@ class CandidateProfile(BaseModel):
     cities: list[str] = Field(default_factory=list, max_length=200)
     preferred_cities: list[str] = Field(default_factory=list, max_length=20)
     graduation_year: int | None = Field(default=None, ge=1990, le=2100)
-    education: str = Field(default="本科", max_length=30)
-    max_experience_years: int = Field(default=0, ge=0, le=40)
+    education: str = Field(default="不限", max_length=30)
+    max_experience_years: int = Field(default=40, ge=0, le=40)
     salary_min_k: float = Field(default=0, ge=0, le=300)
-    salary_max_k: float = Field(default=40, gt=0, le=300)
+    salary_max_k: float = Field(default=300, gt=0, le=300)
     roles: list[str] = Field(default_factory=list, max_length=60)
     skills: list[str] = Field(default_factory=list, max_length=100)
-    exclude_internships: bool = True
-    exclude_staffing: bool = True
+    exclude_internships: bool = False
+    exclude_staffing: bool = False
     excluded_companies: list[str] = Field(default_factory=list, max_length=100)
     excluded_titles: list[str] = Field(default_factory=list, max_length=100)
 

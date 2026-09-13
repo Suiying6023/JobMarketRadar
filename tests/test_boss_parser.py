@@ -24,17 +24,10 @@ def test_parse_api_job():
     assert job.recruiter_active_status == "在线"
 
 
-def test_should_keep_rejects_anonymous_before_detail_fetch():
-    """匿名公司必须在列表阶段就拦掉。
-
-    标成 active 就会去抓详情，而这类岗位最终一定被 clean_local_db 降级
-    （投递前无法核实公司身份）——每条漏过去就白花一次详情配额。
-    """
+def test_anonymous_source_fact_is_preserved_and_exclusion_is_explicit():
+    """匿名是来源字段；通用采集由操作者选择是否排除。"""
     collector = _collector()
     raw = json.loads(Path("tests/fixtures/boss_joblist.json").read_text(encoding="utf-8"))["zpData"]["jobList"][0]
-    # fixture 的薪资是 `20-35K·14薪`（月基薪均值 27.5K），本身就超 25K 门槛 ——
-    # 而这条测试要证明的是**匿名公司**被拦，所以基准行得先在薪资上过关，
-    # 否则两个原因混在一起，断言通过与否都说明不了匿名判定有没有生效。
     raw = {**raw, "salaryDesc": "15-25K", "salaryMonth": 12}
 
     normal = collector._parse_api_job(raw, "AI Agent", 1)
@@ -42,4 +35,7 @@ def test_should_keep_rejects_anonymous_before_detail_fetch():
 
     anon = collector._parse_api_job({**raw, "anonymous": 101,
                                      "brandName": "某大型互联网公司"}, "AI Agent", 1)
+    assert anon.raw["anonymous"] == 101
+    assert collector._should_keep(anon) is True
+    collector.config.exclude_company_keywords = ["某大型互联网公司"]
     assert collector._should_keep(anon) is False

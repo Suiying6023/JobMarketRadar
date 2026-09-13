@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
-<meta name="description" content="JobMarketRadar 本地离线管理界面：查看岗位池、关键词覆盖统计与采集配置。只读本地数据，不触发任何采集。">
-<title>JobMarketRadar · 本地离线管理</title>
+<meta name="description" content="JobMarketRadar 通用数据服务：岗位采集、详情补全、状态刷新、LLM 打标、任务管理与岗位池总览。">
+<title>JobMarketRadar · 通用数据服务</title>
 <!-- 空 data: 图标：避免浏览器自动请求 /favicon.ico 产生一次无意义的 404，同时不引入外部资源 -->
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
@@ -13,44 +13,44 @@
 <body>
 <a class="skip-link" href="#main">跳到主要内容</a>
 
-<!-- 顶栏：离线/冻结状态常驻可见。刻意不提供任何"解除冻结""开始采集"入口。 -->
 <header class="topbar">
   <div class="topbar-row">
     <p class="brand">
       <span class="brand-mark" aria-hidden="true">JR</span>
       <span class="brand-name">JobMarketRadar</span>
-      <span class="brand-sub">本地离线管理</span>
+      <span class="brand-sub">通用数据服务</span>
     </p>
     <div class="topbar-actions">
       <span id="boot-status" class="pill" role="status" aria-live="polite">加载中…</span>
       <span class="pill pill-quiet" id="meta-pill">—</span>
+      <button id="access-btn" class="btn btn-quiet" type="button">访问控制</button>
       <button id="reload" class="btn btn-quiet" type="button">重新载入</button>
     </div>
   </div>
 
   <p id="safety" class="safety safety-loading" role="status" aria-live="polite">
     <span class="safety-dot" aria-hidden="true"></span>
-    <span class="safety-text">正在读取离线冻结状态…</span>
+    <span class="safety-text">正在读取访问策略…</span>
   </p>
 
   <nav class="nav" aria-label="主导航">
-    <a class="nav-link" href="#/overview" data-view="overview">概览</a>
+    <a class="nav-link" href="#/stats" data-view="stats">岗位池总览</a>
     <a class="nav-link" href="#/jobs" data-view="jobs">岗位池</a>
-    <a class="nav-link" href="#/keywords" data-view="keywords">关键词</a>
+    <a class="nav-link" href="#/terms" data-view="terms">关键词</a>
+    <a class="nav-link" href="#/tasks" data-view="tasks">任务</a>
     <a class="nav-link" href="#/config" data-view="config">配置</a>
-    <a class="nav-link" href="#/notes" data-view="notes">数据说明</a>
   </nav>
 </header>
 
 <main id="main" tabindex="-1">
 
-  <!-- ============================ 概览 ============================ -->
-  <section id="view-overview" class="view" aria-labelledby="overview-h" hidden>
+  <!-- ========================= 岗位池总览 ========================= -->
+  <section id="view-stats" class="view" aria-labelledby="stats-h" hidden>
     <div class="view-head">
-      <h2 id="overview-h">概览</h2>
-      <p class="view-sub">本地库的规模、覆盖与质量口径。所有数字都来自本机数据库快照，不代表平台全量。</p>
+      <h2 id="stats-h">岗位池总览</h2>
+      <p class="view-sub">本地岗位库的规模、JD 覆盖与分布。数字来自本机数据库快照。</p>
     </div>
-    <div id="overview-body">
+    <div id="stats-body">
       <p class="empty">正在读取本地数据…</p>
     </div>
   </section>
@@ -59,10 +59,7 @@
   <section id="view-jobs" class="view" aria-labelledby="jobs-h" hidden>
     <div class="view-head">
       <h2 id="jobs-h">岗位池</h2>
-      <p class="view-sub">
-        本地库内的岗位记录。收藏 / 已投 / 备注只是本地标记，不会与 BOSS 交互，也不代表投递成功。
-        「优先核实」是排序建议，不是确认在招。
-      </p>
+      <p class="view-sub">本机缓存的岗位记录：检索、阅读 JD 原文、写本地复核记录。</p>
     </div>
 
     <form id="jobs-filters" class="filters" role="search" aria-label="岗位筛选">
@@ -78,13 +75,9 @@
         </select>
       </div>
       <div class="field">
-        <label for="f-tier">优先级</label>
+        <label for="f-tier">复核优先级</label>
         <select id="f-tier" name="tier">
-          <option value="">全部</option>
-          <option value="优先核实">优先核实</option>
-          <option value="需核实门槛">需核实门槛</option>
-          <option value="信息不足">信息不足</option>
-          <option value="暂不优先">暂不优先</option>
+          <option value="">全部优先级</option>
         </select>
       </div>
       <div class="field field-narrow">
@@ -116,67 +109,78 @@
           <button id="detail-close" class="btn btn-quiet btn-sm" type="button">关闭</button>
         </div>
         <div id="detail-body" class="detail-body">
-          <p class="empty">从左侧列表选择一条岗位，这里显示本地缓存的 JD 原文、决策依据与本地记录。</p>
+          <p class="empty">从左侧列表选择一条岗位，这里显示本机缓存的 JD 原文与本地复核记录。</p>
         </div>
       </aside>
     </div>
   </section>
 
   <!-- =========================== 关键词 =========================== -->
-  <section id="view-keywords" class="view" aria-labelledby="kw-h" hidden>
+  <section id="view-terms" class="view" aria-labelledby="terms-h" hidden>
     <div class="view-head">
-      <h2 id="kw-h">关键词</h2>
+      <h2 id="terms-h">关键词与词表</h2>
       <p class="view-sub">
-        历史覆盖统计来自本地库。增删关键词、调整每词翻页深度只会写入本地配置，
-        <strong>不会立即采集</strong>，要等下一次（人工发起的）采集才生效。
+        搜索词、目标角色、技能关键词与各类排除词的统一入口：检索、分页、折叠与批量导入。
       </p>
     </div>
+    <div id="terms-body">
+      <p class="empty">正在载入配置…</p>
+    </div>
+    <div id="terms-savebar" class="savebar"></div>
+  </section>
 
-    <p id="kw-caveat" class="callout" role="note">统计口径加载中…</p>
+  <!-- ============================ 任务 ============================ -->
+  <section id="view-tasks" class="view" aria-labelledby="tasks-h" hidden>
+    <div class="view-head">
+      <h2 id="tasks-h">任务</h2>
+      <p class="view-sub">启动与停止采集、详情补全、状态刷新与打标，查看进度、结果与实时日志。</p>
+    </div>
 
-    <div class="kw-add">
-      <div class="field">
-        <label for="kw-new">新增关键词</label>
-        <input id="kw-new" type="text" autocomplete="off" placeholder="例如：大模型应用开发">
+    <section id="access-panel" class="panel" aria-label="访问策略">
+      <p class="empty">正在读取访问策略…</p>
+    </section>
+
+    <form id="task-form" class="panel task-form" aria-label="启动任务">
+      <h3 class="panel-title">启动任务</h3>
+      <p class="panel-note">选择任务类型与数量上限，可先生成执行计划。</p>
+      <div class="grid">
+        <div class="field">
+          <label for="task-kind">任务类型</label>
+          <select id="task-kind"></select>
+          <p class="hint" id="task-kind-hint"></p>
+        </div>
+        <div class="field">
+          <label for="task-limit">数量上限（1–100000）</label>
+          <input id="task-limit" type="number" min="1" max="100000" step="1" value="100" inputmode="numeric">
+        </div>
+        <div class="field field-check">
+          <label class="switch" for="task-dry-run">
+            <input id="task-dry-run" type="checkbox" checked>
+            <span>计划预览</span>
+          </label>
+          <p class="hint">生成任务计划；取消勾选后执行实际任务。</p>
+        </div>
       </div>
-      <button id="kw-add-btn" class="btn btn-primary" type="button">添加到配置</button>
-      <p id="kw-add-msg" class="hint" role="status" aria-live="polite"></p>
+      <div class="group-actions">
+        <button id="task-start" class="btn btn-primary" type="button">启动任务</button>
+        <p id="task-start-msg" class="field-msg" role="status" aria-live="polite"></p>
+      </div>
+    </form>
+
+    <div class="tasks-layout">
+      <div class="tasks-col">
+        <h3 class="panel-title">任务列表</h3>
+        <div id="tasks-list"></div>
+      </div>
+      <aside id="task-detail" class="detail" aria-labelledby="task-detail-h">
+        <div class="detail-head">
+          <h3 id="task-detail-h">任务详情</h3>
+        </div>
+        <div id="task-detail-body" class="detail-body">
+          <p class="empty">从左侧列表选择一个任务，这里显示它的进度、结果与实时日志。</p>
+        </div>
+      </aside>
     </div>
-
-    <div class="table-wrap">
-      <table class="table" id="kw-table">
-        <caption>关键词覆盖统计与每词翻页深度（未在配置中的历史关键词单独列出，可加回配置）</caption>
-        <thead>
-          <tr>
-            <th scope="col">关键词</th>
-            <th scope="col" class="num">岗位</th>
-            <th scope="col" class="num">有 JD</th>
-            <th scope="col" class="num">未标关闭</th>
-            <th scope="col" class="num">独有覆盖</th>
-            <th scope="col" class="num">每词页深</th>
-            <th scope="col" class="num">上轮末页</th>
-            <th scope="col">操作</th>
-          </tr>
-        </thead>
-        <tbody id="kw-tbody">
-          <tr><td colspan="8" class="empty">正在读取关键词统计…</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <p class="hint">
-      「独有覆盖」是<strong>只被这一个关键词命中过</strong>的岗位数：同时被别的关键词命中的岗位不计入，
-      独有覆盖之和只代表单一关键词命中的记录数，不代表整个数据池。表格中的「岗位」是该关键词命中的全部条数。
-    </p>
-
-    <p class="hint">
-      页深留空表示使用「配置」页里的默认每词页数；留空不会删除历史统计，也不算"未保存的修改"。
-      设置上限 30 页，深翻是定向动作，不是默认行为。
-      页深与关键词数都是<strong>自设参考线</strong>：在「配置」页选了「强制限制，到线停止」才会被截断，
-      选「仅作参考」时只提示。
-    </p>
-
-    <div id="kw-savebar" class="savebar"></div>
   </section>
 
   <!-- ============================ 配置 ============================ -->
@@ -184,124 +188,29 @@
     <div class="view-head">
       <h2 id="cfg-h">配置</h2>
       <p class="view-sub">
-        这里编辑的是本地采集配置。<strong>保存不会启动采集</strong>，也不会改变离线冻结状态；
-        它只写回配置文件，等下一次人工采集时生效。
+        本地采集、刷新、浏览器与 LLM 设置。保存只写入本地配置文件。
       </p>
     </div>
-
-    <p class="callout" role="note">
-      本页只编辑目标城市、参考线、请求间隔与候选人画像；其他高级设置保持原值，可在本地配置文件中管理。
-      请求量、翻页深度、关键词数都是<strong>本机自设的参考线</strong>，不代表平台的安全额度；
-      保存它们既不会启动采集，也不会解除冻结，更不会改变平台侧的真实限制。
-    </p>
-
     <form id="config-form" novalidate>
       <div id="config-fields">
         <p class="empty">正在载入配置…</p>
       </div>
     </form>
-
     <div id="config-savebar" class="savebar"></div>
-  </section>
-
-  <!-- ========================== 数据说明 ========================== -->
-  <section id="view-notes" class="view" aria-labelledby="notes-h" hidden>
-    <div class="view-head">
-      <h2 id="notes-h">数据说明</h2>
-      <p class="view-sub">读这份数据前需要知道的几条边界。它们不是免责声明，是会直接影响判断的口径。</p>
-    </div>
-
-    <div class="notes">
-      <section class="note-card">
-        <h3>这是本地偏样本，不是全网</h3>
-        <p>
-          岗位只来自本机既有的采集结果，受关键词、城市、翻页深度、账号可见范围与采集时间窗共同限制。
-          它既不是 BOSS 全量，也不是随机抽样：越是被配置里反复采的关键词，在库里的相对占比就越高。
-          因此「技能 Top N」「行业分布」只能读作<strong>本库内的相对频率</strong>，不能外推成市场占比。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>薪资是挂牌薪资</h3>
-        <p>
-          薪资字段是招聘方在平台上标注的区间（例如「15-25K·14薪」），通常面向所有候选人，
-          不是给你的 offer，也不是到手收入。统计里的中位数取<strong>区间中点</strong>
-          （下限与上限的平均），不折算年终奖倍数，并排除日薪 / 时薪与明显异常值
-          （下限 ≤ 0、下限大于上限、或超过 300K）。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>活跃度与在招状态是带时间戳的快照</h3>
-        <p>
-          「在线」「刚刚活跃」「招聘中」都是<strong>抓取详情那一刻</strong>的状态，此后不随时间自动衰减。
-          一个月前记录的「刚刚活跃」今天既不能证明在线，也不能证明不在线 —— 它的信息量接近于零。
-          因此列表里给出「详情快照」时间与快照年龄：<strong>超过 7 天</strong>即标记为偏旧、
-          需要重新核实；没有时间戳的（未抓详情、或正文缺时间）单独算作状态未知，不按新鲜岗位推荐。
-        </p>
-        <p>
-          快照状态只区分「已标关闭」与「未标关闭，当前待核实」两种情况。
-          概览里的「未标关闭」统计的是<strong>快照没有标关闭的全部记录（含没有 JD 的）</strong>，
-          它是"没有看到关闭标记"，不是"确认在招"。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>「优先核实」不是确认在招</h3>
-        <p>
-          岗位池的优先级（优先核实 / 需核实门槛 / 暂不优先 / 信息不足）是本地规则给出的
-          <strong>核实排序建议</strong>：它综合了画像匹配、门槛与快照新鲜度，用来决定「先去核实哪一条」。
-          任何一条在被人工或平台确认之前，都不代表岗位仍在招聘，也不代表你可以投递。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>收藏 / 已投 / 备注只是本地记录</h3>
-        <p>
-          这三个标记写在本机数据库里，用来记录你自己的进度。它们不会向 BOSS 发送任何内容，
-          也不代表简历已投出、更不代表对方已收到。重置只会清掉本机的这三个字段。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>重复与状态未知</h3>
-        <p>
-          「疑似重复」的判据是<strong>公司标识（或规范化公司名）+ 规范化标题 + 城市</strong>相同，
-          它只提示合并候选、不删原记录，也不等于跨平台已去重。状态未知表示没有 JD 正文、
-          或正文缺时间戳；这类岗位在统计里有独立的位置，不会被算作「在招」。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>离线冻结：本页不会解除</h3>
-        <p>
-          顶栏显示的是当前安全状态与原因。本页只读本地数据、只写本地配置与本地标记，
-          没有任何采集、开聊或解除冻结的入口；冻结到期或需要人工解除时，按项目既有的命令行流程处理。
-        </p>
-      </section>
-
-      <section class="note-card">
-        <h3>导出</h3>
-        <p>
-          「导出 CSV」导出的当前筛选结果（未分页），由本地服务直接生成，不联网。
-          导出内容同样受上面的口径限制。
-        </p>
-      </section>
-    </div>
   </section>
 
 </main>
 
 <footer class="footer">
   <p class="footer-line">
-    <span>JobMarketRadar 本地离线管理界面</span>
+    <span>JobMarketRadar 通用数据服务</span>
     <span class="footer-sep" aria-hidden="true">·</span>
-    <span>仅读写本机数据，不访问 BOSS 或外网</span>
+    <span>本地管理控制台</span>
     <span class="footer-sep" aria-hidden="true">·</span>
     <span id="footer-meta">版本 —</span>
   </p>
   <p class="footer-line footer-hint">
-    快捷键：<kbd>/</kbd> 聚焦搜索 · <kbd>j</kbd>/<kbd>k</kbd> 上下移动 · <kbd>Enter</kbd> 打开详情 · <kbd>Esc</kbd> 关闭详情
+    岗位池快捷键：<kbd>/</kbd> 聚焦搜索 · <kbd>j</kbd>/<kbd>k</kbd> 上下移动 · <kbd>Enter</kbd> 打开详情 · <kbd>Esc</kbd> 关闭详情
   </p>
 </footer>
 

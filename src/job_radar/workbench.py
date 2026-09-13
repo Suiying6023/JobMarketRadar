@@ -1,4 +1,4 @@
-"""Loopback-only offline workbench; no route initiates platform requests."""
+"""Loopback service console and shared task-control API."""
 from __future__ import annotations
 
 import json
@@ -15,11 +15,17 @@ from pydantic import ValidationError
 from .analysis.decisions import BUCKETS
 from .analysis.market import MarketSnapshot, csv_export
 from .candidate import CandidateProfile
-from .settings import RevisionConflict, SettingsStore, resolve_database
+from .settings import APPLY_POLICY, RevisionConflict, SettingsStore, resolve_database
+from .service_config import public_config, secret_status
+from .safety import AccessBlocked, AccessGate
+from .tasks import TaskManager
+from .task_store import TaskConflict
+from .annotations import latest_annotations, annotation_stale
+from .storage import JobStore
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 WEB = Path(__file__).parent / "web"
-MAX_BODY = 256 * 1024
+MAX_BODY = 1024 * 1024
 
 
 class LocalNotes:
@@ -87,9 +93,18 @@ class Workbench:
         self.lock = threading.RLock()
         cfg, _ = self.settings.read()
         self.database = resolve_database(cfg, self.settings.path)
+        if not self.database.exists():
+            with JobStore(self.database):
+                pass
         self.snapshot = MarketSnapshot(self.database)
         self.notes = LocalNotes(self.database.parent / "review-state.sqlite3")
         self.fingerprint = self._fingerprint()
+        self.tasks = TaskManager(self.settings)
+        self.annotations = self._annotations()
+
+    def _annotations(self):
+        with JobStore(self.database, read_only=True) as store:
+            return latest_annotations(store.conn)
 
     def _fingerprint(self):
         # WAL writes may not change the main database mtime.
@@ -102,6 +117,7 @@ class Workbench:
             day = datetime.now(timezone.utc).date()
             if fp != self.fingerprint or self.snapshot.now.date() != day:
                 self.snapshot = MarketSnapshot(self.database)
+                self.annotations = self._annotations()
                 self.fingerprint = fp
             return self.snapshot
 
@@ -110,13 +126,20 @@ class Workbench:
         cfg, revision = self.settings.read()
         safety = AccessGate(self.database).read_state().as_dict()
         if not cfg.network_enabled and safety.get("mode") == "ready":
-            safety = {**safety, "mode": "offline", "reason": "配置处于离线模式，保存配置不会启动采集"}
-        return {"config": cfg.model_dump(mode="json"), "revision": revision, "csrf_token": self.csrf,
-                "safety": safety, "version": VERSION}
+            safety = {**safety, "mode": "offline", "reason": "在线访问已关闭"}
+        return {"config": public_config(cfg), "revision": revision, "csrf_token": self.csrf,
+                "safety": safety, "version": VERSION, "secrets": secret_status(cfg), "apply_policy": APPLY_POLICY}
 
     def annotate(self, items: list[dict]) -> list[dict]:
         saved = self.notes.all()
-        return [{**item, **saved.get(item["id"], {})} for item in items]
+        cfg, _ = self.settings.read()
+        result = []
+        for item in items:
+            annotation = self.annotations.get(item["id"])
+            if annotation:
+                annotation = {**annotation, "stale": annotation_stale(self.snapshot.by_id[item["id"]], cfg, annotation)}
+            result.append({**item, **saved.get(item["id"], {}), "annotation": annotation})
+        return result
 
 
 class WorkbenchServer(ThreadingHTTPServer):
@@ -126,6 +149,10 @@ class WorkbenchServer(ThreadingHTTPServer):
     def __init__(self, port: int, workbench: Workbench):
         self.workbench = workbench
         super().__init__(("127.0.0.1", port), Handler)
+
+    def server_close(self):
+        self.workbench.tasks.close()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -157,8 +184,8 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         for name, value in (headers or {}).items():
             self.send_header(name, value)
-        self.end_headers()
         try:
+            self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -184,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parts.query, max_num_fields=20)
             static = {"/": ("index.html", "text/html; charset=utf-8"), "/index.html": ("index.html", "text/html; charset=utf-8"),
                       "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
+            for asset in WEB.iterdir():
+                if asset.is_file() and asset.suffix in (".js", ".css"):
+                    static["/" + asset.name] = (asset.name, "text/javascript; charset=utf-8" if asset.suffix == ".js" else "text/css; charset=utf-8")
             if path in static:
                 name, ctype = static[path]
                 self._send(200, (WEB / name).read_bytes(), ctype)
@@ -192,10 +222,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, app.state())
                 return
             cfg, _ = app.settings.read()
+            if path == "/api/options":
+                from .options import option_catalog
+                self._json(200, option_catalog(cfg, app.current().rows))
+                return
+            if path == "/api/tasks":
+                self._json(200, app.tasks.list())
+                return
+            if path.startswith("/api/tasks/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 3:
+                    self._json(200, app.tasks.store.get(parts[2]))
+                elif len(parts) == 4 and parts[3] == "events":
+                    after = int(query.get("after", ["0"])[0])
+                    limit = int(query.get("limit", ["200"])[0])
+                    if after < 0 or not 1 <= limit <= 500:
+                        raise ValueError("日志游标或条数无效")
+                    self._json(200, app.tasks.store.events(parts[2], after, limit))
+                else:
+                    self._json(404, {"error": "未找到操作"})
+                return
             profile = cfg.candidate or CandidateProfile()
             snap = app.current()
             if path == "/api/overview":
-                self._json(200, snap.overview(profile))
+                overview = dict(snap.overview())
+                overview["scope"] = "本地岗位池 · 全部已采集记录"
+                totals = dict(overview["totals"])
+                totals["tagged"] = len({row["canonical_id"] for row in snap.rows if row.get("glm_tags_json") not in (None, "", "{}")}.union(app.annotations))
+                overview["totals"] = totals
+                self._json(200, overview)
             elif path == "/api/keywords":
                 self._json(200, snap.keywords(cfg))
             elif path == "/api/jobs":
@@ -219,6 +274,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, csv_export(items), "text/csv; charset=utf-8", {"Content-Disposition": 'attachment; filename="job-review-queue.csv"'})
             else:
                 self._json(404, {"error": "未找到页面"})
+        except KeyError:
+            self._json(404, {"error": "未找到任务"})
         except (ValueError, FileNotFoundError) as exc:
             self._json(400, {"error": str(exc)[:200]})
         except Exception:
@@ -247,7 +304,40 @@ class Handler(BaseHTTPRequestHandler):
             path = unquote(urlsplit(self.path).path)
             app = self.server.workbench
             if path == "/api/config":
-                app.settings.save(payload.get("config"), payload.get("revision", ""))
+                app.settings.save(payload.get("config"), payload.get("revision", ""), payload.get("clear_secrets"))
+                self._json(200, app.state())
+            elif path == "/api/tasks":
+                self._json(202, app.tasks.start(payload.get("kind"), payload.get("options")))
+            elif path.startswith("/api/tasks/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    self._json(404, {"error": "未找到操作"})
+                elif parts[3] == "stop":
+                    self._json(200, app.tasks.stop(parts[2]))
+                elif parts[3] == "resume":
+                    self._json(200, app.tasks.resume(parts[2], payload.get("confirmed") is True))
+                elif parts[3] == "verification":
+                    self._json(200, app.tasks.show_verification(parts[2]))
+                else:
+                    self._json(404, {"error": "未找到操作"})
+            elif path == "/api/access":
+                if payload.get("action") == "pause":
+                    reason = payload.get("reason", "手动暂停")
+                    if not isinstance(reason, str) or len(reason) > 500:
+                        raise ValueError("暂停原因最多 500 字")
+                    AccessGate(app.database).pause(reason)
+                    for task in app.tasks.store.active():
+                        if task["kind"] != "tag" and not task["options"]["dry_run"]:
+                            app.tasks.stop(task["id"])
+                elif payload.get("action") == "release":
+                    if payload.get("confirmed") is not True:
+                        raise ValueError("请先确认平台状态已恢复")
+                    confirmation = payload.get("confirmation", "用户通过管理页确认平台状态已恢复")
+                    if not isinstance(confirmation, str) or not confirmation.strip() or len(confirmation) > 500:
+                        raise ValueError("恢复依据需为 1–500 字")
+                    AccessGate(app.database).release(confirmation)
+                else:
+                    raise ValueError("访问状态操作无效")
                 self._json(200, app.state())
             elif path.startswith("/api/jobs/") and path.endswith("/action"):
                 cid = path[len("/api/jobs/"):-len("/action")]
@@ -258,8 +348,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "local_only": True})
             else:
                 self._json(404, {"error": "未找到操作"})
-        except RevisionConflict as exc:
+        except (RevisionConflict, TaskConflict, AccessBlocked) as exc:
             self._json(409, {"error": str(exc)})
+        except KeyError:
+            self._json(404, {"error": "未找到任务"})
         except ValidationError as exc:
             # Do not echo whole config values in validation errors.
             issues = [".".join(map(str, e["loc"])) + ": " + e["msg"] for e in exc.errors(include_input=False, include_url=False)]
@@ -271,7 +363,7 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.OperationalError:
             self._json(503, {"error": "本地记录数据库繁忙或不可写，请稍后再试"})
         except Exception:
-            self._json(500, {"error": "本地保存失败，原始岗位库未被修改"})
+            self._json(500, {"error": "操作失败，请查看服务日志"})
 
 
 def serve(config: str, port: int = 8765):
@@ -279,7 +371,7 @@ def serve(config: str, port: int = 8765):
         raise ValueError("端口必须在 1–65535")
     app = Workbench(config)
     server = WorkbenchServer(port, app)
-    print(f"JobMarketRadar 离线工作台：http://127.0.0.1:{port}/", flush=True)
+    print(f"JobMarketRadar 数据服务：http://127.0.0.1:{port}/", flush=True)
     try:
         server.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:

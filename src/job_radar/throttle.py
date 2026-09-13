@@ -1,27 +1,6 @@
-"""人类行为节流模块：复用参考项目的风控规避设计。
+"""Legacy pacing helpers; managed tasks use pacing.RequestPacer.
 
-参考来源（2026-08-01 调研）：
-- Auto-JobHunter：高斯抖动 + 突发惩罚节流
-- boss-zhipin-scraper：全局请求预算 + 退避
-- boss-agent-cli：高斯节流 + 风控即停
-
-设计要点：
-1. 请求间隔用高斯分布（mean ± std），比 uniform 更接近真实人操作的时序——
-   真实用户有时快有时慢，不是均匀的。
-2. 突发惩罚：连续 N 条请求后强制插入一次较长冷却，避免「稳定高速」的机器特征。
-3. 批次冷却：详情接口有账号级累计配额（约 5-6 次触发 code=37），
-   每批后必须长休息等窗口恢复，这是唯一有效防线。
-4. 全局预算：单轮请求上限，超了就停。
-
-用法：
-    throttle = HumanThrottle(cfg, detail_batch=5, detail_cooldown=(10.0, 15.0))
-    await throttle.delay_before_request('list')    # 列表请求前
-    await throttle.delay_before_request('detail')  # 详情请求前
-    await throttle.human_heartbeat(page, 30)       # 长暂停期间保鲜 cookie
-
-注意 `config` 是必需的位置参数（节流档位从 yaml 读，见 __init__）。
-批间冷却由调用方自己排（backfill_details / backfill_activity 用随机批大小），
-本模块只提供 `detail_batch` / `detail_cooldown` 这两个值和 `_gaussian` 采样。
+Timing values are operator configuration, not platform guarantees.
 """
 from __future__ import annotations
 
