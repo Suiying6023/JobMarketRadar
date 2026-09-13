@@ -98,3 +98,7 @@ resumes/
 demo/
 data/**/*.sqlite3*
 data/**/*.manifest.json
+
+# Local archives, handoffs, private research and organization records
+local/
+data/batches/

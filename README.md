@@ -1,6 +1,6 @@
 # JobMarketRadar
 
-本地招聘数据工作台：先分析全国采样池，再用可调整的求职画像生成岗位复核队列。
+本地岗位数据工具：采集与保存招聘信息，提供岗位池总览、配置编辑和可解释的岗位复核。
 
 - 全国整库的城市、行业、薪资、经验与技能统计，明确显示分母和采样偏差。
 - 岗位搜索、原文阅读、可解释的复核排序，以及单独保存的收藏、已投和备注。
@@ -32,4 +32,4 @@ uv run job-radar db-backup --config config.local.yaml --destination data/backups
 
 `init` 仅创建配置，不抓取数据；数据库应为本项目的 SQLite schema。相对数据库路径在工作台中按配置文件所在目录解析。
 
-[操作与配置](docs/OPERATIONS.md) · [数据口径](docs/DATA_MODEL.md) · [脚本索引](scripts/README.md)
+[操作与配置](docs/OPERATIONS.md) · [数据口径](docs/DATA_MODEL.md) · [脚本索引](scripts/README.md) · [服务与使用工作区](docs/WORKSPACES.md)
