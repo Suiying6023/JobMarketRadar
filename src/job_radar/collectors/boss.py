@@ -72,7 +72,6 @@ def _inline_is_login(html: str) -> bool | None:
 _CLOSED_MARKS = ("职位已关闭", "该职位已下线", "岗位已下线", "已停止招聘",
                  "职位不存在", "该职位不存在", "页面不存在", "该页面不存在",
                  "已结束招聘", "职位已失效")
-_LOGIN_MARKS = ("登录后查看", "请先登录", "登录/注册")
 _VERIFY_MARKS = ("拖动滑块", "请完成验证", "安全验证", "验证后继续")
 
 
@@ -128,9 +127,11 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
         hit = next((m for m in _VERIFY_MARKS if m in lowered), None)
         if hit:
             return {**base, "kind": "verification", "evidence": hit}
-    hit = next((m for m in _LOGIN_MARKS if m in lowered), None)
-    if hit:
-        return {**base, "kind": "login_wall", "evidence": hit}
+    # ⚠️ **不要在这里判登录墙**。曾经有过一版扫 `登录/注册`、`请先登录` 这类文案，
+    # 结果误报：页头本来就有「登录/注册」入口，任何空页都能命中 —— 而误判登录墙
+    # 会触发 `PlatformRiskStop` → 持久熔断 → 要人工解冻，代价极高。
+    # 真正的登录判定是 `_inline_is_login()` 读页面内联的 `_userInfo.isLogin`，
+    # 它在 `_collect_ssr_detail` 里**更早**就已经执行过，是结构化的硬信号。
     hit = next((m for m in _CLOSED_MARKS if m in lowered), None)
     if hit:
         return {**base, "kind": "closed", "evidence": hit}
@@ -1297,9 +1298,6 @@ class BossCollector(Collector):
                 # 搜索 URL 的上下文。
                 self._search_ready = False
             self._finish_request(rowid, diag["kind"])
-            if diag["kind"] == "login_wall":
-                raise PlatformRiskStop("详情页要求登录后才能看正文，不把预览当完整正文",
-                                       category="authentication_required")
             raise RuntimeError(
                 f"详情页没有正文（{diag['kind']}｜HTTP {diag['status']}｜"
                 f"{diag['length']} 字节｜证据 {diag['evidence']}｜{diag['url'][:90]}），"

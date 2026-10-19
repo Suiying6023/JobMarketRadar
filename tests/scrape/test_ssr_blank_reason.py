@@ -80,8 +80,18 @@ def test_closed_job_is_recognised_and_not_retried_as_risk():
     assert reason("<html>页面不存在</html>" + "x" * 11000) == "closed"
 
 
-def test_login_wall_is_its_own_kind():
-    assert reason("<html>登录后查看</html>" + "x" * 200) == "login_wall"
+def test_login_markers_are_not_treated_as_login_wall():
+    """页头本来就有「登录/注册」入口 —— 扫整页文案判登录墙会误报。
+
+    误判登录墙会触发 `PlatformRiskStop` → 持久熔断 → 要人工解冻，代价极高。
+    真正的登录判定是 `_inline_is_login()` 读 `_userInfo.isLogin`（结构化硬信号），
+    在 `_collect_ssr_detail` 里更早执行过。2026-10-19 实测：这条误报让一轮扫描
+    在 8 个请求处被熔断。
+    """
+    page = "<html><a>登录/注册</a>" + "x" * 9000 + "</html>"
+    kind = reason(page)
+    assert kind != "login_wall"
+    assert kind in ("selector_miss", "empty_page", "closed", "js_challenge")
 
 
 def test_selector_miss_vs_empty_page_vs_blank_jd():
@@ -106,14 +116,13 @@ def test_size_threshold_uses_bytes_not_characters():
     assert diag["kind"] == "js_challenge"
 
 
-@pytest.mark.parametrize("kind", ["verification", "js_challenge", "login_wall", "closed",
+@pytest.mark.parametrize("kind", ["verification", "js_challenge", "closed",
                                   "selector_miss", "empty_page", "blank_jd"])
 def test_every_reason_carries_evidence(kind):
     """异常消息里必须带证据（状态码/字节数/URL/命中的词），否则等于没归因。"""
     samples = {
         "verification": ("<html>x</html>", "https://www.zhipin.com/web/passport/zp/verify.html"),
         "js_challenge": ("<html>" + "x" * 42000 + "</html>", URL),
-        "login_wall": ("<html>请先登录</html>", URL),
         "closed": ("<html>职位已关闭</html>", URL),
         "selector_miss": ("<html>" + "x" * 9000 + "</html>", URL),
         "empty_page": ("<html></html>", URL),
