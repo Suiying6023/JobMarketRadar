@@ -26,13 +26,14 @@ output/
 # 留在本地可复跑，但不入库（这个仓库有「不进公开仓」的约定）。
 data/eval/
 
-# 2026-08-30 成本/判据标定的产物：同样含真实公司名、JD 正文与整页 HTML
+# 2026-08-30 成本/判据标定的产物：含真实公司名、JD 正文与整页 HTML
 # （`sample_job.html` 是一条完整岗位页）。结论已写进记忆与代码注释，
-# 原始件留本地复核用。注意 `data/calibration/*.jsonl` 那批老标定数据是
-# 纯数字，已在仓里，不受影响。
+# 原始件留本地复核用。
+# `*.jsonl` 里是逐条抓取记录（岗位 ID、标题、请求计数），不是纯数字，同样不入库。
 data/calibration/*.json
 data/calibration/*.html
 data/calibration/*.css
+data/calibration/*.jsonl
 # security.js 是平台自己的挑战脚本（324KB，无个人数据），
 # 但它是**平台资产**且随版本变化，取证结论已进记忆，不入库。
 data/calibration/*.js
@@ -114,3 +115,8 @@ data/batches/
 *.db-wal
 *.db-shm
 /.browser-interface-anonymous/
+
+# 浏览器 profile 一律不入库：里面是登录态（Network/Cookies、Login Data、Local State）
+# 和抓取过程中的缓存。按前缀兜底，避免新增 profile 目录时漏掉。
+# 不加尾部 `/`：profile 目录可能尚不存在，git 对不存在的路径判不出是不是目录。
+/.browser-profile*
