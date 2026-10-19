@@ -13,9 +13,28 @@ from __future__ import annotations
 
 import pytest
 
-from job_radar.collectors.boss import _ssr_blank_reason
+from job_radar.collectors.boss import _is_challenge_url, _ssr_blank_reason
 
 URL = "https://www.zhipin.com/job_detail/abc123.html"
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.zhipin.com/web/passport/zp/security.html?seed=x",
+    "https://www.zhipin.com/web/passport/zp/verify.html?code=36",
+    "https://www.zhipin.com/job_detail/x.html?safe-validate=1",
+])
+def test_challenge_urls_are_recognised(url):
+    """`_collect_ssr_detail` 靠它决定「要不要等站点自己跳走再读」。"""
+    assert _is_challenge_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.zhipin.com/job_detail/x.html",
+    "https://www.zhipin.com/job_detail/x.html?_security_check=1_123",   # 已自愈的地址
+    "https://www.zhipin.com/web/geek/jobs?query=Python",
+])
+def test_normal_urls_are_not_challenges(url):
+    assert _is_challenge_url(url) is False
 
 
 def reason(html: str, url: str = URL, status: int = 200) -> str:

@@ -76,6 +76,14 @@ _LOGIN_MARKS = ("登录后查看", "请先登录", "登录/注册")
 _VERIFY_MARKS = ("拖动滑块", "请完成验证", "安全验证", "验证后继续")
 
 
+def _is_challenge_url(url: str) -> bool:
+    """当前地址是不是风控校验页（JS 安全挑战 / 滑块验证）。"""
+    lowered = (url or "").casefold()
+    return ("/web/passport/zp/security.html" in lowered
+            or "/web/passport/zp/verify.html" in lowered
+            or "safe-validate" in lowered)
+
+
 def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
     """详情页没有 `.job-sec-text` 时，**说清是哪一种空**。
 
@@ -1161,6 +1169,33 @@ class BossCollector(Collector):
             await asyncio.sleep(gaussian(lo, hi))
         return job
 
+    async def _settle_challenge(self, html: str, timeout_s: float = 20.0) -> str:
+        """详情页落在安全校验页时，**等它自己跳走**再重新取 HTML。
+
+        为什么需要：`wait_until="domcontentloaded"` 只保证 DOM 就绪，不保证站点
+        那段安全校验 JS 跑完。挑战页的地址会自己变成
+        `job_detail/...?_security_check=1_<ts>`，页面才真正是岗位页。
+
+        代价：**零额外主动请求**。`page.url` 与 `page.content()` 都是本地状态；
+        唯一的网络流量是站点自己发起的那次跳转（它本来就会发生，我们只是不再
+        提前把挑战页当结果）。
+
+        2026-10-19 屏外窗口实测：43,417 字节挑战页 → 2 秒后 467,056 字节岗位页，
+        `.job-sec-text` 出现。**这条也说明「屏外窗口一直不跳转」不成立于这个场景**
+        —— 那句话描述的是 `refresh.recover_session` 里"新开页面 goto"的流程。
+        """
+        if not _is_challenge_url(self.page.url or ""):
+            return html
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            if not _is_challenge_url(self.page.url or ""):
+                try:
+                    return await self.page.content()
+                except PlaywrightError:
+                    return html
+        return html
+
     async def _collect_ssr_detail(self, job: JobRecord) -> JobRecord:
         """打开岗位详情页，只放行 document，从 SSR HTML 里取正文。
 
@@ -1215,6 +1250,16 @@ class BossCollector(Collector):
                                 code=None, outcome="risk", http_status=response.status,
                                 category=response_condition(None, response.status, ""))
             html = await response.text()
+            # **挑战页是读早了，不是被拦了。** 详情页的 SSR 文档拿到后，站点自己的
+            # JS 还会跑一段安全校验，通过后把地址跳回 `job_detail/...?_security_check=1`。
+            # `wait_until="domcontentloaded"` 之后立刻 `response.text()` 读到的是
+            # 校验**中途**的那一页（约 41–43KB，没有 `.job-sec-text`）。
+            #
+            # 2026-10-19 屏外窗口实测：导航落在 `security.html`（43,417 字节），
+            # 被动等 2 秒后地址自己跳回岗位页，页面变成 467,056 字节、正文容器在了。
+            # 所以这里**只等、不重发请求** —— `page.url` 和 `page.content()` 都是
+            # 本地状态，零额外请求。等不到就照原样返回，由归因函数判成 js_challenge。
+            html = await self._settle_challenge(html)
         except BaseException:
             self._finish_request(rowid, "error")
             raise
@@ -1244,6 +1289,13 @@ class BossCollector(Collector):
                 self._trip_risk(rowid, f"详情页被导向验证（证据：{diag['evidence']}）",
                                 code=36, outcome="risk", http_status=response.status,
                                 category="verification_required")
+            if diag["kind"] == "js_challenge":
+                # 挑战页会**污染页面上下文**：留在上面时页面内的 `fetch()` 直接失败
+                # （2026-10-19 实测：连续 3 次挑战之后下一个列表请求报
+                # `TypeError: Failed to fetch`）。标脏后 `collect()` 会重新导航回
+                # 搜索页，把干净页面拿回来。不在这里导航，是因为详情调用点没有
+                # 搜索 URL 的上下文。
+                self._search_ready = False
             self._finish_request(rowid, diag["kind"])
             if diag["kind"] == "login_wall":
                 raise PlatformRiskStop("详情页要求登录后才能看正文，不把预览当完整正文",
@@ -1335,9 +1387,17 @@ class BossCollector(Collector):
                 not self._stoken_roll_ok
                 and self._requests_since_remint >= self.config.remint_after_requests
             )
+            # 页面是否已被风控页**污染**。挑战页和验证页都在 `www.zhipin.com` 上，
+            # `is_boss_origin()` 判不出来 —— 但留在那上面时，页面内的 `fetch()`
+            # 会直接失败（2026-10-19 实测：连续 3 次 `js_challenge` 之后，下一个
+            # 列表请求报 `TypeError: Failed to fetch`，整轮扫描就此中断）。
+            # 所以必须重新导航回搜索页，把干净页面拿回来。
+            page_url = self.page.url or ""
+            poisoned = _is_challenge_url(page_url)
             need_remint = (
                 not self._search_ready
-                or not is_boss_origin(self.page.url or "")
+                or not is_boss_origin(page_url)
+                or poisoned
                 or window_exhausted
             )
             if need_remint:

@@ -499,6 +499,7 @@ async def sweep(ctx, store, cfg):
     # 打散顺序：同一城市、同一关键词连着打是最容易被识别的节奏。
     random.shuffle(tasks)
     detailed: set[str] = set()       # 本轮抓过正文的主键（跨关键词共享，去重用）
+    query_failures = 0               # 连续失败的查询数
     ctx.report(total=len(tasks), queries_total=len(tasks), queries_done=0,
                keywords=keywords, cities=[city.name for city in cities])
     ctx.log(f"扫描开始：{len(cities)} 城市 × {len(keywords)} 关键词 = {len(tasks)} 个查询，"
@@ -540,7 +541,24 @@ async def sweep(ctx, store, cfg):
                     ctx.report(requests=collector.request_count)
                 return True
 
-            await ctx.verified(query, collector.browser_session, collector.page)
+            try:
+                await ctx.verified(query, collector.browser_session, collector.page)
+            except (RiskControlStop, AccessBlocked):
+                raise
+            except (ValueError, RuntimeError) as exc:
+                # 一条查询失败不该拖垮整轮：39 个查询里一次网络抖动就全停，代价太大
+                # （2026-10-19 实测：`TypeError: Failed to fetch` 让整轮扫描在 4/39 处
+                # 直接失败）。但**连续**失败仍然停 —— 那说明登录态、页面结构或风控
+                # 状态变了，继续只是白烧请求。阈值与详情失败共用 `FAILURE_LIMIT`。
+                query_failures += 1
+                ctx.progress["failed"] += 1
+                ctx.log(f"查询失败 {city.name}/{word}：{exc}", level="warning", kind="session")
+                if query_failures >= FAILURE_LIMIT:
+                    raise RuntimeError(
+                        f"连续 {FAILURE_LIMIT} 个查询失败，任务停止；请检查登录态与页面结构"
+                    ) from exc
+            else:
+                query_failures = 0
             # 轮转只关心「这个词多久没碰过」，不动翻页进度。
             store.touch_keyword_progress(city.name, word)
             ctx.report(queries_done=index, processed=index,
