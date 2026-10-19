@@ -25,6 +25,8 @@ from pathlib import Path
 
 from .decision import DecisionClient, DecisionError, run_batch
 from .schema import QUESTIONS, build_state, flatten
+from .tech import extract as extract_tech
+from .tech import to_json as tech_json
 
 DB = Path(r"D:\Code\Boss\data\hangzhou_agent.sqlite3")
 DETAIL_LOG = Path(r"D:\Code\Boss\data\relabel-log.jsonl")
@@ -33,7 +35,7 @@ MODEL = "decision-model-preview"
 COLUMNS = ("role_family", "role_confidence", "role_probabilities", "title_mismatch",
            "seniority_score", "seniority_confidence", "employment_type",
            "employment_confidence", "fresh_grad", "fresh_grad_confidence",
-           "grad_year", "grad_year_confidence", "is_proxy")
+           "grad_year", "grad_year_confidence", "is_proxy", "tech_stack_json")
 
 
 def load_rows(db: sqlite3.Connection, limit: int) -> list[dict]:
@@ -66,6 +68,10 @@ def write_batch(db: sqlite3.Connection, results: list[tuple[dict, dict, str | No
             flat["employment_type"], flat["employment_confidence"],
             flat["fresh_grad"], flat["fresh_grad_confidence"],
             flat["grad_year"], flat["grad_year_confidence"], flat["is_proxy"],
+            # 技术栈是**纯规则抽取**（词表匹配），顺手在这里算掉，零额外成本。
+            # 之前 `tech.py` 是个没人调用的孤儿库，`tech_stack_json` 靠已删除的
+            # 旧脚本维护 —— 存量 7,417 条有值、新岗位全空。
+            tech_json(extract_tech(item.get("job_description") or "")),
             stamp, model, item["canonical_id"]))
     if updates:
         placeholders = ", ".join(f"{name} = ?" for name in COLUMNS)

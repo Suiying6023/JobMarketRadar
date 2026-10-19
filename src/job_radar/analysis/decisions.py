@@ -136,6 +136,20 @@ _ROLE_FIT: dict[str, tuple[int, str]] = {
 #: 不是「门槛松一点就能投」，所以不进次级可报。
 _ROLE_MIN_FIT = 2
 
+#: 技术栈里出现这些，才算**AI 应用/Agent 开发**（而不是纯后端或数据标注）。
+#: 规范名来自 `job_analysis.tech` 的词表。
+_AI_APP_STACK = {
+    "Agent", "RAG", "Prompt", "LangChain", "LangGraph", "LlamaIndex",
+    "Dify", "Coze", "n8n", "向量数据库", "vLLM", "Fine-tune", "多模态",
+}
+#: 这些岗位族**必须**有 AI 技术栈信号才算对口。
+#:
+#: 为什么需要：`role_family` 会把「AI数据标注专家」判成 `ai_app` —— JD 里全是
+#: LLM、大模型、训练这些词，模型读的是「工作对象」而不是「工作性质」。
+#: 但它的技术栈只有 `Python, SQL`，而真正的 AI 开发岗有 `Agent, RAG, Prompt,
+#: LangChain`。用技术栈一卡就分开了（2026-10-19 实测 4 条标注岗全是 Python+SQL）。
+_AI_GATED_ROLES = {"ai_app", "backend", "fullstack", "algorithm"}
+
 _EMPLOYMENT_LABEL = {
     "internship": "实习岗",
     "parttime": "兼职 / 非全日制",
@@ -220,6 +234,8 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
     fresh = (row.get("fresh_grad") or "").strip()
     grad_year = (row.get("grad_year") or "").strip()
     employment = (row.get("employment_type") or "").strip()
+    # 技术栈要提前取：岗位族判定要靠它区分「AI 开发」和「AI 数据标注」。
+    stack = _tech_flat(row)
 
     if not relabeled:
         # 没有标签就不猜。用正则兜底等于把「未知」伪装成「已判」——
@@ -248,9 +264,25 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         # 岗位族：这是**方向**问题，不是门槛松一点就能投的问题，所以硬排除。
         if role:
             fit, label = _ROLE_FIT.get(role, (0, role))
+            ai_confirmed = False
+            if role in _AI_GATED_ROLES:
+                # 技术栈由 `job_analysis.tech` 从正文抽（纯词表，确定性）。
+                if not stack:
+                    unresolved.append("技术栈抽取为空，无法判断是否 AI 方向")
+                elif set(stack) & _AI_APP_STACK:
+                    fit = 3
+                    ai_confirmed = True
+                    label = f"{label}（AI 方向）"
+                else:
+                    fit = min(fit, 1)
             if fit >= _ROLE_MIN_FIT:
                 reasons.append(f"岗位族：{label}")
                 score += 4 * fit
+            elif role in _AI_GATED_ROLES and stack and not ai_confirmed:
+                # 说清是**哪一步**不符：族名像 AI，但正文里没有任何 AI 技术词。
+                exclusions.append(
+                    f"LLM 判为{label}，但技术栈无 AI 信号"
+                    f"（{('、'.join(stack[:5])) or '空'}），非 AI 开发岗")
             else:
                 exclusions.append(f"LLM 判为{label}，与求职方向不符")
         # 资历：**不硬排除**。招聘是许愿式的，年限是期望值不是门槛。
@@ -282,7 +314,6 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         unresolved.append("雇主主体不明，需确认实际签约公司")
 
     # ---------------- 技术栈（LLM 抽取，不扫正文）----------------
-    stack = _tech_flat(row)
     if stack:
         hits = [x for x in profile.skills if mentions(" ".join(stack), [x])]
         if hits:

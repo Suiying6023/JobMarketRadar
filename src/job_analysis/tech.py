@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+from pathlib import Path
 
 # 规范名 → (别名元组, 是否短词需边界匹配)
 VOCAB: dict[str, tuple[tuple[str, ...], bool]] = {
@@ -170,3 +172,43 @@ def load(raw: str | None) -> dict:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def backfill(db_path: str | Path, *, limit: int = 0) -> int:
+    """给缺 `tech_stack_json` 的岗位补技术栈。**纯规则抽取，零 LLM 成本。**
+
+    为什么单独做一遍而不是只挂在打标流程里：库里存量 7,417 条有标签但
+    `tech_stack_json` 是旧脚本留下的，新岗位又是空的；重跑打标要花 LLM 钱，
+    而技术栈抽取只是词表匹配，秒级完成。两件事的成本差两个数量级。
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        sql = ("SELECT canonical_id, job_description FROM jobs "
+               "WHERE job_description IS NOT NULL AND TRIM(job_description) != '' "
+               "AND (tech_stack_json IS NULL OR TRIM(tech_stack_json) = '' "
+               "     OR TRIM(tech_stack_json) = '{}')")
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        rows = conn.execute(sql).fetchall()
+        if not rows:
+            return 0
+        conn.executemany(
+            "UPDATE jobs SET tech_stack_json = ? WHERE canonical_id = ?",
+            [(to_json(extract(jd)), cid) for cid, jd in rows],
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="回填 tech_stack_json（纯规则，不调模型）")
+    parser.add_argument("--db", default=str(Path(__file__).resolve().parents[2] / "data" / "hangzhou_agent.sqlite3"))
+    parser.add_argument("--limit", type=int, default=0)
+    args = parser.parse_args()
+    n = backfill(args.db, limit=args.limit)
+    print(f"已回填 {n} 条技术栈")
+
