@@ -550,6 +550,20 @@ class BossCollector(Collector):
             print(f"[LEDGER-FAIL] 记账失败（{type(exc).__name__}: {exc}）；"
                   f"仅影响观测，采集继续。", flush=True)
 
+    def _pace_signal(self, name: str, value=None) -> None:
+        """把观察到的信号回传给 pacer（内容长度 / 挑战命中 / 成功）。
+
+        约定：`pace_signal` 是**可选**注入点（和 `pace` 一样用 getattr 取）。
+        没有注入时静默跳过 —— 它只影响节奏的"形状"，不该影响采集能否进行。
+        """
+        hook = getattr(self, "pace_signal", None)
+        if hook is None:
+            return
+        try:
+            hook(name, value)
+        except Exception:  # noqa: BLE001 - 信号失败不影响采集
+            pass
+
     def _log_request(self, url: str) -> int:
         """**记账**：先记内存计数，再往账本落一行；返回该行 id（无账本时 0）。
 
@@ -1297,6 +1311,8 @@ class BossCollector(Collector):
                 # 搜索页，把干净页面拿回来。不在这里导航，是因为详情调用点没有
                 # 搜索 URL 的上下文。
                 self._search_ready = False
+                # 同时告诉 pacer 放慢 —— 被站点推回时要让路。
+                self._pace_signal("challenge")
             self._finish_request(rowid, diag["kind"])
             raise RuntimeError(
                 f"详情页没有正文（{diag['kind']}｜HTTP {diag['status']}｜"
@@ -1346,6 +1362,11 @@ class BossCollector(Collector):
             "access_evidence": dict(self._detail_access_evidence),
         })
         self._finish_request(rowid, "ok")
+
+        # 把"这条读完了、多长"回传给 pacer：下一次间隔按字数微调（只算 20%，
+        # 见 `pacing.py` 的说明），并逐步解除挑战倍数。
+        self._pace_signal("ok")
+        self._pace_signal("content", len(description))
 
         # **导航之后必须补滚一次 stoken。**
         #

@@ -6,6 +6,7 @@ Timing values are operator configuration, not platform guarantees.
 """
 from __future__ import annotations
 
+import math
 import random
 
 
@@ -28,45 +29,43 @@ def gaussian(lo: float, hi: float) -> float:
     return mean  # 极端情况兜底，不让调用方卡住
 
 
-# 拟人抖动的混合分布：三档，权重 + 在**以 d=(hi-lo) 为单位、从 lo 起算**的区间。
+# 拟人间隔：**对数正态**，不是裁剪正态、也不是手工混合分布。
 #
-# 为什么不用 `gaussian`：裁剪到 [lo, hi] 的对称正态**永远不会走神**——没有长尾，
-# 最大也就 hi。真人不是这样：多数时候手快，偶尔停下来看正文、回消息、被别的事
-# 打断。所以改成三档混合。
+# 为什么换成对数正态（2026-10-19，参考开源实现后重写）：
+#   · 人类行为间隔的实测形态是**重尾右偏**：多数很短，少数很长。
+#     对数正态两个参数就能刻画，而且中位数可解释（第 50 百分位）。
+#   · 参考 `tr4m0ryp/Linkedin_Automation` 的 `humanizer/delay.rs`：同样用
+#     `mu = ln(median)` + sigma 控制尾部，并把样本 clamp 到 [min, max]，
+#     理由是"单次抽到极端值不该让整轮停摆"。
+#   · 上一版是 80/15/5 的手工混合。它虽然也有长尾，但**参数不可解释**：
+#     "长停 5%、倍率 2.6–4.6" 是为了凑均值反推出来的，改一个就得重算三个。
+#     对数正态只有一个形状参数 sigma，尾部重量直接由 `hi/lo` 决定。
 #
-# ⚠️ **下限必须严格等于 lo**。第一版用"相对中点的倍数"，结果 [6,11] 会抽出
-# 5.04 秒——比运维设的 6 秒地板还快。均值虽然守住了，但配置的语义被悄悄改掉了：
-# 写 [6,11] 就该真的不短于 6 秒。速率是唯一实测过安全区间的量，地板更是。
-#
-# 三档（d = hi - lo，全部从 lo 起算）：
-#   · 常态  80%  [0.00, 0.45]d —— 手快
-#   · 走神  15%  [0.45, 1.00]d —— 看正文
-#   · 长停   5%  [1.00, 7.00]d —— 被别的事打断
-#
-# 加权均值 = lo + 0.48875·d，而区间中点 = lo + 0.5·d —— **相差不到 1.2% 的 d**，
-# 所以不需要任何归一化：均值天然落在中点附近，下限天然就是 lo，全程无状态。
-_HUMAN_MIX = ((0.80, 0.00, 0.45), (0.15, 0.45, 1.00), (0.05, 1.00, 7.00))
+# 参数映射（保持配置格式仍是 `[lo, hi]` 区间，不用引入新键）：
+#   median = sqrt(lo * hi)          —— 几何中点
+#   sigma  = ln(hi / lo) / 2        —— 让 lo/hi 大致落在 ±2σ 上
+# 对 `[6, 11]`：median 8.12、sigma 0.303、均值 8.50（正好是区间中点）、
+# p95 ≈ 13.4s、clamp 上限 8×hi = 88s。
+_CLAMP_FACTOR = 8.0      # 上限 = hi × 8：截断极端抽样，避免单次抽到几分钟
 
 
-def human_pause(lo: float, hi: float) -> float:
-    """在 `[lo, hi]` 上生成拟人延迟：**不短于 lo**，均值≈区间中点，右偏带长尾。
+def lognormal_pause(lo: float, hi: float) -> float:
+    """在 `[lo, hi]` 上生成**对数正态**间隔：中位数是几何中点，右偏带长尾。
 
-    和 `gaussian` 的区别：均值几乎相同，但分布右偏且有 5% 的长停，不像节拍器；
-    而且上不封顶（最长的走神可以到 `lo + 7d`），下严格以 `lo` 为地板。
-    区间写反时同样先归正（见 `gaussian` 的说明）。
+    和 `gaussian` 的区别：那个是对称的、裁剪在区间内、**永远没有长尾**——
+    上界就是 hi，一眼能看出是机器。这个下界严格等于 lo、上界放宽到 `8×hi`，
+    中间按对数正态分布。
     """
     if lo > hi:
         lo, hi = hi, lo
-    span = hi - lo
-    if span <= 0:
-        return lo
-    roll = random.random()
-    acc = 0.0
-    for weight, lower, upper in _HUMAN_MIX:
-        acc += weight
-        if roll <= acc:
-            return lo + random.uniform(lower, upper) * span
-    return lo + 0.5 * span
+    if lo <= 0:
+        return max(0.0, hi)
+    median = math.sqrt(lo * hi)
+    sigma = math.log(hi / lo) / 2
+    if sigma <= 0:
+        return median
+    value = median * math.exp(random.gauss(0.0, sigma))
+    return min(max(value, lo), hi * _CLAMP_FACTOR)
 
 
 # 2026-10-19 删除 `HumanThrottle` 与 `human_heartbeat`：两者在取消请求账本的重构

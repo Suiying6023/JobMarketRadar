@@ -205,6 +205,7 @@ async def collect(ctx, store, cfg):
     collector = BossCollector(cfg)
     pacer = RequestPacer(ctx.log)
     collector.pace = lambda kind: pacer.before(kind, collector.config)
+    collector.pace_signal = pacer.signal
     collector.online_check = lambda: ctx.settings.read()[0].network_enabled
     collector.ledger = store
     collector.ledger_script = "service.collect"
@@ -290,6 +291,7 @@ async def recommend(ctx, store, cfg):
     collector.online_check = lambda: ctx.settings.read()[0].network_enabled
     pacer = RequestPacer(ctx.log)
     collector.pace = lambda kind: pacer.before(kind, collector.config)
+    collector.pace_signal = pacer.signal
     rounds = CollectionRound(store)
     options = ctx.task["options"]
     ident = options.get("round_id") or ctx.ident
@@ -348,6 +350,7 @@ async def details(ctx, store, rows, cfg):
     collector = BossCollector(cfg)
     pacer = RequestPacer(ctx.log)
     collector.pace = lambda kind: pacer.before(kind, collector.config)
+    collector.pace_signal = pacer.signal
     collector.online_check = lambda: ctx.settings.read()[0].network_enabled
     collector.ledger = store
     collector.ledger_script = "service.details"

@@ -232,6 +232,7 @@ def build_collector(ctx, store, cfg, *, recommendation: bool = False, script: st
     # 这个 lambda 是热更新的关键一环：调用时才读 collector.config，
     # 所以任务跑着改 detail_delay_seconds / burst_threshold 会立刻生效。
     collector.pace = lambda kind: pacer.before(kind, collector.config)
+    collector.pace_signal = pacer.signal
     collector.online_check = lambda: ctx.settings.read()[0].network_enabled
     collector.ledger = store
     collector.ledger_script = script

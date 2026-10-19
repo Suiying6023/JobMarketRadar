@@ -11,7 +11,7 @@ import json
 
 from job_radar.models import CityConfig, CollectionConfig, JobRecord, Platform
 from job_radar.storage import JobStore
-from job_radar.throttle import gaussian, human_pause
+from job_radar.throttle import gaussian, lognormal_pause
 
 
 def make_config(**kw) -> CollectionConfig:
@@ -52,38 +52,39 @@ def test_gaussian_does_not_hang_on_inverted_range():
         assert 8.0 <= gaussian(12.0, 8.0) <= 12.0
 
 
-# ---------- 拟人抖动 ----------
+# ---------- 对数正态间隔 ----------
 
-def test_human_pause_mean_matches_range_midpoint():
-    """抖动的形状可以乱，**均值必须守住区间中点** —— 速率是唯一实测过安全区间的量。"""
-    samples = [human_pause(6.0, 11.0) for _ in range(4000)]
-    mean = sum(samples) / len(samples)
-    assert abs(mean - 8.5) < 0.4, f"均值 {mean:.2f} 偏离中点 8.5 过多"
-
-
-def test_human_pause_never_goes_below_configured_floor():
-    """`[6,11]` 就该真的不短于 6 秒 —— 地板是运维设的安全参数，不能被抖动吃掉。
-
-    第一版用"相对中点的倍数"实现，抽出了 5.04 秒：均值守住了，配置语义却变了。
-    """
-    samples = [human_pause(6.0, 11.0) for _ in range(4000)]
-    assert min(samples) >= 6.0, f"最小值 {min(samples):.2f} 跌破下限 6.0"
-    assert min(samples) < 6.5, "下限附近应当有样本，否则等于没抖动"
-
-
-def test_human_pause_has_long_tail_but_bounded_floor():
-    """右偏长尾：中位数低于均值，最大值明显超过配置上界，下界不破。"""
-    samples = sorted(human_pause(6.0, 11.0) for _ in range(4000))
+def test_lognormal_median_is_geometric_midpoint():
+    """中位数 = sqrt(lo*hi)，这是对数正态最可解释的参数。"""
+    samples = sorted(lognormal_pause(6.0, 11.0) for _ in range(8000))
     median = samples[len(samples) // 2]
-    assert median < 8.5, "中位数应低于均值（右偏）"
-    assert samples[-1] > 11.0, "长尾应能超过配置上界"
-    assert samples[0] >= 6.0, "下界不得跌破配置下限"
+    assert abs(median - 8.12) < 0.5, f"中位 {median:.2f}，期望约 8.12"
 
 
-def test_human_pause_handles_inverted_and_zero_range():
+def test_lognormal_never_goes_below_configured_floor():
+    """`[6,11]` 就该真的不短于 6 秒 —— 地板是运维设的安全参数。"""
+    samples = [lognormal_pause(6.0, 11.0) for _ in range(8000)]
+    assert min(samples) >= 6.0, f"最小值 {min(samples):.2f} 跌破下限 6.0"
+
+
+def test_lognormal_has_heavy_tail_but_is_capped():
+    """右偏重尾是重点：p95 明显超过 hi，但不能无限长。
+
+    裁剪正态做不到前者（上界就是 hi），上一版手工混合做到了前者却让
+    最大值失控到 255 秒。对数正态 + `8×hi` 封顶两头都占。
+    """
+    samples = sorted(lognormal_pause(6.0, 11.0) for _ in range(8000))
+    p95 = samples[int(len(samples) * 0.95)]
+    assert p95 > 11.0, "p95 应超过配置上界（重尾）"
+    assert samples[-1] <= 11.0 * 8, "上限应是 8×hi，不能失控"
+    assert samples[-1] > 11.0 * 1.5, "尾部应该真的能拉长"
+
+
+def test_lognormal_handles_inverted_and_degenerate_range():
     for _ in range(50):
-        assert human_pause(12.0, 8.0) >= 8.0, "区间写反后下限应是较小的那个数"
-    assert human_pause(0.0, 0.0) == 0.0
+        assert lognormal_pause(12.0, 8.0) >= 8.0, "区间写反后下限应是较小的那个数"
+    assert lognormal_pause(5.0, 5.0) == 5.0
+    assert lognormal_pause(0.0, 0.0) == 0.0
 
 
 # ---------- 详情去重前置 ----------
