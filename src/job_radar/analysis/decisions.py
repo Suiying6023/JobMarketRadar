@@ -101,41 +101,99 @@ def _sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"[\n。；;]+", text) if s.strip()]
 
 
-def fresh_graduate_evidence(text: str) -> str:
-    # A bare '应届' is not enough: '不接受应届生' says the opposite.
-    for sentence in _sentences(text):
-        if re.search(r"不(?:考虑|招|接受)|非应届|在校|实习生|实习岗位|每周", sentence):
-            continue
-        if re.search(r"(?:欢迎|接受|优秀|面向|可接收|应往届).{0,12}应届|应届.{0,12}(?:可投|亦可|也可|均可|优先|不限|可接受)|不限.{0,8}应届|应届(?:毕业)?生[，,、\s]*(?:或|优先)", sentence):
-            return sentence[:240]
-    return ""
+# ============================================================================
+# 判定策略：LLM 标签 → 画像
+# ============================================================================
+#
+# 这里只做**策略映射**（哪个岗位族算对口、哪档资历算够得着），分类本身由
+# 决策模型完成 —— `job_analysis.relabel` 把结果写进 role_family /
+# seniority_score / fresh_grad / grad_year / employment_type / is_proxy /
+# tech_stack_json。用正则解析 JD 才是要避免的事：那只能覆盖想得到的情况。
+
+#: `role_family` → (契合度 0-3, 中文名)
+_ROLE_FIT: dict[str, tuple[int, str]] = {
+    "ai_app": (3, "AI 应用 / Agent 开发"),
+    "algorithm": (2, "算法 / 模型训练"),
+    "backend": (2, "后端开发"),
+    "fullstack": (2, "全栈开发"),
+    "data": (1, "数据 / 数仓"),
+    "test": (1, "测试 / 质量保障"),
+    "frontend": (1, "前端"),
+    "ops": (1, "运维 / SRE"),
+    "embedded": (0, "嵌入式"),
+    "product": (0, "产品经理"),
+    "operation": (0, "运营"),
+    "sales": (0, "销售 / 商务"),
+    "design": (0, "设计"),
+    "management": (0, "项目管理"),
+    "content": (0, "AIGC 内容制作"),
+    "teaching": (0, "讲师 / 教研"),
+    "ecommerce": (0, "电商"),
+    "implementation": (0, "实施 / 驻场"),
+    "other": (0, "其它"),
+}
+#: 契合度低于这个值的岗位族整类排除。这是**方向**问题 ——
+#: 不是「门槛松一点就能投」，所以不进次级可报。
+_ROLE_MIN_FIT = 2
+
+_EMPLOYMENT_LABEL = {
+    "internship": "实习岗",
+    "parttime": "兼职 / 非全日制",
+    "campus": "校招 / 应届专项",
+    "fulltime": "全职",
+}
+
+#: `seniority_score` 是 0–4 的连续值（0=实习/应届，4=专家/管理）。
+_SENIORITY_BANDS = (
+    (0.6, "实习 / 应届级"),
+    (1.6, "初级（约 1-3 年）"),
+    (2.6, "中级（约 3-5 年）"),
+    (3.6, "高级（约 5-8 年）"),
+    (9.9, "专家 / 管理"),
+)
 
 
-def experience_requirements(text: str) -> list[tuple[int, str, bool]]:
-    results = []
-    chars = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-    pattern = re.compile(r"(?P<n>\d{1,2}|[一二两三四五六七八九十])\s*(?:[-~～至到]\s*(?:\d{1,2}|[一二三四五六七八九十]))?\s*年(?:及以上|以上|以?上|\+)?[^\n。；;]{0,24}经验")
-    for sentence in _sentences(text):
-        # Company history and phrases such as '团队平均5年经验' are not applicant requirements.
-        if re.search(r"团队平均|创始人|创始团队|公司成立|公司拥有|导师拥有", sentence):
-            continue
-        for match in pattern.finditer(sentence):
-            if re.search(r"年\s*(?:及)?以[内下]", match.group(0)):
-                continue
-            n = chars.get(match.group("n"), 0) or int(match.group("n"))
-            # A later comma-separated bonus must not waive a preceding mandatory year count.
-            clause = re.split(r"[，,]", sentence[match.start():], maxsplit=1)[0]
-            prefix = sentence[max(0, match.start() - 12):match.start()]
-            optional = bool(re.search(r"优先|加分|更佳|最好|可放宽|非必须|非必需|不强制", clause)
-                            or re.search(r"(?:加分项|优先条件|非必须|非必需|最好)[：:\s]*$", prefix))
-            results.append((n, sentence[:260], optional))
-    return results
+def _seniority_label(value: float) -> str:
+    for cap, label in _SENIORITY_BANDS:
+        if value < cap:
+            return label
+    return _SENIORITY_BANDS[-1][1]
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tech_flat(row: dict) -> list[str]:
+    """读 LLM 抽出的技术栈扁平列表。读不到返回空 —— **不退回扫正文**。"""
+    data = parse_json(row.get("tech_stack_json"), {})
+    flat = data.get("flat") if isinstance(data, dict) else None
+    if not isinstance(flat, list):
+        return []
+    return [str(x) for x in flat][:40]
 
 
 def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
+    """按画像判定一条岗位。**判据以 LLM 标签为主，不再用正则解析 JD。**
+
+    为什么改（2026-10-19）：正则每加一条都是给上一个漏判打补丁 —— 先加
+    「正文要硕博」，再加「标注岗要区分技术活和苦力」，再加「年限是期望值不是
+    门槛」…… 这些判断决策模型一次就能给出，而且有固定选项集、可复核、有置信度。
+    正则版本的根本问题是：**它只能覆盖你想得到的情况**，想不到的全漏，
+    而且每补一条都可能像 `OD` 吃掉 `Coding` 那样误伤。
+
+    主判据来自 `job_analysis.relabel`（`relabeled_at` 非空即有标签）：
+      `role_family` / `fresh_grad` / `grad_year` / `employment_type` /
+      `seniority_score` / `is_proxy` / `tech_stack_json`
+
+    仍然保留的判据都是**结构化数据或主体身份**，不是文本解析：
+      城市、薪资区间、平台在招状态、公司是不是人力服务商、雇主是否匿名。
+    """
     title = row.get("title") or ""
     jd = row.get("job_description") or ""
-    text = title + "\n" + jd
     company = row.get("company_name") or ""
     reasons: list[str] = []
     concerns: list[str] = []
@@ -143,38 +201,73 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
     exclusions: list[str] = []
     unresolved: list[str] = []
     score = 40.0
+
+    # ---------------- 结构化数据 ----------------
     if closed(row):
         exclusions.append("本地快照已标记关闭")
     if profile.cities and row.get("city") not in profile.cities:
         exclusions.append("不在当前目标城市范围")
-    if profile.exclude_internships and re.search(r"实习|兼职|日结", title):
-        exclusions.append("标题为实习、兼职或日结")
-    if profile.exclude_internships and re.search(r"必须.{0,8}在校|仅限.{0,8}在校|在校生|每周.{0,8}(?:实习|到岗).{0,5}天|实习.{0,6}[3-6三四五六]天", jd):
-        unresolved.append("正文含在校或实习到岗要求，需核实是否有独立全职名额")
-    # 届数**只存在于标题**（以及少数正文里的「2026年应届」写法）：详情接口的
-    # `postDescription` 不含毕业时间，届别是校招岗专属的服务端结构化字段
-    # （2026-08-10 抽查 5 岗验证）。所以这条只能靠正则，不能指望 LLM 从正文读 ——
-    # 实测 8 条标题写「27 届」的岗位，LLM 全判 keep，`grad_year` 甚至标成
-    # 「26届可投」，因为标题当时压根没进 prompt。
-    cohort = [int(x) if len(x) == 4 else 2000 + int(x) for x in re.findall(r"(?<!\d)(20\d{2}|\d{2})\s*届", text)]
-    cohort.extend(int(x) for x in re.findall(r"(?<!\d)(20\d{2})\s*年\s*(?:应届|毕业)", text))
-    for first, last in re.findall(r"(?<!\d)(20\d{2}|\d{2})\s*[/、或与至~～-]\s*(20\d{2}|\d{2})\s*届", text):
-        start, end = (int(x) if len(x) == 4 else 2000 + int(x) for x in (first, last))
-        cohort.extend(range(start, end + 1) if 0 <= end - start <= 5 else (start, end))
-    if profile.graduation_year and cohort and profile.graduation_year not in cohort and min(cohort) > profile.graduation_year:
-        exclusions.append(f"正文或标题仅提及更晚届别（{min(cohort)} 届及以后）")
-    # Education and explicit entry requirements are stronger than historical LLM labels.
+    if profile.preferred_cities and row.get("city") in profile.preferred_cities:
+        score += 8
+        reasons.append("属于同级优先城市")
     degree = row.get("education") or ""
     if degree in DEGREES and DEGREES[degree] > DEGREES.get(profile.education, 99):
         exclusions.append(f"列表学历要求为{degree}")
-    if re.search(r"仅限.{0,8}(?:985|211)|(?:985|211).{0,8}(?:必须|统招院校)", jd):
-        unresolved.append("正文有院校限制，需逐句确认")
-    elif re.search(r"(?:知名|重点|一流).{0,3}(?:院校|高校|大学)", jd):
-        unresolved.append("正文提及知名或重点院校，需确认是否是硬性门槛")
-    # 外包判定：三路信号并联（公司名单 / 行业标签 / 平台代招标记），
-    # 再兜一层标题正则。**不读 JD** —— JD 里几乎不写外包（3,072 条在招正文里
-    # 只有 1 条明写「劳务派遣」），而 `客户现场`、`驻场` 这类词绝大多数指工作
-    # 地点，做 JD 关键词会误杀主动声明「非外包」的岗位。详见 profile.py 的说明。
+
+    # ---------------- LLM 标签（主判据）----------------
+    relabeled = (row.get("relabeled_at") or "").strip()
+    role = (row.get("role_family") or "").strip()
+    fresh = (row.get("fresh_grad") or "").strip()
+    grad_year = (row.get("grad_year") or "").strip()
+    employment = (row.get("employment_type") or "").strip()
+
+    if not relabeled:
+        # 没有标签就不猜。用正则兜底等于把「未知」伪装成「已判」——
+        # 那正是之前 48 条说不清为什么被排除的来源。
+        unresolved.append("尚未打标（缺 LLM 标签），先跑 job_analysis.relabel 再判")
+    else:
+        if profile.exclude_internships and employment in ("internship", "parttime"):
+            exclusions.append(f"LLM 判为{_EMPLOYMENT_LABEL.get(employment, employment)}")
+        # 应届表态：只有「明确拒绝」才硬排除。`unstated` 不是拒绝 ——
+        # 绝大多数 JD 根本不提应届，按「没提就是不要」判会误杀一大片。
+        if fresh == "reject":
+            exclusions.append("LLM 判为正文明确拒绝应届/毕业生")
+        elif fresh == "accept":
+            reasons.append("LLM 判为正文接受应届")
+            score += 12
+        elif fresh == "maybe":
+            reasons.append("LLM 判为应届可放宽（未明确）")
+            score += 5
+        # 届别：只有「明确限定更晚届别」才硬排除。
+        if profile.graduation_year:
+            if grad_year in ("2027", "other_year"):
+                exclusions.append(f"LLM 判为仅面向更晚届别（{grad_year}）")
+            elif grad_year == str(profile.graduation_year):
+                reasons.append(f"LLM 判为面向 {grad_year} 届")
+                score += 8
+        # 岗位族：这是**方向**问题，不是门槛松一点就能投的问题，所以硬排除。
+        if role:
+            fit, label = _ROLE_FIT.get(role, (0, role))
+            if fit >= _ROLE_MIN_FIT:
+                reasons.append(f"岗位族：{label}")
+                score += 4 * fit
+            else:
+                exclusions.append(f"LLM 判为{label}，与求职方向不符")
+        # 资历：**不硬排除**。招聘是许愿式的，年限是期望值不是门槛。
+        seniority = _as_float(row.get("seniority_score"))
+        if seniority is not None:
+            level = _seniority_label(seniority)
+            if seniority < 1.6:
+                reasons.append(f"LLM 判为{level}")
+                score += 8
+            else:
+                unresolved.append(f"LLM 判为{level}，年限是期望值，可尝试投递")
+        # 代招/外包：决策模型有独立的 `is_proxy` 概率，比标题正则可靠。
+        proxy = _as_float(row.get("is_proxy"))
+        if profile.exclude_staffing and proxy is not None and proxy >= 0.5:
+            exclusions.append("LLM 判为代招/外包岗位")
+
+    # ---------------- 公司主体身份 ----------------
     if profile.exclude_staffing:
         signal = staffing_signal(row)
         if signal:
@@ -185,56 +278,19 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         exclusions.append("命中自定义公司排除词")
     if profile.excluded_titles and mentions(title, profile.excluded_titles):
         exclusions.append("命中自定义岗位排除词")
-    if profile.exclude_staffing and re.search(r"猎头|劳务派遣|人力资源", company):
-        exclusions.append("公司名称带中介用工信号")
     if not company or row.get("anonymous") or re.match(r"^(?:[\u4e00-\u9fff]{2})?某", company):
         unresolved.append("雇主主体不明，需确认实际签约公司")
-    fresh = fresh_graduate_evidence(text)
-    experience = row.get("experience") or ""
-    nmatch = re.search(r"(\d+)\s*(?:[-~～]|年)", experience)
-    listed_min = int(nmatch.group(1)) if nmatch and "以内" not in experience else 0
-    if listed_min > profile.max_experience_years:
-        if fresh:
-            concerns.append(f"列表标{experience}，正文另有应届入口")
-        elif listed_min >= max(3, profile.max_experience_years + 2):
-            exclusions.append(f"列表要求{experience}，超出现有工作年限")
-        else:
-            unresolved.append(f"列表要求{experience}，需确认能否接受项目经验替代")
-    mandatory = [(years, sentence) for years, sentence, optional in experience_requirements(jd) if not optional and years > profile.max_experience_years]
-    for years, sentence in mandatory[:2]:
-        evidence.append(sentence)
-        if fresh:
-            unresolved.append(f"正文同时有{years}年经验与应届入口，需确认适用条件")
-        elif years >= max(3, profile.max_experience_years + 2):
-            exclusions.append(f"正文出现{years}年经验要求")
-        else:
-            unresolved.append(f"正文出现{years}年经验要求")
-    if fresh:
-        reasons.append("正文明确提供应届入口")
-        evidence.append(fresh)
-        score += 12
-    elif experience in ("经验不限", "在校/应届", "应届生", "1年以内"):
-        reasons.append(f"列表经验标为{experience}")
-        score += 5
-    elif not experience:
-        unresolved.append("列表未给经验要求")
-    if profile.roles:
-        hits = [x for x in profile.roles if mentions(text, [x])]
-        if not hits:
-            exclusions.append("未检出当前目标方向信号")
-        else:
-            reasons.append("方向信号：" + "、".join(hits[:4]))
-            score += min(15, len(hits) * 4)
-        # Mentioning an agent tool does not turn a sales/design job into an engineering role.
-        if re.search(r"运营|销售|商务|美工|设计师|剪辑|主播|客服|标注员|产品经理|培训讲师", title) and not re.search(r"开发|研发|工程师", title):
-            exclusions.append("标题主要职责与开发岗位不符")
-    skill_hits = [x for x in profile.skills if mentions(text, [x])]
-    if skill_hits:
-        reasons.append("技能信号：" + "、".join(skill_hits[:6]))
-        score += min(18, 3 * len(skill_hits))
-    if profile.preferred_cities and row.get("city") in profile.preferred_cities:
-        score += 8
-        reasons.append("属于同级优先城市")
+
+    # ---------------- 技术栈（LLM 抽取，不扫正文）----------------
+    stack = _tech_flat(row)
+    if stack:
+        hits = [x for x in profile.skills if mentions(" ".join(stack), [x])]
+        if hits:
+            reasons.append("技术栈命中：" + "、".join(hits[:6]))
+            score += min(18, 3 * len(hits))
+        reasons.append("LLM 技术栈：" + "、".join(stack[:6]))
+
+    # ---------------- 薪资 ----------------
     mid = salary_mid(row)
     if mid is None:
         unresolved.append("缺少可比较的月薪区间")
@@ -245,6 +301,8 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
     else:
         reasons.append("挂牌月薪与期望区间有交集")
         score += 7
+
+    # ---------------- 时间 ----------------
     age = snapshot_age(row, now)
     if age is None:
         concerns.append("没有详情/状态采集时间")
@@ -254,8 +312,11 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         concerns.append(f"最近详情/状态快照距今{int(age)}天，须确认仍在招")
     else:
         concerns.append("近期快照也不等于今天仍在招")
+
     if not jd.strip():
         unresolved.append("缺少岗位正文")
+
+    # ---------------- 分桶 ----------------
     if exclusions:
         bucket = "暂不优先"
     elif not jd.strip():
@@ -265,15 +326,18 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
     else:
         bucket = "优先核实"
     concerns = list(dict.fromkeys(exclusions + unresolved + concerns))
+
+    # 证据句：从正文里挑出含技术栈词的句子，供人工复核时定位。
+    keywords = profile.roles + profile.skills + stack[:12]
     for sentence in _sentences(jd):
         if len(evidence) >= 3:
             break
-        if len(sentence) >= 15 and mentions(sentence, profile.roles + profile.skills) and sentence[:240] not in evidence:
+        if len(sentence) >= 15 and mentions(sentence, keywords) and sentence[:240] not in evidence:
             evidence.append(sentence[:240])
     return {"bucket": bucket, "score": round(max(0, min(100, score - 8 * len(unresolved) - 40 * bool(exclusions))), 1),
             "reasons": reasons, "concerns": concerns, "evidence": evidence[:4],
             # 排除原因必须**跟着结果一起返回**。只返回 bucket 的话，界面上只能看到
-            # "暂不优先"却看不到为什么 —— 2026-10-19 分析今晚抓的数据时，
+            # 「暂不优先」却看不到为什么 —— 2026-10-19 分析今晚抓的数据时，
             # 57 条里有 48 条落在这个桶，而外部拿不到任何解释。
             # 它也是 `-40 * bool(exclusions)` 那个扣分的唯一依据，不给出来就没法核对。
             "exclusions": list(exclusions),
