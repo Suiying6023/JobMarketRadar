@@ -52,7 +52,10 @@ pythonpath = ["src"]
 #   pytest tests/_legacy         → 历史行为查证，红着不代表现在有问题
 #
 # 2026-10-19 从三个目录收回成只有 e2e：注释一直写着"默认只跑 e2e"，但
-# `testpaths` 被陆续扩成了三个目录，实际每次要跑 128 个用例。同时删掉了一段
-# 引用 `src/job_analysis` 的陈旧注释 —— 那个包在项目瘦身时已经删了。
+# `testpaths` 被陆续扩成了三个目录，实际每次要跑 128 个用例。
+#
+# 注意 `src/job_analysis` 是**独立分析包**（`python -m job_analysis.relabel` 入口），
+# 不被 `job_radar` 导入，但 `tests/analysis` 覆盖它 —— 所以那批测试按需跑，
+# 不能当成"已删模块的历史测试"一起清掉。
 testpaths = ["tests/e2e"]
 addopts = "-ra"

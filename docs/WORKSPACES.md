@@ -6,9 +6,9 @@ JobMarketRadar 提供通用岗位采集、详情补全、状态刷新、LLM 标�
 
 ```text
 Boss/
-  src/ scripts/ tests/     工程与兼容脚本
-  data/ logs/             岗位数据、运行状态与日志
-  local/                  本地技术档案与交接
+  src/ tests/             工程代码与测试
+  data/                   岗位数据、运行状态与日志
+  local/                  本地技术档案、一次性研究与交接
 JobHunt/
   data/                   分析快照与来源
   analysis/ reports/      研究代码与报告
