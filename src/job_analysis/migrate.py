@@ -49,6 +49,10 @@ NEW_COLUMNS: dict[str, str] = {
     # 把"接受应届"当布尔值会把下一届的岗位也算成可投，这是方向性错误。
     "grad_year": "TEXT",
     "grad_year_confidence": "REAL",
+    # 学历也要单独问、单独存：列表的 `education` 字段是**搜索条件的回显**，
+    # 不是岗位真实门槛。实测某岗位列表标「本科」、正文写「博士/硕士学位的同学」。
+    "education_req": "TEXT",
+    "education_confidence": "REAL",
     # 技术栈走规则抽取（不花模型调用），覆盖面比平台自带的 skills 字段广。
     "tech_stack_json": "TEXT",
     "is_proxy": "REAL",

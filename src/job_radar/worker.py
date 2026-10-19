@@ -15,6 +15,41 @@ from .annotations import hash_json
 HOT_FIELDS = ("llm", "network_enabled", "request_delay_seconds", "detail_delay_seconds", "detail_batch",
               "detail_cooldown_seconds", "burst_threshold", "burst_penalty_seconds")
 
+#: 三类停机要人做的事**完全不同**，弹窗文案必须分开说。
+#:
+#: 2026-10-19 之前一律提示「请人工确认账号状态」，把三件事糊成一句：
+#: 人打开窗口看到的是岗位页，不知道该拖滑块、该登录、还是该换出口。
+#: 实际操作中「账号被退出」和「IP 受限」都被误当成「要验证」，
+#: 白白等了一轮又一轮。
+_VERIFY_HINTS = {
+    "verification_required": "页面要求完成验证 —— 请直接在弹出的窗口里拖滑块，"
+                             "通过后运行 job-radar risk-release --confirm-account-recovered",
+    "authentication_required": "**账号已退出** —— 请在弹出的窗口里重新登录（不是滑滑块），"
+                               "登录后运行 job-radar risk-release --confirm-account-recovered",
+    "network_restriction": "**出口 IP 被限制**（code=35）—— 账号本身没问题，"
+                           "需要换网络出口或等冷却，不要反复重试",
+}
+
+
+def _verification_hint(category: str | None, code: int | None, url: str) -> str:
+    """按停机原因给出该做什么。页面地址是补充证据，分类以 category/code 为准。"""
+    hint = _VERIFY_HINTS.get(category or "")
+    if hint:
+        return hint
+    lowered = (url or "").lower()
+    if "verify" in lowered or "safe-validate" in lowered:
+        return "当前就是验证页，请直接完成验证"
+    if code == 36:
+        return "平台要求人工过验证，请完成滑块"
+    if code == 37:
+        return ("code=37「环境存在异常」——多数是 stoken 过期而非封禁："
+                "先在窗口里确认页面是否正常，正常就重新登录一次再解除")
+    if code == 35:
+        return "出口 IP 被限制，账号没问题，需要换出口或等冷却"
+    if code == 7:
+        return "登录已失效，请重新登录"
+    return "请人工确认账号与页面状态"
+
 
 def changed_fields(actual, requested, prefix=""):
     if isinstance(actual, dict) and isinstance(requested, dict):
@@ -110,14 +145,19 @@ class TaskContext:
                 # 不是限速：等 12 分钟无效，整页重载也无效，只有人点一下能解。
                 # 原先必须由操作者再敲一条 show 命令才会弹窗，等于把一个"必须人来"
                 # 的动作藏在了第二道门后面。
+                #
+                # **文案必须分清两类**（2026-10-19 用户明确要求）：
+                #   · 要滑块验证 —— 当前页面就是 verify.html，人拖一下就过
+                #   · 账号被退出 —— 页面要求登录，得重新登录，拖滑块没用
+                #   · IP 受限 —— code=35，账号没问题，是出口的问题
+                # 原来一律说「请人工确认账号状态」，把三件事糊成一句，
+                # 人打开窗口看不出该做什么。
                 try:
                     if page is not None and not getattr(self.config().browser, "headless", False):
                         await browser.show(page)
-                        on_verify = any(hint in (getattr(page, "url", "") or "")
-                                        for hint in ("verify", "safe-validate"))
-                        self.log("已自动弹出浏览器窗口" +
-                                 ("；当前就是验证页，请直接完成验证" if on_verify
-                                  else "；若不是验证页，请人工确认账号状态"),
+                        current = getattr(page, "url", "") or ""
+                        hint = _verification_hint(exc.category, exc.code, current)
+                        self.log(f"已自动弹出浏览器窗口；{hint}",
                                  kind="verification", category=exc.category)
                 except Exception:  # noqa: BLE001 - 弹窗失败不影响暂停语义
                     self.log("窗口显示失败，请检查浏览器是否可见后重试", level="warning")

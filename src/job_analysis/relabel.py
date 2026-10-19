@@ -35,7 +35,8 @@ MODEL = "decision-model-preview"
 COLUMNS = ("role_family", "role_confidence", "role_probabilities", "title_mismatch",
            "seniority_score", "seniority_confidence", "employment_type",
            "employment_confidence", "fresh_grad", "fresh_grad_confidence",
-           "grad_year", "grad_year_confidence", "is_proxy", "tech_stack_json")
+           "grad_year", "grad_year_confidence", "is_proxy", "tech_stack_json",
+           "education_req", "education_confidence")
 
 
 def load_rows(db: sqlite3.Connection, limit: int, max_age_days: int | None = 7) -> list[dict]:
@@ -102,6 +103,7 @@ def write_batch(db: sqlite3.Connection, results: list[tuple[dict, dict, str | No
             # 之前 `tech.py` 是个没人调用的孤儿库，`tech_stack_json` 靠已删除的
             # 旧脚本维护 —— 存量 7,417 条有值、新岗位全空。
             tech_json(extract_tech(item.get("job_description") or "")),
+            flat.get("education_req"), flat.get("education_confidence"),
             stamp, model, item["canonical_id"]))
     if updates:
         placeholders = ", ".join(f"{name} = ?" for name in COLUMNS)

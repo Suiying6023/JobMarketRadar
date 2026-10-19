@@ -243,6 +243,15 @@ class JobRecord(BaseModel):
     brand_id: str = ""
     company_intro: str = ""
     company_founded_year: int | None = None
+    # 工商登记照面（注册资本 / 成立时间 / 企业类型 / 经营状态 / 法定代表人 …）。
+    #
+    # 2026-10-19 之前这个字段只存在于数据库，`JobRecord` 里没有 —— 也就是说
+    # `upsert()` 根本不写它，只有旧的 `enrich_company_info.py` 用裸 SQL 维护，
+    # 所以覆盖率长期停在 4%（727/11,958）。
+    #
+    # 现在详情页的 `.business-info-box` 直接带这些字段，跟着 JD 一起白拿。
+    company_reg: dict[str, str] = Field(default_factory=dict)
+    company_reg_updated_at: str = ""
     job_status_desc: str = ""
     position_name: str = ""
     recruitment_count: str = ""

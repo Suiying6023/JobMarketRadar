@@ -274,6 +274,7 @@ class JobStore:
         "recruiter_certificated", "recruiter_id", "brand_id", "company_intro",
         "company_founded_year", "job_status_desc", "position_name",
         "recruitment_count", "latitude", "longitude",
+        "company_reg_json", "company_reg_updated_at",
         "is_proxy_job", "job_invalid", "address", "job_description", "detail_fetched_at",
         "skills_json", "labels_json", "welfare_json", "matched_queries_json",
         "source_rank", "raw_json", "collected_at",
@@ -308,6 +309,8 @@ class JobStore:
         "address", "latitude", "longitude", "detail_fetched_at",
         "recruiter_active_status",
         "job_status_desc", "position_name", "recruitment_count",
+        # 工商照面只能靠详情页拿：列表轮次的 `{}` 绝不能覆盖详情拿到的真数据。
+        "company_reg_json",
     )
 
     # 只在新值为 NULL 时保留旧值。`recruiter_active_days = 0` 是**合法且最强**的
@@ -409,6 +412,12 @@ class JobStore:
             "brand_id": job.brand_id,
             "company_intro": job.company_intro,
             "company_founded_year": job.company_founded_year,
+            # 工商照面：跟着详情页一起拿到的（`.business-info-box`）。
+            # 空字典写成 `'{}'`（列默认值），不写 `''` —— 下游用 `length()>2`
+            # 判断「有没有真数据」，`''` 和 `'{}'` 都是空，但前者会让
+            # `json_extract` 报错。
+            "company_reg_json": json.dumps(job.company_reg or {}, ensure_ascii=False),
+            "company_reg_updated_at": job.company_reg_updated_at,
             "job_status_desc": job.job_status_desc,
             "position_name": job.position_name,
             "recruitment_count": job.recruitment_count,

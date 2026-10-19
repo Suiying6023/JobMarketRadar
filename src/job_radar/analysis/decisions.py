@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..candidate import CandidateProfile
-from ..profile import staffing_signal
+from ..profile import company_risk, staffing_signal
 
 BUCKETS = ("优先核实", "需核实门槛", "信息不足", "暂不优先")
 DEGREES = {"初中及以下": 0, "高中": 1, "中专/中技": 1, "大专": 2, "本科": 3, "硕士": 4, "博士": 5}
@@ -136,6 +136,16 @@ _ROLE_FIT: dict[str, tuple[int, str]] = {
 #: 不是「门槛松一点就能投」，所以不进次级可报。
 _ROLE_MIN_FIT = 2
 
+#: 薪资**中点**超过这个值就超出可达范围（单位 K/月，月基薪）。
+#:
+#: 来自库内实测（2026-10-19，4,177 条在招）：「AI/算法 + 应届友好」分组
+#: n=625，中点 p50=12.5、p75=20、**p90=22.5**；而 5-10 年分组中点 p50=27.5。
+#: 取 25 是在这两档之间划线 —— 高于它的岗位招的是有独立交付能力的人。
+SALARY_REACH_MID = 25.0
+#: 顶薪超过「期望上限 × 这个倍数」时，说明区间是给资深人开的。
+#: 2 倍：期望上限 28K → 顶薪 56K 以上算宽区间。
+SALARY_WIDE_RATIO = 2.0
+
 #: 技术栈里出现这些，才算**AI 应用/Agent 开发**（而不是纯后端或数据标注）。
 #: 规范名来自 `job_analysis.tech` 的词表。
 _AI_APP_STACK = {
@@ -155,6 +165,15 @@ _EMPLOYMENT_LABEL = {
     "parttime": "兼职 / 非全日制",
     "campus": "校招 / 应届专项",
     "fulltime": "全职",
+}
+
+_EDU_LABEL = {
+    "bachelor": "本科及以上",
+    "college": "大专及以上",
+    "any": "学历不限",
+    "master": "硕士及以上",
+    "phd": "博士",
+    "unstated": "未说明",
 }
 
 #: `seniority_score` 是 0–4 的连续值（0=实习/应届，4=专家/管理）。
@@ -227,7 +246,6 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
     degree = row.get("education") or ""
     if degree in DEGREES and DEGREES[degree] > DEGREES.get(profile.education, 99):
         exclusions.append(f"列表学历要求为{degree}")
-
     # ---------------- LLM 标签（主判据）----------------
     relabeled = (row.get("relabeled_at") or "").strip()
     role = (row.get("role_family") or "").strip()
@@ -244,6 +262,17 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
     else:
         if profile.exclude_internships and employment in ("internship", "parttime"):
             exclusions.append(f"LLM 判为{_EMPLOYMENT_LABEL.get(employment, employment)}")
+        # 学历：**正文的学历要求比列表字段可信**。
+        # 列表的 `education` 是搜索条件回显 —— 实测某岗位列表标「本科」（因为搜索时
+        # 按本科筛），正文写的却是「2026.9-2027.8 期间已获得或即将获得**博士/硕士**
+        # 学位的同学」。只看列表会把硕博岗放进本科可投清单。
+        edu_req = (row.get("education_req") or "").strip()
+        if edu_req in ("phd", "master"):
+            need = "博士" if edu_req == "phd" else "硕士"
+            if DEGREES.get(need, 0) > DEGREES.get(profile.education, 99):
+                exclusions.append(f"正文要求{need}及以上，学历不符")
+        elif edu_req in ("bachelor", "college", "any"):
+            reasons.append(f"学历要求{_EDU_LABEL.get(edu_req, edu_req)}，符合")
         # 应届表态：只有「明确拒绝」才硬排除。`unstated` 不是拒绝 ——
         # 绝大多数 JD 根本不提应届，按「没提就是不要」判会误杀一大片。
         if fresh == "reject":
@@ -285,15 +314,38 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
                     f"（{('、'.join(stack[:5])) or '空'}），非 AI 开发岗")
             else:
                 exclusions.append(f"LLM 判为{label}，与求职方向不符")
-        # 资历：**不硬排除**。招聘是许愿式的，年限是期望值不是门槛。
+        # 资历：**2 年以上直接排除。**
+        #
+        # 这里的口径比「许愿式招人」更严，是刻意收窄的（2026-10-19 用户明确要求）：
+        # 早期把「年限是期望值」写得很松，结果 5-10 年的岗位也留在清单里
+        # （例如「AI Agent 工程师」要求 5-10 年）。对无经验的应届生，2 年以上
+        # 就是明确的「不是招你」，投了也是浪费。
+        #
+        # 可看的只有四种：
+        #   经验不限 / 在校·应届 / 1 年以内 / 正文明确接受应届
+        # 所以判定顺序是：先看有没有「应届入口」这种豁免，再看年限。
         seniority = _as_float(row.get("seniority_score"))
+        listed = (row.get("experience") or "").strip()
+        # 列表年限的第一个数字：`1-3年`→1、`3-5年`→3、`5-10年`→5、`经验不限`→0
+        m_years = re.search(r"(\d+)\s*(?:[-~～]|年)", listed)
+        listed_min = 0
+        if m_years and "以内" not in listed and "不限" not in listed:
+            listed_min = int(m_years.group(1))
+        # 豁免：正文明确接受应届时，年限可以放宽（很多 JD 写「1-3年，优秀应届可」）。
+        exempt = fresh == "accept" or listed in ("经验不限", "在校/应届", "应届生", "1年以内")
         if seniority is not None:
             level = _seniority_label(seniority)
-            if seniority < 1.6:
+            if seniority < 1.6 and listed_min <= 1:
                 reasons.append(f"LLM 判为{level}")
                 score += 8
+            elif exempt and seniority < 2.6:
+                reasons.append(f"LLM 判为{level}，但正文接受应届，可尝试")
+                score += 3
             else:
-                unresolved.append(f"LLM 判为{level}，年限是期望值，可尝试投递")
+                exclusions.append(
+                    f"经验要求不符（LLM 判为{level}；列表标「{listed or '未给'}」）")
+        elif listed_min >= 2:
+            exclusions.append(f"列表要求「{listed}」，需 2 年以上经验")
         # 代招/外包：决策模型有独立的 `is_proxy` 概率，比标题正则可靠。
         proxy = _as_float(row.get("is_proxy"))
         if profile.exclude_staffing and proxy is not None and proxy >= 0.5:
@@ -306,6 +358,23 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
             exclusions.append(f"外包/人力服务用工（{signal}）")
         elif re.search(r"外包|外派|驻场|(?<![A-Za-z])OD(?![A-Za-z])", title, re.I):
             exclusions.append("标题含外包或代招信号")
+    # 工商登记风险：低注册资本 / 非公司主体 / 刚成立。
+    # **没有工商数据时判 unknown，不进排除** —— 覆盖只有 4%，把「没数据」
+    # 当成「有风险」会把 96% 的岗位全毙掉。
+    #
+    # 缺数据只记 concern 不记 unresolved：那会让「优先核实」永久清零，
+    # 而数据缺口是**待补的动作**，不是岗位本身的缺陷。真正的拦截发生在
+    # 拿到工商数据之后（低资本 → 排除，新成立 → 待核实）。
+    reg = parse_json(row.get("company_reg_json"), {})
+    risk = company_risk(reg if isinstance(reg, dict) else {})
+    if risk["level"] == "low":
+        exclusions.append("公司风险：" + "；".join(risk["reasons"]))
+    elif risk["level"] == "new":
+        unresolved.append("公司风险：" + "；".join(risk["reasons"]))
+    elif risk["level"] == "ok":
+        reasons.append("工商：注册资本 " + str(reg.get("注册资本") or "未知"))
+    else:
+        concerns.append("缺工商登记信息，注册资本待核实")
     if profile.excluded_companies and mentions(company, profile.excluded_companies):
         exclusions.append("命中自定义公司排除词")
     if profile.excluded_titles and mentions(title, profile.excluded_titles):
@@ -321,28 +390,56 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
             score += min(18, 3 * len(hits))
         reasons.append("LLM 技术栈：" + "、".join(stack[:6]))
 
-    # ---------------- 薪资 ----------------
+    # ---------------- 薪资：三角度判断 ----------------
+    #
+    # 只看「区间有没有交集」是不够的。`25-50K` 和我期望的 `12-28K` 确实在 25-28
+    # 有交集，但那是**区间下沿恰好擦边** —— 这种岗位招的是能独当一面的人，
+    # 起薪就顶到我的上限，进去也没有成长空间。
+    #
+    # 三个角度各自回答一个问题：
+    #   · 起薪 min_k —— 「这个岗位的**底线**给到多少」→ 超过我的上限就是不看简历
+    #   · 中点 mid  —— 「这个岗位的**典型水平**」→ 超过可达范围就是资深岗
+    #   · 顶薪 max_k —— 「这个岗位的**天花板**」→ 远超我上限说明区间是给资深人开的
+    #
+    # 阈值来自库内实测（2026-10-19，4,177 条在招）：
+    #   AI/算法 + 应届友好（n=625）  起薪 p50=11 p75=15 p90=18，中点 p90=22.5
+    #   5-10 年（n=272）             起薪 p50=20 p75=30，中点 p50=27.5
+    # 所以「起薪 25K」落在 5-10 年档，「中点 37.5」也在 5-10 年档。
+    min_k = _as_float(row.get("salary_min_k"))
+    max_k = _as_float(row.get("salary_max_k"))
     mid = salary_mid(row)
-    if mid is None:
+    if mid is None or min_k is None or max_k is None:
         unresolved.append("缺少可比较的月薪区间")
-    elif float(row["salary_max_k"]) < profile.salary_min_k:
+    elif max_k < profile.salary_min_k:
         exclusions.append("挂牌月薪上限低于期望下限")
-    elif float(row["salary_min_k"]) > profile.salary_max_k:
-        unresolved.append("挂牌月薪下限高于期望范围，需核实职级")
+    elif min_k > profile.salary_max_k:
+        # 起薪就超过我的上限 —— 招的是更高一级的人，不是我。
+        exclusions.append(f"起薪 {min_k:g}K 高于期望上限 {profile.salary_max_k:g}K")
+    elif mid > SALARY_REACH_MID:
+        # 中点超出可达范围。淘宝 25-50K（中点 37.5）落在这里。
+        exclusions.append(
+            f"薪资中点 {mid:g}K 超出可达范围（应届友好岗 p90 约 {SALARY_REACH_MID:g}K）")
+    elif max_k > profile.salary_max_k * SALARY_WIDE_RATIO:
+        # 顶薪是期望上限的两倍以上：区间是为资深人开的，我够不到上半段。
+        unresolved.append(
+            f"薪资跨度 {min_k:g}-{max_k:g}K，顶薪远超期望上限，需确认职级")
+    elif min_k > profile.salary_min_k * 1.5:
+        unresolved.append(f"起薪 {min_k:g}K 偏高，需确认是否接受应届")
     else:
-        reasons.append("挂牌月薪与期望区间有交集")
+        reasons.append(f"薪资区间 {min_k:g}-{max_k:g}K 与期望相符")
         score += 7
 
     # ---------------- 时间 ----------------
+    # 只在**真有问题**时提示。原先 7 天内一律加一句「近期快照也不等于今天仍在招」——
+    # 那句话出现在每条岗位上、信息量为零，只是把真正需要注意的事项淹掉。
+    # "在招状态"另有 `hiring_of()` 按平台状态 + HR 活跃度判，不需要这里复读。
     age = snapshot_age(row, now)
     if age is None:
         concerns.append("没有详情/状态采集时间")
     elif age < -0.05:
         concerns.append("采集时间在未来，时间字段待核对")
     elif age > 7:
-        concerns.append(f"最近详情/状态快照距今{int(age)}天，须确认仍在招")
-    else:
-        concerns.append("近期快照也不等于今天仍在招")
+        concerns.append(f"快照距今 {int(age)} 天，须确认仍在招")
 
     if not jd.strip():
         unresolved.append("缺少岗位正文")

@@ -92,6 +92,20 @@ GRAD_YEAR_OPTIONS: dict[str, str] = {
     "unstated": "正文没有提到毕业届别",
 }
 
+# ⚠️ 学历必须单独问，不能只看列表的 `education` 字段。
+#
+# 2026-10-19 实例：某岗位列表标「本科」（因为搜索时按本科筛选），正文却写
+# 「2026.9-2027.8 期间已获得或即将获得**博士/硕士**学位的同学」。列表字段是
+# 搜索条件的回显，不是这个岗位的真实门槛 —— 只看它会把硕博岗放进本科可投列表。
+EDUCATION_OPTIONS: dict[str, str] = {
+    "phd": "正文要求博士（或博士优先但不排除硕士以外）",
+    "master": "正文要求硕士及以上，本科不符合",
+    "bachelor": "正文要求本科及以上（本科即可）",
+    "college": "正文要求大专及以上，本科满足",
+    "any": "正文明确学历不限",
+    "unstated": "正文没有提到学历要求",
+}
+
 QUESTIONS: dict[str, dict] = {
     "role": {
         "type": "choice",
@@ -144,6 +158,20 @@ QUESTIONS: dict[str, dict] = {
             "这个岗位是否为外包、劳务派遣或人力中介代招？"
             "例如正文写「长期驻场客户现场」「外包岗位」「由某人力公司代招」。"),
     },
+    "education": {
+        "type": "choice",
+        "instructions": (
+            "正文要求的**最低学历**是哪一档？只看正文，不要看标题或外部信息。\n"
+            "1. 写「博士」或「博士优先」→ phd。\n"
+            "2. 写「硕士及以上」「硕士研究生」「硕士学历」→ master。"
+            "注意「硕士优先」不算门槛，若同时说「本科及以上」则选 bachelor。\n"
+            "3. 写「本科及以上」「统招本科」→ bachelor；没写学历但要求「本科专业」"
+            "同理选 bachelor。\n"
+            "4. 写「大专及以上」「专科」→ college。\n"
+            "5. 写「学历不限」→ any。\n"
+            "6. **正文完全没提学历 → unstated**。不要因为岗位看着像研发岗就默认本科。"),
+        "criteria": EDUCATION_OPTIONS,
+    },
 }
 
 QUESTION_ROLE = "role"
@@ -194,6 +222,7 @@ def flatten(answers: dict) -> dict:
     fresh = answers.get("fresh_grad") or {}
     grad_year = answers.get("grad_year") or {}
     proxy = answers.get("is_proxy") or {}
+    education = answers.get("education") or {}
 
     mismatch_p = mismatch.get("noul")
     proxy_p = proxy.get("noul")
@@ -213,4 +242,6 @@ def flatten(answers: dict) -> dict:
         "grad_year": grad_year.get("choice"),
         "grad_year_confidence": _confidence(grad_year),
         "is_proxy": (float(proxy_p) if isinstance(proxy_p, (int, float)) else None),
+        "education_req": education.get("choice"),
+        "education_confidence": _confidence(education),
     }

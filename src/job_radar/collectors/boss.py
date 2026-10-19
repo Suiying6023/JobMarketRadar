@@ -42,6 +42,20 @@ SSR_SELECTORS = {
     "boss_active": ".job-boss-info .boss-active-time",
     "address": ".location-address",
     "skills": ".job-keyword-list li",
+    # ---- 工商信息：**就在详情页里，零额外请求** ----
+    #
+    # 2026-10-19 发现：详情页的 `.business-info-box` 直接带着 GSXT 照面字段。
+    # 之前一直以为要单独请求 `/gongsi/{id}.html`，其实不用 —— 只是当时按
+    # 「注册资本」去搜，而页面用的词是「**注册资金**」，所以一直搜到 0 次。
+    #
+    # 这块数据的价值：注册资本能直接筛掉皮包公司（实测某岗位对应公司仅 10 万）。
+    # 按公司去重算，抓 `/gongsi/` 是每家 1 个请求；而这里跟着 JD 一起白拿。
+    "reg_name": ".business-info-box .company-name",
+    "reg_legal": ".business-info-box .company-user",
+    "reg_founded": ".business-info-box .res-time",
+    "reg_type": ".business-info-box .company-type",
+    "reg_state": ".business-info-box .manage-state",
+    "reg_capital": ".business-info-box .company-fund",
 }
 
 # 详情页 HTML 里内联的 `var _jobInfo = {...}`：job_id / user_id / job_name /
@@ -66,6 +80,102 @@ def _inline_is_login(html: str) -> bool | None:
     if not match:
         return None
     return match.group(1) == "true"
+
+
+#: 详情页工商块（`.business-info-box`）取出来的文本带标签前缀，
+#: 例如 `注册资金100万人民币`、`成立日期2019-10-30`。这里按标签剥掉。
+_REG_LABELS = (
+    ("reg_name", "公司名称", "公司名称"),
+    ("reg_legal", "法定代表人", "法定代表人"),
+    ("reg_founded", "成立日期", "成立时间"),
+    ("reg_type", "企业类型", "企业类型"),
+    ("reg_state", "经营状态", "经营状态"),
+    # 页面写的是「注册资金」，而 GSXT 照面叫「注册资本」—— 统一成后者，
+    # 与 `company_reg_json` 已有的 727 条保持同一套键名。
+    ("reg_capital", "注册资金", "注册资本"),
+)
+
+
+def _company_reg_from_html(fields: dict) -> dict:
+    """从详情页的工商块拼出 `company_reg_json` 结构。
+
+    **零额外请求**：这些字段就在抓 JD 的同一个 SSR 文档里。
+    2026-10-19 之前一直以为要单独请求 `/gongsi/{id}.html`，其实不用 ——
+    当时按「注册资本」去搜而页面写的是「注册资金」，所以搜到 0 次、误以为没有。
+    """
+    reg: dict[str, str] = {}
+    for key, label, canonical in _REG_LABELS:
+        text = ((fields.get(key) or {}).get("text") or "").strip()
+        if not text:
+            continue
+        # 只剥开头的标签，正文里出现同样的字不受影响。
+        if text.startswith(label):
+            text = text[len(label):].strip()
+        if text:
+            reg[canonical] = text
+    # 至少要有注册资本或统一社会信用代码才算有效工商数据，避免把空块写进库。
+    return reg if "注册资本" in reg else {}
+
+
+# 风控页上的可见文案里，这些词说明「平台在说什么」。
+_PROMPT_MARKS = ("异常", "验证", "登录", "限制", "封禁", "封", "频繁", "稍后",
+                 "重试", "拒绝", "无权", "禁止", "安全", "解锁")
+_TAG_RE = re.compile(r"<[^>]+>")
+_DROP_RE = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1>", re.S | re.I)
+_SPACE_RE = re.compile(r"[\s\u3000]+")
+
+
+def _page_prompt(html: str, limit: int = 120) -> str:
+    """从风控 / 验证 / 封禁页里抠出**平台自己给的那句话**。
+
+    为什么要读它：只看 URL 和字节数只能判出「大概是哪一类」，判不出
+    「这次到底为什么」。而页面本来就写着原因 ——
+    `您的IP地址存在异常行为`、`您的账号可能存在异常访问行为，完成验证后即可正常使用`、
+    `访问过于频繁，请稍后再试`。这些原句比任何分类标签都更精确，也更能指导
+    下一步该做什么（换出口？过滑块？重新登录？还是等冷却）。
+
+    实现上刻意**不用选择器**：风控页每次改版都可能换 class，但文案几乎不变。
+    剥掉 script/style 后取可见文本，挑第一句含风控词的返回。
+    """
+    text = _DROP_RE.sub(" ", html or "")
+    text = _TAG_RE.sub(" ", text)
+    text = _SPACE_RE.sub(" ", text).strip()
+    if not text:
+        return ""
+    # 按中英文句末切句，挑含风控词的。
+    for sentence in re.split(r"[。！？!?\n]", text):
+        sentence = sentence.strip()
+        if len(sentence) < 4:
+            continue
+        if any(mark in sentence for mark in _PROMPT_MARKS):
+            # 没有标点的长串（压缩过的 HTML 文本）截到第一处分句边界，
+            # 否则会把整页文字塞进异常消息。
+            return sentence[:limit]
+    # **没命中风控词就返回空串**：正常岗位页的首句是 JD 正文，把它当成
+    # 「平台提示」写进异常消息只会误导。语义上 `prompt` = 平台在说哪里不对。
+    return ""
+
+
+#: 页面文案 → 停机类别。**这是最精确的一层判据** —— 平台自己写的原因
+#: 比 URL 模式、字节数区间都更可靠，也直接告诉人下一步该做什么。
+_PROMPT_CATEGORY = (
+    (("ip地址存在异常", "ip 地址存在异常", "ip存在异常"), "network_restriction", 35),
+    (("账户存在异常", "账号存在异常", "账号可能存在异常"), "account_restriction", 36),
+    (("环境存在异常", "环境异常"), "environment_restriction", 37),
+    (("访问过于频繁", "操作过于频繁", "操作太频繁"), "rate_limited", None),
+    (("重新登录", "请先登录", "登录已失效", "未登录"), "authentication_required", 7),
+)
+
+
+def _prompt_verdict(prompt: str) -> tuple[str, int | None] | None:
+    """把页面文案翻成 (category, code)。认不出返回 None，交给其他判据。"""
+    lowered = (prompt or "").casefold()
+    if not lowered:
+        return None
+    for marks, category, code in _PROMPT_CATEGORY:
+        if any(mark in lowered for mark in marks):
+            return category, code
+    return None
 
 
 # 详情页读到空正文时的归因标记。
@@ -109,7 +219,24 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
     # `len(str)` 只有字节数的三分之一左右，拿字符数去比阈值会把 41KB 的
     # 挑战页判成 14K 字符 → 落进 `selector_miss`（当成我们自己的 bug）。
     size = len(text.encode("utf-8", "ignore"))
-    base = {"status": status, "length": size, "url": final_url or ""}
+    # 页面自己给的文案 —— 比任何分类标签都精确，也直接指导下一步该做什么。
+    # 空正文归因时一并带出去，异常消息里就能看到「平台原话」。
+    base = {"status": status, "length": size, "url": final_url or "",
+            "prompt": _page_prompt(html)}
+
+    # **先看页面自己说什么。** 平台文案是最精确的判据：`IP地址存在异常`
+    # 就是网络限制，`账户存在异常` 就是账号限制 —— 比按 URL 或字节数猜准得多。
+    # 这一步只改判据来源，不改「撞墙即停」的语义。
+    verdict = _prompt_verdict(base.get("prompt", ""))
+    if verdict:
+        category, code = verdict
+        kind = {"network_restriction": "ip_restricted",
+                "account_restriction": "account_restricted",
+                "environment_restriction": "environment_restricted",
+                "rate_limited": "rate_limited",
+                "authentication_required": "login_wall"}.get(category, "risk")
+        return {**base, "kind": kind, "category": category, "code": code,
+                "evidence": "page_prompt"}
 
     if any(token in url_l for token in ("verify", "safe-validate", "security-check")):
         return {**base, "kind": "verification", "evidence": "url"}
@@ -1209,6 +1336,15 @@ class BossCollector(Collector):
                     return await self.page.content()
                 except PlaywrightError:
                     return html
+        # 等不到自愈时把**平台原话**记下来。挑战页上通常写着为什么被拦
+        # （「访问过于频繁」「您的IP地址存在异常行为」），比只知道"超时"有用。
+        try:
+            stuck = await self.page.content()
+            prompt = _page_prompt(stuck)
+            if prompt:
+                print(f"[RISK-PAGE] {prompt}", flush=True)
+        except PlaywrightError:
+            pass
         return html
 
     async def _collect_ssr_detail(self, job: JobRecord) -> JobRecord:
@@ -1261,9 +1397,18 @@ class BossCollector(Collector):
             if response is None:
                 raise RuntimeError("详情页没有返回响应，不写入正文")
             if response.status in (401, 403, 429):
-                self._trip_risk(rowid, f"详情页收到 HTTP {response.status}，需要人工复检",
+                # 错误页的正文里通常有平台的原始说明（「访问过于频繁」等），
+                # 读出来比只报状态码有用得多。
+                try:
+                    body_text = await response.text()
+                except PlaywrightError:
+                    body_text = ""
+                prompt = _page_prompt(body_text)
+                detail = (f"详情页收到 HTTP {response.status}"
+                          + (f"｜平台提示「{prompt}」" if prompt else "") + "，需要人工复检")
+                self._trip_risk(rowid, detail,
                                 code=None, outcome="risk", http_status=response.status,
-                                category=response_condition(None, response.status, ""))
+                                category=response_condition(None, response.status, prompt))
             html = await response.text()
             # **挑战页是读早了，不是被拦了。** 详情页的 SSR 文档拿到后，站点自己的
             # JS 还会跑一段安全校验，通过后把地址跳回 `job_detail/...?_security_check=1`。
@@ -1300,8 +1445,19 @@ class BossCollector(Collector):
             diag = _ssr_blank_reason(html, self.page.url or url, response.status)
             # 验证页与登录墙是**平台状态问题**，必须停；其余是岗位/选择器问题，
             # 记一条分类后继续跑下一条。
+            # 页面文案直接判出风险类别时，**立刻熔断** —— 这是最硬的证据。
+            if diag.get("category") and diag["kind"] in (
+                    "ip_restricted", "account_restricted", "environment_restricted",
+                    "rate_limited", "login_wall"):
+                self._finish_request(rowid, diag["kind"], diag.get("code"))
+                self._trip_risk(rowid, f"详情页提示「{diag['prompt']}」",
+                                code=diag.get("code"), outcome="risk",
+                                http_status=response.status, category=diag["category"])
             if diag["kind"] == "verification":
-                self._trip_risk(rowid, f"详情页被导向验证（证据：{diag['evidence']}）",
+                # 平台原话优先：它直接说明「为什么要验证」。
+                why = (f"平台提示「{diag['prompt']}」" if diag.get("prompt")
+                       else f"证据：{diag['evidence']}")
+                self._trip_risk(rowid, f"详情页被导向验证（{why}）",
                                 code=36, outcome="risk", http_status=response.status,
                                 category="verification_required")
             if diag["kind"] == "js_challenge":
@@ -1314,9 +1470,10 @@ class BossCollector(Collector):
                 # 同时告诉 pacer 放慢 —— 被站点推回时要让路。
                 self._pace_signal("challenge")
             self._finish_request(rowid, diag["kind"])
+            prompt = f"｜平台提示「{diag['prompt']}」" if diag.get("prompt") else ""
             raise RuntimeError(
                 f"详情页没有正文（{diag['kind']}｜HTTP {diag['status']}｜"
-                f"{diag['length']} 字节｜证据 {diag['evidence']}｜{diag['url'][:90]}），"
+                f"{diag['length']} 字节｜证据 {diag['evidence']}{prompt}｜{diag['url'][:90]}），"
                 f"不把空正文写库")
 
         inline = _inline_jobinfo(html)
@@ -1361,6 +1518,13 @@ class BossCollector(Collector):
             "inline_security_id_present": bool(inline.get("securityId")),
             "access_evidence": dict(self._detail_access_evidence),
         })
+        # 工商信息**跟着 JD 一起白拿**，不额外发请求。
+        # 只在这条岗位还没有工商数据时写，避免用页面上的简版覆盖
+        # `/gongsi/` 抓到的完整版（后者还有统一社会信用代码、注册地址等）。
+        reg = _company_reg_from_html(fields)
+        if reg and not (job.company_reg or {}).get("注册资本"):
+            job.company_reg = {**(job.company_reg or {}), **reg}
+            job.company_reg_updated_at = datetime.now(timezone.utc).isoformat()
         self._finish_request(rowid, "ok")
 
         # 把"这条读完了、多长"回传给 pacer：下一次间隔按字数微调（只算 20%，

@@ -61,10 +61,85 @@ SALARY_HIGH_MID_MIN = 15.0     # 中点 > 此值 → 高薪页单列（12 薪折
 ACTIVE_P0_MAX_DAYS = 3         # ≤3 天 → P0 优先；None（平台未给）→ P1 待确认；其余 → P2 冷池
 
 # ---------- 公司风险 ----------
-RISK_MIN_CAPITAL_WAN = 100.0   # 注册资本 < 100 万 → 低资本
-RISK_MIN_AGE_MONTHS = 12       # 成立不足 12 个月 → 新成立
+#: 注册资本下限（万元）。低于这条线判「低资本」。
+#:
+#: 为什么卡 100 万：2026-10-19 查「深圳市知行远创科技」发现注册资本只有 50 万，
+#: 而它在今天的优先清单里排第一（99 分）。50 万注册资本的小公司承担不起一个
+#: 正式员工的用工风险 —— 拖欠工资、随时解散都是现实风险。100 万是本地一家
+#: 正常软件公司的下限量级。
+RISK_MIN_CAPITAL_WAN = 100.0
+#: 成立不足这么多个月判「新成立」。12 个月是能完整走过一个财年的最短周期。
+RISK_MIN_AGE_MONTHS = 12
 # 非公司主体：个体工商户/个人独资/合伙 —— 抗风险能力与有限责任公司不可比
 RISK_ENTITY_MARKS = ("个体", "个人独资", "合伙")
+
+
+def _parse_capital_wan(raw: str) -> float | None:
+    """把「100万人民币」「1644.7496万元」「5000万美元」解析成万元。
+
+    外币不做汇率换算 —— 直接返回 None，宁可漏判也不要用猜测的汇率去筛公司。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    # 外币（美元/港元/欧元…）一律放弃判断
+    if any(mark in text for mark in ("美元", "港元", "欧元", "日元", "英镑", "新台币")):
+        return None
+    match = _re.search(r"([\d.]+)\s*万", text)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    match = _re.search(r"([\d.]+)\s*亿", text)
+    if match:
+        try:
+            return float(match.group(1)) * 10000
+        except ValueError:
+            return None
+    match = _re.search(r"([\d,]+)\s*元", text)
+    if match:
+        try:
+            return float(match.group(1).replace(",", "")) / 10000
+        except ValueError:
+            return None
+    return None
+
+
+def company_risk(reg: dict) -> dict:
+    """按工商登记字段判断公司规模风险。`reg` 是 `company_reg_json` 解析后的字典。
+
+    返回 `{"level": "low"|"new"|"noncorp"|"ok"|"unknown", "reasons": [...]}`。
+    没有工商数据时返回 `unknown` —— **不把「没数据」当成「有风险」**，
+    否则覆盖只有 4% 时会把 96% 的岗位全判成风险。
+    """
+    reasons: list[str] = []
+    if not reg:
+        return {"level": "unknown", "reasons": []}
+
+    capital = _parse_capital_wan(reg.get("注册资本") or "")
+    if capital is not None and capital < RISK_MIN_CAPITAL_WAN:
+        reasons.append(f"注册资本 {capital:g} 万，低于 {RISK_MIN_CAPITAL_WAN:g} 万")
+
+    entity = (reg.get("企业类型") or "") + (reg.get("企业名称") or "")
+    if any(mark in entity for mark in RISK_ENTITY_MARKS):
+        reasons.append("非公司主体（个体/个人独资/合伙）")
+
+    founded = (reg.get("成立时间") or "")[:10]
+    if founded:
+        try:
+            age_days = (date.today() - date.fromisoformat(founded)).days
+            if age_days < RISK_MIN_AGE_MONTHS * 30:
+                reasons.append(f"成立仅 {age_days // 30} 个月")
+        except ValueError:
+            pass
+
+    if not reasons:
+        return {"level": "ok", "reasons": []}
+    # 低资本是最硬的一条，其余算附带说明。
+    level = "low" if capital is not None and capital < RISK_MIN_CAPITAL_WAN else "new"
+    return {"level": level, "reasons": reasons}
+
 
 # ---------- 标题 / 公司黑名单 ----------
 EXCLUDE_TITLE = (
