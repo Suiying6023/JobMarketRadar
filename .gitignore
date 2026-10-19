@@ -120,3 +120,6 @@ data/batches/
 # 和抓取过程中的缓存。按前缀兜底，避免新增 profile 目录时漏掉。
 # 不加尾部 `/`：profile 目录可能尚不存在，git 对不存在的路径判不出是不是目录。
 /.browser-profile*
+# 打标/采集的逐条日志（含岗位标题、canonical_id、LLM 原始回答）—— 与数据库同属
+# 采集数据，不入库。2026-10-19 发现 relabel-log.jsonl 被误提交过一次。
+data/*.jsonl
