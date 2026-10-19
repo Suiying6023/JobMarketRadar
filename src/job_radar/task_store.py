@@ -12,7 +12,8 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 
-KINDS = {"collect": "采集岗位", "recommend": "推荐岗位", "details": "补全详情", "refresh": "刷新状态", "tag": "LLM 打标"}
+KINDS = {"collect": "采集岗位", "recommend": "推荐岗位", "session": "采集会话",
+         "details": "补全详情", "refresh": "刷新状态", "tag": "LLM 打标"}
 ACTIVE = ("queued", "running", "waiting_verification", "stopping")
 TERMINAL = ("succeeded", "failed", "cancelled", "interrupted")
 
@@ -29,6 +30,19 @@ class TaskOptions(BaseModel):
     canonical_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(default_factory=list, max_length=1000)
     recommend_pages: int = Field(default=2, ge=1, le=6)
     expectation_label: str = Field(default="", max_length=100)
+    # ---- 采集会话（kind="session"，见 session.py）----
+    # 阶段在这里就校验：非法值应当在**建任务时**被拒（HTTP 422），
+    # 而不是先起一个工作进程、再让它在浏览器起来之后报错。
+    phase: str = Field(default="", pattern=r"^$|^(calibrate|sweep|backfill)$")
+    # 页数/详情条数用 None 表示「没填，按阶段默认」。0 是**有意义的取值**
+    # （sweep 的 detail_limit=0 就是「不抓正文」），不能被当成未填。
+    pages: int | None = Field(default=None, ge=1, le=30)
+    detail_limit: int | None = Field(default=None, ge=0, le=500)
+    # 关键词与城市同时接受数组（LLM / 前端）和分隔字符串（CLI），
+    # 由 session.parse_names() 统一解析。
+    keywords: list[str] | str = Field(default_factory=list)
+    cities: list[str] | str = Field(default_factory=list)
+    output: str = Field(default="", max_length=500)
 
 
 def now() -> str:

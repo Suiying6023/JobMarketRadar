@@ -30,11 +30,6 @@
 """
 from __future__ import annotations
 
-import os
-
-# (标识, SOCKS 端口)。顺序即默认轮换顺序。
-EXITS: list[tuple[str, int]] = [("vm", 1080), ("container", 1082)]
-
 # 采集链路走本机家宽直连，没有端口。巡检需要把它和跳板出口并列展示时用这个。
 DIRECT_LABEL = "家宽"
 
@@ -44,30 +39,6 @@ FORBIDDEN_INFO_URL = "https://www.zhipin.com/wapi/zpsecureflow/forbidden-info?"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-
-def exit_pool(only: str = "", skip: str = "") -> list[tuple[str, int]]:
-    """按标识筛出口池。`only` 白名单优先于 `skip` 黑名单，都为空则返回全池。
-
-    环境变量 `JOB_RADAR_EXITS` 可整体覆盖（格式 `vm:1080,container:1082`），
-    用于临时加出口而不改代码。
-    """
-    pool = _from_env() or list(EXITS)
-    if only:
-        picked = [(t, p) for t, p in pool if t == only]
-        if not picked:
-            raise ValueError(
-                f"--only-exit {only!r} 不在出口池里，可选 {[t for t, _ in pool]}")
-        return picked
-    if skip:
-        dropped = {s.strip() for s in skip.split(",") if s.strip()}
-        unknown = dropped - {t for t, _ in pool}
-        if unknown:
-            raise ValueError(
-                f"--skip-exit 里有不认识的标识 {sorted(unknown)}，"
-                f"可选 {[t for t, _ in pool]}")
-        return [(t, p) for t, p in pool if t not in dropped]
-    return pool
 
 
 def exit_verdict(port: int | None, timeout: int = 20) -> tuple[str, str]:
@@ -159,20 +130,3 @@ def exit_verdict(port: int | None, timeout: int = 20) -> tuple[str, str]:
             f"IP {ip} 被标记且平台只给「登录」这条路（tip: {tip}）——"
             f"验证页会打开但组件不加载，点也点不了。{when}")
     return "blocked", f"IP {ip} 硬封，人工验证无效，只能等。{when}"
-
-
-def _from_env() -> list[tuple[str, int]]:
-    raw = os.environ.get("JOB_RADAR_EXITS", "").strip()
-    if not raw:
-        return []
-    out: list[tuple[str, int]] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        tag, _, port = part.partition(":")
-        if not tag or not port.isdigit():
-            raise ValueError(
-                f"JOB_RADAR_EXITS 格式应为 `标识:端口,...`，收到 {part!r}")
-        out.append((tag.strip(), int(port)))
-    return out

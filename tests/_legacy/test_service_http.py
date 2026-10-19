@@ -13,8 +13,9 @@ def test_service_http_preview_options_events_and_invalid_requests(local_server):
     assert any(city["name"] == "杭州" for city in catalog["cities"])
     # 任务种类以 task_store.KINDS 为准；recommend（推荐流采集）是后来加的，
     # 这里原先只写了四种，导致目录接口一加新种类测试就红。
+    # session（采集会话：校准/扫描/补正文）同理。
     assert {item["value"] for item in catalog["task_kinds"]} == {
-        "collect", "recommend", "details", "refresh", "tag"
+        "collect", "recommend", "session", "details", "refresh", "tag"
     }
     assert call(server, "/api/tasks", {"kind": "collect"}, headers)[0] == 409
     assert call(server, "/api/tasks", {"kind": "shell"}, headers)[0] == 400

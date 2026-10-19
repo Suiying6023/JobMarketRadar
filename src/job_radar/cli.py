@@ -20,7 +20,7 @@ for stream in (sys.stdout, sys.stderr):
 
 app = typer.Typer(no_args_is_help=True, help="岗位数据服务：采集、存储、任务、配置与日志")
 console = Console()
-from .service_cli import tasks as task_commands, settings as config_commands, run_task
+from .service_cli import tasks as task_commands, settings as config_commands, run_task, run_task_with_options
 app.add_typer(task_commands, name="task")
 app.add_typer(config_commands, name="config")
 app.command(name="run")(run_task)
@@ -252,6 +252,53 @@ def collect(
     if allow_live_chat:
         raise typer.BadParameter("数据服务任务处理岗位数据；联系动作使用独立流程")
     run_task("collect", config, limit, dry_run)
+
+
+@app.command()
+def session(
+    config: str = DEFAULT_CONFIG,
+    phase: str = typer.Option("calibrate", "--phase",
+                              help="calibrate=推荐流校准（含抓正文）/ sweep=关键词扫描 / backfill=存量补正文"),
+    pages: int | None = typer.Option(None, "--pages", min=1, max=30,
+                                     help="翻几页；不填按阶段默认（校准 5 页 / 扫描取配置 pages_per_query）"),
+    detail_limit: int | None = typer.Option(None, "--detail-limit", min=0, max=500,
+                                            help="抓多少条正文；不填按阶段默认（校准 40 / 扫描 8 / 补正文取 --limit）；扫描填 0 表示只扫不抓"),
+    keywords: str = typer.Option("", "--keywords",
+                                 help="逗号分隔；留空用配置里的，并按「最久没采过」轮转（仅 sweep 生效）"),
+    cities: str = typer.Option("", "--cities", help="逗号分隔；留空用配置里的（仅 sweep 生效）"),
+    output: str = typer.Option("", "--output",
+                               help="校准记录 JSONL 路径；留空 output/calibration-<任务ID>.jsonl"),
+    limit: int = typer.Option(100, "--limit", min=1, max=100000, help="数量上限（校准的候选预算 / 补正文的条数上限）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只输出执行计划，不联网、不起浏览器"),
+) -> None:
+    """采集会话：推荐流校准 → 关键词扫描 → 存量补正文（与网页共用任务核心）。
+
+    三个阶段可以单独跑，也可以按顺序跑完一条链：
+
+        job-radar session --phase calibrate --pages 5 --detail-limit 40
+        job-radar session --phase sweep --keywords "AI Agent,Python" --detail-limit 8
+        job-radar session --phase backfill --detail-limit 60 --limit 60
+
+    `--dry-run` 不花任何请求：先把关键词、城市、页数的解析结果打出来核对。
+    任务运行中改配置（`request_delay_seconds` / `detail_delay_seconds` /
+    `detail_batch` / `burst_threshold` 等）会即时生效，见 `worker.HOT_FIELDS`。
+    """
+    if phase not in ("calibrate", "sweep", "backfill"):
+        raise typer.BadParameter("阶段只能是 calibrate / sweep / backfill")
+    options: dict = {"phase": phase}
+    # 只在**真的传了**的时候写进选项：`detail_limit=0` 对扫描阶段是有效取值
+    # （只扫不抓正文），不能用 `or` 之类的写法把 0 当成「没填」。
+    if pages is not None:
+        options["pages"] = pages
+    if detail_limit is not None:
+        options["detail_limit"] = detail_limit
+    if keywords.strip():
+        options["keywords"] = keywords
+    if cities.strip():
+        options["cities"] = cities
+    if output.strip():
+        options["output"] = output
+    run_task_with_options("session", config, limit, dry_run, "", options)
 
 
 @app.command(name="init")

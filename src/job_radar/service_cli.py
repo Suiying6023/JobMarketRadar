@@ -33,8 +33,29 @@ def request(url, path, payload=None):
 
 
 @tasks.command("start")
-def start(kind: str, limit: int = 100, dry_run: bool = False, round_id: str = "", url: str = "http://127.0.0.1:8765"):
-    request(url, "/api/tasks", {"kind": kind, "options": {"limit": limit, "dry_run": dry_run, "round_id": round_id}})
+def start(kind: str, limit: int = 100, dry_run: bool = False, round_id: str = "", options: str = "",
+          url: str = "http://127.0.0.1:8765"):
+    """启动任务。`options` 是 JSON 对象字符串，用来传任务种类专属选项。
+
+    为什么要有这个口子：`session`（采集会话）需要 phase / pages / detail_limit /
+    keywords 这些选项，而通用三项（limit / dry_run / round_id）表达不了。让 Agent
+    去拼 HTTP 请求体也行，但那样每次都得重新确认 CSRF 与请求头；这里收一个 JSON
+    字符串，仍然只有一个入口：
+
+        job-radar task start session --options '{"phase":"sweep","pages":2}'
+    """
+    extra: dict = {}
+    if options.strip():
+        try:
+            extra = json.loads(options)
+        except ValueError:
+            output({"error": "options 需为 JSON 对象字符串，例如 {\"phase\":\"sweep\"}"})
+            raise typer.Exit(1)
+        if not isinstance(extra, dict):
+            output({"error": "options 需为 JSON 对象"})
+            raise typer.Exit(1)
+    request(url, "/api/tasks", {"kind": kind, "options": {**extra, "limit": limit, "dry_run": dry_run,
+                                                          "round_id": round_id}})
 
 
 @tasks.command("list")
@@ -84,11 +105,27 @@ def config_set(file: Path, url: str = "http://127.0.0.1:8765"):
 
 
 def run_task(kind: str, config: str = "config.local.yaml", limit: int = 100, dry_run: bool = False, round_id: str = ""):
-    """直接运行一个任务，结束时输出 JSON；与网页使用同一任务核心。"""
+    """直接运行一个任务，结束时输出 JSON；与网页使用同一任务核心。
+
+    这个函数同时是 `job-radar run` 这条命令的实现，所以**签名必须保持
+    CLI 能生成的形状**（typer 不支持 `dict` 类型的参数，加了会让整个 CLI 起不来）。
+    需要更多选项的任务走下面的 `run_task_with_options()`。
+    """
+    return run_task_with_options(kind, config, limit, dry_run, round_id)
+
+
+def run_task_with_options(kind: str, config: str = "config.local.yaml", limit: int = 100,
+                          dry_run: bool = False, round_id: str = "", options: dict | None = None):
+    """`run_task()` 的加选项版本，供需要 phase/pages/keywords 的任务种类（session）使用。
+
+    `options` 只**补充**基础三项：同名键不会覆盖 limit / dry_run / round_id，
+    这样「数量上限」和「计划预览」始终只有一个来源。
+    """
+    payload = {**(options or {}), "limit": limit, "dry_run": dry_run, "round_id": round_id}
     task = None
     try:
         with TaskManager(SettingsStore(config)) as manager:
-            task = manager.start(kind, {"limit": limit, "dry_run": dry_run, "round_id": round_id})
+            task = manager.start(kind, payload)
             try:
                 while manager.store.get(task["id"])["status"] not in TERMINAL:
                     if manager.store.get(task["id"])["status"] == "waiting_verification":

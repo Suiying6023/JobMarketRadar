@@ -17,6 +17,7 @@ from boss_scrape.errors import AUTH_EXPIRED_CODES, RISK_CODES, RISK_TEXTS
 from boss_scrape.htmlpage import query as html_query
 
 from ..models import CityConfig, CollectionConfig, JobRecord, Platform, SearchFilters
+from ..profile import is_staffing_company
 from ..safety import AccessBlocked, AccessGate
 from ..throttle import gaussian
 from .base import Collector
@@ -65,6 +66,66 @@ def _inline_is_login(html: str) -> bool | None:
     if not match:
         return None
     return match.group(1) == "true"
+
+
+# 详情页读到空正文时的归因标记。
+_CLOSED_MARKS = ("职位已关闭", "该职位已下线", "岗位已下线", "已停止招聘",
+                 "职位不存在", "该职位不存在", "已结束招聘", "职位已失效")
+_LOGIN_MARKS = ("登录后查看", "请先登录", "登录/注册")
+_VERIFY_MARKS = ("拖动滑块", "请完成验证", "安全验证", "验证后继续")
+
+
+def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
+    """详情页没有 `.job-sec-text` 时，**说清是哪一种空**。
+
+    为什么值得单独做：2026-10-19 一轮校准有 5 条失败，原来的错误信息一律是
+    「岗位可能已下线或页面改版」—— 把四件完全不同的事糊成一句：
+
+      · 平台要人工验证（风控信号，必须停）
+      · 岗位真的下线了（正常，不算问题）
+      · 未登录只能看预览（账号问题，必须停）
+      · 我们的选择器失效了（我们自己的 bug）
+
+    糊在一起的代价是双向的：真下线被当成风控而白白停轮，风控被当成下线而继续
+    加压，选择器失效则长期无声地丢正文。所以这里把证据带回异常消息里。
+
+    ⚠️ 归因顺序是刻意的：**地址栏优先于正文关键词**。`verify` 出现在 URL 上是
+    平台把我们送去了验证页，这是硬证据；而"安全验证"四个字可能只是页面脚本里的
+    一句文案。反过来判会把正常岗位误判成风控 —— 而误判风控要人工解冻，代价很高。
+    """
+    text = html or ""
+    lowered = text.casefold()
+    url_l = (final_url or "").casefold()
+    base = {"status": status, "length": len(text), "url": final_url or ""}
+
+    if any(token in url_l for token in ("verify", "safe-validate", "security-check")):
+        return {**base, "kind": "verification", "evidence": "url"}
+    # `/web/passport/zp/security.html` 是**风控阶梯的第二级**：JS 安全挑战，
+    # 通常 10-16 秒自愈，不是硬拦。要和"滑块验证"分开 —— 混为一谈会让我们
+    # 要么对它过度反应（白停一轮），要么把它当成自己的 bug（继续加压）。
+    # 判据沿用 `service_jobs.page_session_check`：有验证控件才算要人，
+    # 没有就是可自愈的 JS 挑战。
+    if "/web/passport/zp/security.html" in url_l or "/zp/security.html" in url_l:
+        hit = next((m for m in _VERIFY_MARKS if m in lowered), None)
+        return {**base, "kind": "verification" if hit else "js_challenge",
+                "evidence": hit or "security.html"}
+    # 正文里出现验证控件**且整页很短**才认：长页面里的"安全验证"多半是页脚文案。
+    if len(text) < 8000:
+        hit = next((m for m in _VERIFY_MARKS if m in lowered), None)
+        if hit:
+            return {**base, "kind": "verification", "evidence": hit}
+    hit = next((m for m in _LOGIN_MARKS if m in lowered), None)
+    if hit:
+        return {**base, "kind": "login_wall", "evidence": hit}
+    hit = next((m for m in _CLOSED_MARKS if m in lowered), None)
+    if hit:
+        return {**base, "kind": "closed", "evidence": hit}
+    if "job-sec-text" not in text:
+        # 连容器都没有：页面很长说明结构变了，很短说明压根不是详情页。
+        kind = "selector_miss" if len(text) > 4000 else "empty_page"
+        return {**base, "kind": kind, "evidence": "no-container"}
+    # 容器在、里面是空的：岗位在线但正文为空（少数岗位确实不写 JD）。
+    return {**base, "kind": "blank_jd", "evidence": "empty-container"}
 
 
 # 必须是 jobs（带 s）。`/web/geek/job` 会 302 到 `/web/geek/jobs`，多一跳；
@@ -432,7 +493,12 @@ class BossCollector(Collector):
     @staticmethod
     def _kind_of(url: str) -> str:
         """按 URL 判断请求类型。风险差异很大：详情接口几乎承担了全部风控。"""
-        if DETAIL_PATH in url:
+        # SSR 详情页（`/job_detail/{id}.html`）也是详情，必须归到 `detail`。
+        # 漏掉它的后果是**观测失真**：2026-10-19 实测，SSR 路径的详情请求
+        # 全被记成 `list`，于是"详情占多少请求""code=37 浪费在哪类请求上"
+        # 这两类分析对 SSR 路径全部失效。只影响记账归类，不影响 pacing
+        # （pacing 由调用点显式传 "detail"）。
+        if DETAIL_PATH in url or "/job_detail/" in url:
             return "detail"
         if "security-check" in url:
             return "security_check"
@@ -939,6 +1005,11 @@ class BossCollector(Collector):
             return False
         if any(word.casefold() in company for word in self.config.exclude_company_keywords):
             return False
+        # 外包/人力服务公司名单：命中即降级为 sample（**仍然入库**，只是不进投递池，
+        # 下次增量采集照样能识别为已见）。放在采集侧而不是只放分析侧，是因为它
+        # 决定要不要为这个岗位花一次详情请求 —— 详情是最贵、最容易触发风控的一环。
+        if is_staffing_company(job.company_name):
+            return False
         if self.config.service.candidate_filtering and self.config.candidate is not None:
             from ..candidate import passes_list_facts
             data = job.model_dump()
@@ -1097,6 +1168,16 @@ class BossCollector(Collector):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", job.source_job_id):
             raise ValueError("岗位 ID 字符格式无效，无法打开详情页")
 
+        # 节奏：这条路径是 `page.goto` 直接发文档请求，不经过 `_same_origin_fetch`，
+        # 所以必须自己调 pace。**漏了这一句的后果不是"稍快一点"**：末尾那个
+        # `if pace is None` 的兜底 sleep 在 pace 已注入时会整段跳过，详情就变成
+        # 零间隔连发——而详情正是最贵、最容易触发封禁的一环。
+        # （2026-10-19 实测：未接 pace 时 2 条详情 5 秒跑完，pacer_requests=1。）
+        pace = getattr(self, "pace", None)
+        if pace is not None:
+            await pace("detail")
+            self._require_online()
+
         url = f"{ORIGIN}{DETAIL_PAGE.format(job.source_job_id)}"
         rowid = self._log_request(url)
         self.request_count += 1
@@ -1141,8 +1222,21 @@ class BossCollector(Collector):
         fields = html_query(html, SSR_SELECTORS)
         description = (fields["jd"]["text"] or "").strip()
         if not description:
-            self._finish_request(rowid, "short")
-            raise RuntimeError("详情页没有读到正文（岗位可能已下线或页面改版），不把空正文写库")
+            diag = _ssr_blank_reason(html, self.page.url or url, response.status)
+            # 验证页与登录墙是**平台状态问题**，必须停；其余是岗位/选择器问题，
+            # 记一条分类后继续跑下一条。
+            if diag["kind"] == "verification":
+                self._trip_risk(rowid, f"详情页被导向验证（证据：{diag['evidence']}）",
+                                code=36, outcome="risk", http_status=response.status,
+                                category="verification_required")
+            self._finish_request(rowid, diag["kind"])
+            if diag["kind"] == "login_wall":
+                raise PlatformRiskStop("详情页要求登录后才能看正文，不把预览当完整正文",
+                                       category="authentication_required")
+            raise RuntimeError(
+                f"详情页没有正文（{diag['kind']}｜HTTP {diag['status']}｜"
+                f"{diag['length']} 字节｜证据 {diag['evidence']}｜{diag['url'][:90]}），"
+                f"不把空正文写库")
 
         inline = _inline_jobinfo(html)
         encrypt_id = inline.get("job_id") or job.source_job_id

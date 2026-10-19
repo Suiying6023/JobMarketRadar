@@ -152,6 +152,17 @@ async def execute(ctx):
             result["plan"] = query_plan(cfg)
             result["round_id"] = ctx.task["options"].get("round_id", "") or ctx.ident
             result["queries"] = len(result["plan"])
+        elif kind == "session":
+            # 采集会话的阶段、关键词、城市、输出路径都由选项决定，预览走 session.plan()：
+            # 不花一个请求就能确认解析结果（尤其关键词/城市是不是被正确拆分）。
+            from .session import plan as session_plan
+            result.pop("queries")
+            if ctx.database.exists():
+                with JobStore(ctx.database, read_only=True) as source:
+                    result["source_records"] = source.conn.execute("SELECT COUNT(*) FROM jobs WHERE platform='boss'").fetchone()[0]
+                    result["plan"] = session_plan(ctx, cfg, source.keyword_recency(), source)
+            else:
+                result["plan"] = session_plan(ctx, cfg)
         else:
             result.pop("queries")
             if ctx.database.exists():
@@ -169,6 +180,12 @@ async def execute(ctx):
             return await collect(ctx, store, cfg)
         if kind == "recommend":
             return await recommend(ctx, store, cfg)
+        if kind == "session":
+            # 采集会话：推荐流校准 / 关键词扫描 / 存量补正文，见 session.py。
+            # 选行、分页、去重都在 session 内部完成，不走下面那条
+            # `selected_rows()` 的通用选行路径。
+            from .session import run_session
+            return await run_session(ctx, store, cfg)
         rows = selected_rows(ctx, store, kind, cfg)
         ctx.report(total=len(rows))
         if not rows:

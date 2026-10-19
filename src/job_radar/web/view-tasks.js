@@ -534,6 +534,13 @@ export async function startTask(button) {
     limitInput.focus();
     return;
   }
+  // 采集会话的额外选项：留空就交给后端的阶段默认值，填了就必须是合法整数，
+  // 否则会出现「任务创建成功但一个查询都没跑」这种最难查的失败。
+  const session = kindSelect.value === 'session' ? readSessionOptions() : { options: {}, problem: '' };
+  if (session.problem) {
+    if (message) { message.className = 'field-msg'; setText(message, session.problem); }
+    return;
+  }
   const dryRun = dryRunBox.checked === true;
   if (!dryRun) {
     const result = await openDialog({
@@ -549,7 +556,10 @@ export async function startTask(button) {
   setPending(button, true, '启动中…');
   if (message) { message.className = 'hint'; setText(message, ''); }
   try {
-    const task = normalizeTask(await API.createTask({ kind: kindSelect.value, options: { limit, dry_run: dryRun, round_id: roundId } }));
+    const task = normalizeTask(await API.createTask({
+      kind: kindSelect.value,
+      options: { limit, dry_run: dryRun, round_id: roundId, ...session.options },
+    }));
     if (message) {
       message.className = 'hint';
       setText(message, `已创建任务 ${task.id}（${kindLabel(task.kind)}${dryRun ? '，计划预览' : ''}）。`);
@@ -750,6 +760,8 @@ export function populateTaskForm() {
   clear(kindSelect);
   for (const kind of kinds) kindSelect.appendChild(h('option', { value: kind.value, text: kind.label }));
   if (previous && kinds.some((kind) => kind.value === previous)) kindSelect.value = previous;
+  // 重绘后会话选项的可见性要跟当前选中的种类一致（不重建节点，未提交的输入不丢）。
+  syncSessionFields(kindSelect.value);
 }
 
 export function renderTasks() {
@@ -762,10 +774,93 @@ export function renderTasks() {
 
 const KIND_HINTS = {
   collect: '按配置里的城市、搜索词与筛选组合采集岗位列表。',
+  session: '采集会话：推荐流校准 → 关键词扫描 → 存量补正文，三个阶段选一个执行。',
   details: '为缺少 JD 正文的岗位补全详情。',
   refresh: '刷新已有岗位的在招状态（默认本地直连，可在配置页改为代理）。',
   tag: '按当前提示词对岗位原文做 LLM 打标。',
 };
+
+// ============================== 采集会话选项 ==============================
+// `session` 是唯一需要额外选项的任务种类（阶段 / 页数 / 正文条数 / 关键词）。
+// 这些字段按需插进启动表单的网格里，结构与 index.html 的静态字段相同（都是
+// `.field`），所以不用改样式；其它任务种类看不到它们（`hidden`，样式表里有
+// `[hidden]{display:none!important}` 兜底）。
+
+const SESSION_PHASES = [
+  { value: 'calibrate', label: '推荐流校准（含抓正文）' },
+  { value: 'sweep', label: '关键词扫描（就地补详情）' },
+  { value: 'backfill', label: '存量补正文' },
+];
+
+function ensureSessionFields() {
+  const existing = Array.from(document.querySelectorAll('[data-session-field]'));
+  if (existing.length) return existing;
+  const grid = document.querySelector('#task-form .grid');
+  if (!grid) return [];
+  const nodes = [
+    h('div', { class: 'field', dataset: { sessionField: '1' } },
+      h('label', { for: 'task-session-phase', text: '会话阶段' }),
+      h('select', { id: 'task-session-phase' },
+        ...SESSION_PHASES.map((item) => h('option', { value: item.value, text: item.label }))),
+      h('p', { class: 'hint', text: '校准=推荐流采样并抓正文；扫描=按关键词轮转采集并就地补详情；补正文=只补 active 且缺正文的存量岗位。' })),
+    h('div', { class: 'field', dataset: { sessionField: '1' } },
+      h('label', { for: 'task-session-pages', text: '翻页数（可留空）' }),
+      h('input', {
+        id: 'task-session-pages', type: 'number', min: '1', max: '30', step: '1',
+        inputmode: 'numeric', placeholder: '校准 5 / 扫描取配置',
+      }),
+      h('p', { class: 'hint', text: '留空按阶段默认。' })),
+    h('div', { class: 'field', dataset: { sessionField: '1' } },
+      h('label', { for: 'task-session-detail-limit', text: '正文条数（可留空）' }),
+      h('input', {
+        id: 'task-session-detail-limit', type: 'number', min: '0', max: '500', step: '1',
+        inputmode: 'numeric', placeholder: '校准 40 / 扫描 8 / 补正文取数量上限',
+      }),
+      h('p', { class: 'hint', text: '填 0 表示扫描时只取列表、不抓正文。' })),
+    h('div', { class: 'field', dataset: { sessionField: '1' } },
+      h('label', { for: 'task-session-keywords', text: '关键词（可留空）' }),
+      h('input', {
+        id: 'task-session-keywords', type: 'text', maxlength: '1000',
+        placeholder: '例如 AI Agent,Python',
+      }),
+      h('p', { class: 'hint', text: '逗号分隔；留空用配置里的，并按「最久没采过」轮转。' })),
+  ];
+  for (const node of nodes) grid.appendChild(node);
+  return nodes;
+}
+
+function syncSessionFields(kind) {
+  const visible = kind === 'session';
+  for (const node of ensureSessionFields()) node.hidden = !visible;
+}
+
+/** 读一个可留空的整数输入；留空返回 undefined（后端按阶段默认），非法则记一条问题。 */
+function readOptionalInt(id, label, min, max, problems) {
+  const raw = (document.getElementById(id)?.value || '').trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    problems.push(`${label}需为 ${min}–${max} 的整数（留空按默认）。`);
+    return undefined;
+  }
+  return value;
+}
+
+/** 采集会话的额外选项。留空一律不发送，让后端的阶段默认值生效。 */
+export function readSessionOptions() {
+  const problems = [];
+  const options = {};
+  const phase = document.getElementById('task-session-phase')?.value || '';
+  if (phase) options.phase = phase;
+  const pages = readOptionalInt('task-session-pages', '翻页数', 1, 30, problems);
+  if (pages !== undefined) options.pages = pages;
+  // `detail_limit: 0` 是有效取值（只扫不抓），所以只判 `undefined`，不判真假。
+  const detailLimit = readOptionalInt('task-session-detail-limit', '正文条数', 0, 500, problems);
+  if (detailLimit !== undefined) options.detail_limit = detailLimit;
+  const keywords = (document.getElementById('task-session-keywords')?.value || '').trim();
+  if (keywords) options.keywords = keywords;
+  return { options, problem: problems[0] || '' };
+}
 
 export function wireTasksEvents() {
   const start = document.getElementById('task-start');
@@ -774,7 +869,10 @@ export function wireTasksEvents() {
   if (form) form.addEventListener('submit', (event) => event.preventDefault());
   const kindSelect = document.getElementById('task-kind');
   const hintNode = document.getElementById('task-kind-hint');
-  const syncHint = () => { if (hintNode && kindSelect) setText(hintNode, KIND_HINTS[kindSelect.value] || ''); };
+  const syncHint = () => {
+    if (hintNode && kindSelect) setText(hintNode, KIND_HINTS[kindSelect.value] || '');
+    if (kindSelect) syncSessionFields(kindSelect.value);
+  };
   if (kindSelect) { kindSelect.addEventListener('change', syncHint); syncHint(); }
 }
 

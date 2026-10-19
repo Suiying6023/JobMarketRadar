@@ -11,49 +11,20 @@ from __future__ import annotations
 
 import re as _re
 from datetime import date, timedelta
-
-# ---------- 届数 ----------
-COHORT_YEAR = 2026          # 用户毕业届；标题含更晚届数（27届+）即剔除
-
-# ---------- 城市 ----------
-# 投递池城市白名单。采集侧按全国抓（config 里配城市），这里决定**哪些进池**：
-# 名单外的岗位降级为 sample —— 仍在库里参与增量去重，只是不进投递池。
-# 想临时看全国盘子用环境变量，不必改代码：
-#   set JOB_RADAR_CITIES=*              # 不限城市
-#   set JOB_RADAR_CITIES=杭州,上海,深圳,苏州
-import os as _os
 from pathlib import Path as _Path
 
-_env_cities = (_os.environ.get("JOB_RADAR_CITIES") or "").strip()
-if not _env_cities:
-    _dotenv_path = _Path(__file__).resolve().parents[2] / ".env"
-    if _dotenv_path.exists():
-        try:
-            for _line in _dotenv_path.read_text(encoding="utf-8").splitlines():
-                if _line.strip().startswith("JOB_RADAR_CITIES="):
-                    _env_cities = _line.strip().split("=", 1)[1].strip()
-                    break
-        except Exception:
-            pass
-
-if _env_cities == "*":
-    CITY_WHITELIST: set[str] | None = None      # None = 不限城市（全国）
-elif _env_cities:
-    CITY_WHITELIST = {c.strip() for c in _env_cities.split(",") if c.strip()}
-else:
-    CITY_WHITELIST = {"杭州", "上海", "深圳"}
-
-# 池内排序偏好：杭州、上海、深圳同等优先。
-# 与白名单是两件事——白名单决定「能不能进池」，这里决定「排多前」。
+# ---------- 城市 ----------
+#
+# 2026-10-19 删除了 `CITY_WHITELIST` / `city_allowed()` / `JOB_RADAR_CITIES`：
+# 它们**没有任何调用点**了（消费它的 `clean_local_db` / `export_pool_html` 已删），
+# 而且和 `CandidateProfile.cities` 是**两套相反语义** —— 这边缺省是白名单
+# {杭州,上海,深圳}，那边空列表 = 不限城市。两套并存时 GUI 的城市筛选与导出准入
+# 会互相打架（2026-09-13 的审查记录过这个冲突）。城市的唯一真源现在是
+# `config.local.yaml` 的 `candidate.cities`。
+#
+# 池内排序偏好保留：它决定「排多前」，不是「能不能进池」。
 CITY_PREFERENCE = {"杭州": 1.0, "上海": 1.0, "深圳": 1.0}
 CITY_PREFERENCE_DEFAULT = 0.0
-
-
-def city_allowed(city: str) -> bool:
-    """城市是否在投递池范围内。`CITY_WHITELIST is None` 表示全国不限。"""
-    if CITY_WHITELIST is None:
-        return True
-    return not city or city in CITY_WHITELIST
 
 
 def city_score(city: str) -> float:
@@ -132,27 +103,110 @@ def outsourced_od(title: str) -> bool:
     return bool(_OD_RE.search(t))
 
 
-_COHORT_RE = _re.compile(r"(20\d{2}|\d{2})\s*届")
+# ---------- 外包 / 人力服务公司名单 ----------
+#
+# 为什么需要名单：**JD 正文里几乎不写外包**。2026-10-19 实测 3,072 条在招且有
+# 正文的岗位里，明写「劳务派遣 / 用工性质 / 与人力公司签约」的只有 1 条，
+# `外派至` 0 条。不写的东西任何文本方法都找不到（LLM 也一样），所以识别只能
+# 靠**公司主体身份**。
+#
+# 反过来，往 JD 里加关键词正则是**更糟**的方案：JD 里 `外包|外派|驻场|客户现场`
+# 命中 124 条，其中 17 条是在主动声明自己**不是**外包（「非外包项目！」「自研产品…
+# 非外包性质」），其余多为实施/交付/售前/售后岗 —— `客户现场`、`驻场` 在中文
+# 技术 JD 里绝大多数指**工作地点**而非用工主体。精确率约 1–2%。
+#
+# 匹配规则由名单文件头定义，这里只实现：
+#   · 强词（≥4 汉字 或 ≥6 拉丁）→ 允许子串
+#   · 短词（<4 汉字 且 <6 拉丁）→ 只允许全等，或去掉 2~4 字省市前缀后以前缀开头
+# 后者是为了挡掉 `华秋智联`（撞「智联」）、`海宇信息`（撞「宇信」）、
+# `山东软件科技`（撞「东软」）这类误报。
+STAFFING_PATH = _Path(__file__).with_name("data") / "staffing_companies.txt"
+
+_PREFIX_WORDS = (
+    "北京", "上海", "天津", "重庆", "深圳", "杭州", "广州", "南京", "苏州", "武汉",
+    "成都", "西安", "厦门", "青岛", "大连", "宁波", "合肥", "长沙", "郑州", "济南",
+    "福州", "昆明", "南昌", "贵阳", "太原", "沈阳", "长春", "哈尔滨", "兰州", "银川",
+    "西宁", "南宁", "海口", "石家庄", "乌鲁木齐", "呼和浩特",
+    "浙江", "江苏", "广东", "山东", "河南", "河北", "湖南", "湖北", "安徽", "福建",
+    "江西", "四川", "辽宁", "吉林", "陕西", "山西", "云南", "贵州", "广西", "海南",
+    "甘肃", "青海", "宁夏", "新疆", "西藏", "内蒙古", "黑龙江", "香港", "澳门", "台湾",
+)
 
 
-def future_cohort(title: str) -> bool:
-    """标题写的届数是否晚于求职者（26 届）→ 投不进去。
+def _is_strong(term: str) -> bool:
+    """强词：汉字 ≥4 个，或拉丁字符 ≥6 个。"""
+    cjk = sum(1 for ch in term if "\u4e00" <= ch <= "\u9fff")
+    return cjk >= 4 or (cjk == 0 and len(term) >= 6)
 
-    **届数只存在于标题**：详情接口的 `postDescription` 不含毕业时间，
-    那是校招岗专属的服务端渲染结构化字段（2026-08-10 抽查 5 岗验证）。
-    所以这条只能按标题正则判，不能指望 LLM 从 JD 正文读出来 ——
-    实测 8 条标题写 27 届的岗位 LLM 全判 keep、`grad_year` 甚至标成
-    「26届可投」，因为标题此前从未进入 prompt（已修，但存量标签仍是错的）。
 
-    放在 profile 里是为了让画像层和导出层共用一份实现：
-    原先只有导出层有，那 8 条便以 active 留在库里被反复刷状态、补详情。
+def _load_staffing() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """读名单，返回 (强词, 短词)。文件缺失时返回空 —— 数据文件不该让采集起不来。"""
+    try:
+        lines = STAFFING_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return (), ()
+    strong: list[str] = []
+    short: list[str] = []
+    for line in lines:
+        term = line.strip()
+        if not term or term.startswith("#"):
+            continue
+        (strong if _is_strong(term) else short).append(term)
+    return tuple(strong), tuple(short)
+
+
+_STAFFING_STRONG, _STAFFING_SHORT = _load_staffing()
+
+
+def is_staffing_company(name: str) -> bool:
+    """公司名是否属于外包 / 人力派遣 / 人力服务商。
+
+    短词（如 `中智`、`佰钧成`）**不做子串匹配** —— 2~3 字中文主体名做子串
+    一定误报（实测踩过 智联/宇信/东软/微创/海隆/宝信 六个坑）。
     """
-    m = _COHORT_RE.search(title or "")
-    if not m:
+    text = (name or "").strip()
+    if not text:
         return False
-    num = m.group(1)
-    yr = int(num) if len(num) == 4 else 2000 + int(num)
-    return yr > COHORT_YEAR
+    lowered = text.casefold()
+    if any(term.casefold() in lowered for term in _STAFFING_STRONG):
+        return True
+    for term in _STAFFING_SHORT:
+        # ① 全等
+        if text == term:
+            return True
+        # ② 本身就以前缀开头（`人瑞网络科技` ← `人瑞`、`中智科创` ← `中智`）。
+        #    这一条不能省：去掉省市前缀是**补充**手段，不是前提条件。
+        if text.startswith(term):
+            return True
+        # ③ 去掉 2~4 字省市前缀后以该词开头（`深圳中智`、`武汉佰钧成`）。
+        for prefix in _PREFIX_WORDS:
+            if text.startswith(prefix) and text[len(prefix):].startswith(term):
+                return True
+    return False
+
+
+def staffing_signal(row: dict) -> str:
+    """返回外包判定依据（空串表示没命中）。三路信号并联，取第一个命中的。
+
+    名单、`industry` 行业标签、平台代招标记三者**正交**：
+      · 名单抓得到 ITO 大厂（它们的行业标「计算机软件」，不是「人力资源服务」）
+      · `industry='人力资源服务'` 抓得到名单没收的小微/区域人力公司
+      · `is_proxy_job` 是平台自己标的代招
+    2026-10-19 实测三路并集 944 条 / 在招 236 条，单看任何一路都少一截。
+    """
+    if is_staffing_company(row.get("company_name") or ""):
+        return "公司名在人力服务名单内"
+    if (row.get("industry") or "").strip() == "人力资源服务":
+        return "行业标为人力资源服务"
+    if row.get("is_proxy_job"):
+        return "平台标记为代招"
+    return ""
+
+
+# 2026-10-19 删除 `future_cohort()` / `_COHORT_RE` / `COHORT_YEAR`：
+# 零调用点，且已被 `analysis/decisions.py::evaluate` 的届别判定取代（那里覆盖得
+# 更全：`20XX届`、`26届`、`2026年应届`、以及 `26/27届` 这种区间写法）。
+# 原实现里那条「届数只存在于标题、LLM 从正文读不出来」的教训已移到 decisions.py。
 EXCLUDE_COMPANY = (
     "猎头", "劳务派遣", "人力资源",
     # IT/人力外包服务公司（名称关键词，命中即降级；2026-08-03 确认）

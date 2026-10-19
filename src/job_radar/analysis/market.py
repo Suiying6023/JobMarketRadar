@@ -130,10 +130,6 @@ def hiring_of(row: dict, now: datetime | None = None) -> dict:
     }
 
 
-def hiring_rank(item: dict) -> int:
-    return _HIRING_RANK.get((item.get("hiring") or {}).get("level"), 2)
-
-
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
     target = Path(path).resolve()
     if not target.is_file():

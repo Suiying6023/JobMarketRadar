@@ -11,7 +11,7 @@ import json
 
 from job_radar.models import CityConfig, CollectionConfig, JobRecord, Platform
 from job_radar.storage import JobStore
-from job_radar.throttle import HumanThrottle, gaussian
+from job_radar.throttle import gaussian, human_pause
 
 
 def make_config(**kw) -> CollectionConfig:
@@ -35,18 +35,6 @@ class SleepRecorder:
         self.waits.append(seconds)
 
 
-def run_delays(throttle: HumanThrottle, kind: str, n: int, monkeypatch) -> list[float]:
-    rec = SleepRecorder()
-    monkeypatch.setattr(asyncio, "sleep", rec)
-
-    async def go():
-        for _ in range(n):
-            await throttle.delay_before_request(kind)
-
-    asyncio.run(go())
-    return rec.waits
-
-
 # ---------- 高斯延迟 ----------
 
 def test_gaussian_stays_in_range():
@@ -64,69 +52,38 @@ def test_gaussian_does_not_hang_on_inverted_range():
         assert 8.0 <= gaussian(12.0, 8.0) <= 12.0
 
 
-# ---------- 突发惩罚叠加 ----------
+# ---------- 拟人抖动 ----------
 
-def test_burst_penalty_adds_on_top_of_normal_delay(monkeypatch):
-    cfg = make_config(burst_threshold=3, burst_penalty_seconds=(60.0, 60.0),
-                      detail_delay_seconds=(3.0, 3.0))
-    waits = run_delays(HumanThrottle(cfg), "detail", 3, monkeypatch)
-    # 前两条只有常规延迟；第三条 = 常规延迟 + 惩罚（两次 sleep 调用）
-    assert waits == [3.0, 3.0, 3.0, 60.0]
-    assert sum(waits) == 69.0
+def test_human_pause_mean_matches_range_midpoint():
+    """抖动的形状可以乱，**均值必须守住区间中点** —— 速率是唯一实测过安全区间的量。"""
+    samples = [human_pause(6.0, 11.0) for _ in range(4000)]
+    mean = sum(samples) / len(samples)
+    assert abs(mean - 8.5) < 0.4, f"均值 {mean:.2f} 偏离中点 8.5 过多"
 
 
-def test_burst_penalty_never_shorter_than_normal_delay(monkeypatch):
-    """原先命中惩罚时 return 跳过常规延迟：惩罚(10s) < 常规(30s) 时第 N 条
-    等得比平常更短，惩罚变奖励。叠加写法不可能出现这种反转。"""
-    cfg = make_config(burst_threshold=2, burst_penalty_seconds=(10.0, 10.0),
-                      request_delay_seconds=(30.0, 30.0))
-    waits = run_delays(HumanThrottle(cfg), "list", 2, monkeypatch)
-    assert waits[0] == 30.0                      # 平常
-    assert sum(waits[1:]) == 40.0 >= waits[0]    # 命中惩罚那条不少于平常
+def test_human_pause_never_goes_below_configured_floor():
+    """`[6,11]` 就该真的不短于 6 秒 —— 地板是运维设的安全参数，不能被抖动吃掉。
+
+    第一版用"相对中点的倍数"实现，抽出了 5.04 秒：均值守住了，配置语义却变了。
+    """
+    samples = [human_pause(6.0, 11.0) for _ in range(4000)]
+    assert min(samples) >= 6.0, f"最小值 {min(samples):.2f} 跌破下限 6.0"
+    assert min(samples) < 6.5, "下限附近应当有样本，否则等于没抖动"
 
 
-def test_burst_counter_resets_after_penalty(monkeypatch):
-    cfg = make_config(burst_threshold=2, burst_penalty_seconds=(50.0, 50.0),
-                      detail_delay_seconds=(1.0, 1.0))
-    waits = run_delays(HumanThrottle(cfg), "detail", 4, monkeypatch)
-    assert waits == [1.0, 1.0, 50.0, 1.0, 1.0, 50.0]   # 每 2 条罚一次
+def test_human_pause_has_long_tail_but_bounded_floor():
+    """右偏长尾：中位数低于均值，最大值明显超过配置上界，下界不破。"""
+    samples = sorted(human_pause(6.0, 11.0) for _ in range(4000))
+    median = samples[len(samples) // 2]
+    assert median < 8.5, "中位数应低于均值（右偏）"
+    assert samples[-1] > 11.0, "长尾应能超过配置上界"
+    assert samples[0] >= 6.0, "下界不得跌破配置下限"
 
 
-def test_list_and_detail_counters_are_independent(monkeypatch):
-    cfg = make_config(burst_threshold=2, burst_penalty_seconds=(9.0, 9.0),
-                      request_delay_seconds=(1.0, 1.0), detail_delay_seconds=(2.0, 2.0))
-    t = HumanThrottle(cfg)
-    rec = SleepRecorder()
-    monkeypatch.setattr(asyncio, "sleep", rec)
-
-    async def go():
-        await t.delay_before_request("list")
-        await t.delay_before_request("detail")
-        await t.delay_before_request("list")     # list 第 2 条 → 罚
-        await t.delay_before_request("detail")   # detail 第 2 条 → 罚
-
-    asyncio.run(go())
-    assert rec.waits == [1.0, 2.0, 1.0, 9.0, 2.0, 9.0]
-
-
-# ---------- 节流参数配置化 ----------
-
-def test_throttle_reads_params_from_config():
-    cfg = make_config(detail_batch=7, burst_threshold=3,
-                      detail_cooldown_seconds=(100.0, 200.0),
-                      burst_penalty_seconds=(11.0, 22.0))
-    t = HumanThrottle(cfg)
-    assert (t.detail_batch, t.burst_threshold) == (7, 3)
-    assert t.detail_cooldown == (100.0, 200.0)
-    assert t.burst_penalty == (11.0, 22.0)
-
-
-def test_explicit_args_still_override_config():
-    """backfill_details 用更短的批间冷却，显式传参必须仍然生效。"""
-    t = HumanThrottle(make_config(detail_batch=5), detail_batch=99,
-                      detail_cooldown=(10.0, 15.0))
-    assert t.detail_batch == 99
-    assert t.detail_cooldown == (10.0, 15.0)
+def test_human_pause_handles_inverted_and_zero_range():
+    for _ in range(50):
+        assert human_pause(12.0, 8.0) >= 8.0, "区间写反后下限应是较小的那个数"
+    assert human_pause(0.0, 0.0) == 0.0
 
 
 # ---------- 详情去重前置 ----------

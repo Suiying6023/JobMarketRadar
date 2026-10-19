@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..candidate import CandidateProfile
+from ..profile import staffing_signal
 
 BUCKETS = ("优先核实", "需核实门槛", "信息不足", "暂不优先")
 DEGREES = {"初中及以下": 0, "高中": 1, "中专/中技": 1, "大专": 2, "本科": 3, "硕士": 4, "博士": 5}
@@ -150,6 +151,11 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         exclusions.append("标题为实习、兼职或日结")
     if profile.exclude_internships and re.search(r"必须.{0,8}在校|仅限.{0,8}在校|在校生|每周.{0,8}(?:实习|到岗).{0,5}天|实习.{0,6}[3-6三四五六]天", jd):
         unresolved.append("正文含在校或实习到岗要求，需核实是否有独立全职名额")
+    # 届数**只存在于标题**（以及少数正文里的「2026年应届」写法）：详情接口的
+    # `postDescription` 不含毕业时间，届别是校招岗专属的服务端结构化字段
+    # （2026-08-10 抽查 5 岗验证）。所以这条只能靠正则，不能指望 LLM 从正文读 ——
+    # 实测 8 条标题写「27 届」的岗位，LLM 全判 keep，`grad_year` 甚至标成
+    # 「26届可投」，因为标题当时压根没进 prompt。
     cohort = [int(x) if len(x) == 4 else 2000 + int(x) for x in re.findall(r"(?<!\d)(20\d{2}|\d{2})\s*届", text)]
     cohort.extend(int(x) for x in re.findall(r"(?<!\d)(20\d{2})\s*年\s*(?:应届|毕业)", text))
     for first, last in re.findall(r"(?<!\d)(20\d{2}|\d{2})\s*[/、或与至~～-]\s*(20\d{2}|\d{2})\s*届", text):
@@ -165,8 +171,16 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         unresolved.append("正文有院校限制，需逐句确认")
     elif re.search(r"(?:知名|重点|一流).{0,3}(?:院校|高校|大学)", jd):
         unresolved.append("正文提及知名或重点院校，需确认是否是硬性门槛")
-    if profile.exclude_staffing and (row.get("is_proxy_job") or re.search(r"外包|外派|驻场|(?<![A-Za-z])OD(?![A-Za-z])", title, re.I)):
-        exclusions.append("代招或外包用工信号")
+    # 外包判定：三路信号并联（公司名单 / 行业标签 / 平台代招标记），
+    # 再兜一层标题正则。**不读 JD** —— JD 里几乎不写外包（3,072 条在招正文里
+    # 只有 1 条明写「劳务派遣」），而 `客户现场`、`驻场` 这类词绝大多数指工作
+    # 地点，做 JD 关键词会误杀主动声明「非外包」的岗位。详见 profile.py 的说明。
+    if profile.exclude_staffing:
+        signal = staffing_signal(row)
+        if signal:
+            exclusions.append(f"外包/人力服务用工（{signal}）")
+        elif re.search(r"外包|外派|驻场|(?<![A-Za-z])OD(?![A-Za-z])", title, re.I):
+            exclusions.append("标题含外包或代招信号")
     if profile.excluded_companies and mentions(company, profile.excluded_companies):
         exclusions.append("命中自定义公司排除词")
     if profile.excluded_titles and mentions(title, profile.excluded_titles):

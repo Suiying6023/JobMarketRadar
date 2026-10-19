@@ -169,38 +169,6 @@ CREATE INDEX IF NOT EXISTS idx_request_log_day ON request_log(day, kind);
 """
 
 
-def current_local_day() -> str:
-    """账本的「今天」= **本地日历日**。
-
-    平台给的解封时刻按北京时间，用 UTC 会让早上 8 点前的「今天」错位到前一天
-    （`log_request` 与 `request_counts` 都按这个口径）。
-    """
-    return datetime.now().astimezone().strftime("%Y-%m-%d")
-
-
-def log_request_on(conn: sqlite3.Connection, kind: str, script: str = "",
-                   note: str = "") -> int:
-    """记一行请求**观测**，返回行 id。**不做任何额度判断，不会拒绝任何请求。**
-
-    ⚠️ 口径：一行 = 一次业务尝试，不是真实 HTTP 资源总数（stoken 重算、挑战页
-    子资源不在这里逐条计数）。它只回答"这条链路什么时候做过多少次、结果如何"，
-    不参与任何放行/拦截决定 —— 放行由调用方的节奏参数和风控熔断负责。
-
-    历史说明：这里原本是 `reserve_request_on()`，会在 `BEGIN IMMEDIATE` 里数当天
-    已发请求数、到自设日线就抛 `BudgetExceeded` 拦下请求。那套账本机制已取消：
-    日线是我们按历史轮次反推的推测值，不是平台给的额度，把它当硬线等于在证据不足时
-    替用户做决定。现在只保留记录，节奏与熔断各自独立生效。
-    """
-    now = datetime.now().astimezone()
-    cur = conn.execute(
-        "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"),
-         kind, "pending", None, script, note))
-    conn.commit()
-    return int(cur.lastrowid or 0)
-
-
 def mark_outcome_on(conn: sqlite3.Connection, rowid: int | None,
                     outcome: str, code: int | None = None) -> bool:
     """回填**自己预留的那一行**的最终结果，返回是否命中。
