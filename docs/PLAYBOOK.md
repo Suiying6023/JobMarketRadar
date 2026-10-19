@@ -57,19 +57,32 @@
 冷却只是把平均值压低。所以「调大 batch 提速」的实质是「减少停顿次数」，
 不是「跑得更密」。
 
-### 抖动：`throttle.human_pause()`
+### 抖动：`throttle.lognormal_pause()`
 
-不是固定间隔，是 80/15/5 三档混合：
+不是固定间隔，也**不是**裁剪正态（那没有长尾，上界就是 `hi`，一眼看出是机器）。
 
-- 常态 80% → `[lo, lo+0.45d]`（手快）
-- 走神 15% → `[lo+0.45d, hi]`
-- 长停 5% → `[hi, hi+6d]`（被别的事打断）
+现在用**对数正态**：`median = sqrt(lo*hi)`、`sigma = ln(hi/lo)/2`、上限 `8×hi`。
+参考 `tr4m0ryp/Linkedin_Automation` 的 `humanizer/delay.rs` —— 同样的
+`mu = ln(median)` + sigma 控尾部，外加 clamp 防单次抽到极端值把整轮拖死。
 
-其中 `d = hi - lo`。**下限严格等于 `lo`**，均值≈区间中点（实测 8.43 vs 8.50），
-右偏有长尾（`[6,11]` 实测中位 7.41、p90 10.1、最大 41.0）。
+`[6,11]` 实测（50,000 次）：均值 8.63、**中位 8.11**、最小 6.00、p95 13.3、
+p99 16.3、最大 28.3。**下限严格等于 `lo`。**
 
-⚠️ 第一版按「相对中点的倍数」实现，`[6,11]` 会抽出 5.04 秒 —— 均值守住了但
-**下限被悄悄改掉**。地板是运维设的安全参数，不能被抖动吃掉。
+⚠️ 踩过两次：
+1. 第一版按「相对中点的倍数」实现，`[6,11]` 抽出过 **5.04 秒** —— 均值守住了
+   但下限被悄悄改掉。地板是运维设的安全参数，不能被抖动吃掉。
+2. 第二版用 80/15/5 手工混合，参数是为了凑均值反推的，改一个要重算三个，
+   而且最坏抽到 **255 秒**。
+
+### 另外两层自适应（`pacing.RequestPacer`）
+
+| 层 | 机制 | 作用 |
+|---|---|---|
+| 内容停留 | 读完 JD 后按字数微调 ×0.85–1.50，字数封顶 4000 | 取 Nielsen 实测「用户平均只读网页 **20%** 的文字」 |
+| 挑战自适应 | 命中挑战 ×2（上限 16×），成功 ×0.85 衰减 | 借 `guise_pacing` 的 `MAX_CHALLENGE_MULTIPLIER=16`：「被站点推回时变慢」 |
+
+放大快、衰减慢 —— 被推回要立刻让路，恢复要谨慎。三层叠加后速率仍由
+基础间隔和批间冷却决定，后两层只改形状。
 
 ---
 
@@ -128,26 +141,62 @@ A/B 实测（6 次导航 + 1 次列表复检）：
 
 ### 空正文要分清是哪一种空
 
-`_ssr_blank_reason()` 分 8 类。原来的错误信息一律是「岗位可能已下线或页面改版」，
-把四件完全不同的事糊成一句 —— 代价是双向的：真下线被当成风控白停一轮，
-风控被当成下线继续加压，选择器失效则长期无声地丢正文。
+`_ssr_blank_reason()` **先看平台文案**，没命中才退回 URL / 字节数判据。
+
+```
+IP地址存在异常   → ip_restricted,          network_restriction, 35
+账户存在异常     → account_restricted,     account_restriction, 36
+环境存在异常     → environment_restricted, environment_restriction, 37
+访问过于频繁     → rate_limited
+请先登录/未登录  → login_wall,             authentication_required, 7
+```
+
+**为什么文案优先**：URL 和字节数只能判出「大概是哪一类」，判不出「这次为什么」。
+实测一个 **1KB** 的「您的IP地址存在异常行为」页，按字节数会归成 `empty_page`
+—— 被当成我们自己的 bug。
+
+非风险类的归因：
 
 | 归因 | 含义 | 处置 |
 |---|---|---|
 | `verification` | 要滑块验证 | **停**，等人 |
-| `js_challenge` | JS 挑战，偶发 | 记录、观察频次 |
-| `login_wall` | 未登录只能看预览 | **停**，账号问题 |
+| `js_challenge` | JS 挑战，偶发 | 标脏页面 + 通知 pacer 放慢 |
 | `closed` | 岗位真下线 | 正常，跳过 |
 | `selector_miss` | 页面在但没容器 | 我们的 bug，要查 |
 | `empty_page` | 页面几乎空白 | 瞬时，可重试 |
 | `blank_jd` | 容器在但空 | 岗位没写 JD |
 
-判据顺序**地址栏优先于正文关键词**：`verify` 出现在 URL 上是硬证据，
-而「安全验证」四个字可能只是页面脚本里的一句文案。误判风控要人工解冻，代价太高。
+`_page_prompt()` 剥掉 script/style 取可见文本，**没命中风控词时返回空串** ——
+正常岗位页的首句是 JD 正文，当成「平台提示」写进异常消息只会误导。
 
 **按字节数交叉验证**（来自历史标定）：下架 ~11KB / JS 挑战 ~41KB / 验证页 ~44.5KB /
 正常岗位页 **138–147KB**。2026-10-19 实测 `security.html` 是 42,825 字节，
 正落在 JS 挑战页区间。
+
+### 工商信息跟着 JD 一起白拿
+
+`.business-info-box` 就在详情页里，**零额外请求**：
+
+```html
+<div class="detail-section-item business-info-box">
+  <ul class="level-list">
+    <li class="company-name"><span>公司名称</span>深圳昼光科技有限公司</li>
+    <li class="company-user"><span>法定代表人</span>杨超</li>
+    <li class="res-time"><span>成立日期</span>2019-10-30</li>
+    <li class="company-type"><span>企业类型</span>有限责任公司（法人独资）</li>
+    <li class="manage-state"><span>经营状态</span>存续</li>
+    <li class="company-fund"><span>注册资金</span>100万人民币</li>
+  </ul>
+</div>
+```
+
+⚠️ **页面写的是「注册资金」不是「注册资本」**。早期按后者 grep 一直是 0 次，
+于是误以为详情页没有工商信息、要单独请求 `/gongsi/{id}.html`。
+
+⚠️ `company_reg_json` 这个列 2026-10-19 之前**不在 `JobRecord` 里**，`upsert()`
+从不写它，只有旧的 `enrich_company_info.py` 用裸 SQL 维护 —— 覆盖率长期停在 4%
+（727/11,958）。现在走正常链路，并且归入 `KEEP_IF_EMPTY_COLUMNS`（列表轮次的
+`{}` 不能覆盖详情拿到的真数据）。
 
 ---
 
@@ -274,7 +323,81 @@ staffing_signal(row) = 名单命中 | industry == '人力资源服务' | is_prox
 
 ---
 
-## 7. 关键词：怎么挖，怎么合并
+## 7. 岗位判定：LLM 标签做主，不用正则
+
+### 分工原则
+
+| 层 | 谁做 | 产出 |
+|---|---|---|
+| **分类**（这是什么岗位） | 决策模型 `job_analysis.relabel` | `role_family` / `seniority_score` / `fresh_grad` / `grad_year` / `education_req` / `employment_type` / `is_proxy` |
+| **抽取**（文中提了什么技术） | 规则 `job_analysis.tech` | `tech_stack_json`（词表匹配，确定性、零模型成本） |
+| **策略**（对我合不合适） | `analysis/decisions.py::evaluate` | 分桶 + 排除理由 |
+
+**为什么不用正则做分类**：每加一条正则都是给上一个漏判打补丁 —— 先加「正文要
+硕博」，再加「标注岗要区分技术活和苦力」，再加「年限是期望值不是门槛」……
+正则的根本问题是**它只能覆盖你想得到的情况**，想不到的全漏，而且每补一条
+都可能像 `OD` 吃掉 `Coding` 那样误伤。
+
+**为什么技术栈可以用规则**：技术词是**封闭集合**（Python / Redis / LangChain
+写法固定），而「这个岗位到底算什么方向」是判断，不是匹配。分工要清楚。
+
+### 打标只跑新数据
+
+```powershell
+python -m job_analysis.relabel                    # 只打近 7 天活跃的（默认）
+python -m job_analysis.relabel --stats-only       # 只看新旧分布，不调模型
+python -m job_analysis.relabel --max-age-days 0   # 不限时效，动存量（费额度）
+```
+
+判据用 `last_seen_at` 而不是 `first_seen_at`：三个月前首见、但今天又出现在
+搜索结果里的岗位仍然是活的，值得打标。
+
+⚠️ **加新问题会造成版本断层。** `education_req` 是 2026-10-19 新加的，
+只有按 7 天窗口重标过的那批有值（318/7,502 = 4.2%），更早的 7,184 条是旧
+schema 打的、这一列为空。所以**老的硕博岗不会被它拦住**。要补齐只有全量重标
+一条路（约 78 分钟模型调用），按额度策略需显式决定。
+
+同理，以后再加 schema 问题时要么接受断层，要么一次性全量重标。
+
+### 判定规则（都在 `evaluate()`，每条都标了实测来源）
+
+| 维度 | 硬排除 | 降级为「需核实门槛」 |
+|---|---|---|
+| **岗位族** | `role_family` 契合度 < 2，或 `ai_app`/`backend`/`fullstack`/`algorithm` 但技术栈无 AI 信号 | — |
+| **经验** | 2 年以上（LLM `seniority_score` ≥ 1.6 或列表 ≥ 2 年） | — |
+| **学历** | 正文要求硕/博（`education_req`） | — |
+| **薪资** | 起薪 > 期望上限；或中点 > 25K | 顶薪 > 期望上限 ×2 |
+| **应届** | 仅 `fresh_grad == "reject"` | — |
+| **届别** | 仅 `grad_year` 为更晚届别 | — |
+| **外包** | 名单 / 行业标签 / `is_proxy` ≥ 0.5 | — |
+| **公司** | 注册资本 < 100 万 | 非公司主体 / 成立不足 12 月 |
+
+### 三个踩过的判断错误
+
+1. **`unstated` 不等于拒绝**。绝大多数 JD 根本不提应届，按「没提就是不要」判
+   会误杀一大片。只有 `fresh_grad == "reject"` 才硬排除。
+2. **列表 `education` 是搜索条件回显**，不是岗位门槛。实测某岗位列表标「本科」
+   （因为搜索按本科筛），正文写「2026.9-2027.8 期间已获得**博士/硕士**学位的同学」。
+   所以加了 `education` 这个独立问题（schema 第 8 个）。
+3. **`role_family` 会把「AI数据标注专家」判成 `ai_app`** —— JD 里全是 LLM、
+   大模型、训练这些词，模型读的是**工作对象**而不是**工作性质**。用技术栈一卡
+   就分开了：标注岗是 `Python, SQL`，真 AI 开发岗有 `Agent, RAG, LangChain`。
+
+### 薪资为什么看三个角度
+
+只看「区间有没有交集」不够：`25-50K` 和期望的 `12-28K` 确实在 25-28 擦边，
+但那说明招的是能独当一面的人。三个角度各自回答一个问题：
+
+- **起薪 `min_k`** —— 岗位底线给到多少 → 超过期望上限就是不看简历
+- **中点 `mid`** —— 典型水平 → 超过 25K 是资深岗
+- **顶薪 `max_k`** —— 天花板 → 远超期望上限说明区间是给资深人开的
+
+阈值来自库内实测（4,177 条在招）：应届友好岗中点 p50=12.5 / **p90=22.5**，
+5-10 年档 p50=27.5，**25 是分界线**。
+
+---
+
+## 8. 关键词：怎么挖，怎么合并
 
 ### 挖词的唯一有效来源是**标题措辞**
 
@@ -310,7 +433,7 @@ AI Agent / 智能体开发 / 大模型应用开发 / AI后端工程师 / RAG / P
 
 ---
 
-## 8. 常见坑清单
+## 9. 常见坑清单
 
 1. **裸子串做黑名单** —— `OD` 裸子串命中 91 条，绝大多数是 `Coding`；词边界才 20 条真 OD。
    英文缩写越短越危险。
@@ -327,7 +450,7 @@ AI Agent / 智能体开发 / 大模型应用开发 / AI后端工程师 / RAG / P
 
 ---
 
-## 9. 常用命令
+## 10. 常用命令
 
 ```powershell
 cd D:\Code\Boss
@@ -346,11 +469,18 @@ $env:PYTHONIOENCODING='utf-8'
 # 先看解析对不对（0 请求）
 & .\.venv\Scripts\python.exe -X utf8 -m job_radar.cli session --phase sweep --dry-run --keywords "..."
 
-# 速率模拟（不联网）
-& .\.venv\Scripts\python.exe -X utf8 local\analysis\live-20261019\_simulate_pacing.py
+# 速率模拟（不联网、不 sleep，按真实 JD 字数算内容停留）
+& .\.venv\Scripts\python.exe -X utf8 tools\simulate_pacing.py
 
-# 死代码扫描（不联网）
-& .\.venv\Scripts\python.exe -X utf8 local\analysis\live-20261019\_deadcode_scan.py
+# 死代码扫描（只读，零外部引用 / 仅测试引用 / 正常）
+& .\.venv\Scripts\python.exe -X utf8 tools\deadcode_scan.py
+
+# 打标（默认只跑近 7 天活跃的新数据）
+& .\.venv\Scripts\python.exe -X utf8 -m job_analysis.relabel --stats-only
+& .\.venv\Scripts\python.exe -X utf8 -m job_analysis.relabel
+
+# 只补技术栈（纯规则，零模型成本）
+& .\.venv\Scripts\python.exe -X utf8 -m job_analysis.tech
 
 # 门禁：默认只有端到端（约 22 秒）
 & .\.venv\Scripts\python.exe -X utf8 -m pytest -q

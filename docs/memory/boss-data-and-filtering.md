@@ -50,12 +50,41 @@ metadata:
 
 ## 字段性质分层
 
-`jobs` 78 列按来源分四类：raw 39 列（平台原值）、derived 23 列（LLM/规则产出，**只能存一个版本**）、
-state 14 列、key/manual 各 1 列。派生列填充率整齐卡在 62.8% = `job_description` 非空的行数，
-即"没正文就不打标"——合理但没写在任何地方，只能从数字反推。
+`jobs` 现在 80 列，按来源分四类：raw（平台原值）、derived（LLM/规则产出，
+**只能存一个版本**）、state、key/manual。派生列填充率卡在 `job_description`
+非空的行数上 —— "没正文就不打标"，合理但没写在任何地方，只能从数字反推。
+
+有正文 7,502 条的**基础标签**（`role_family` / `seniority_score` / `fresh_grad` /
+`grad_year` / `employment_type` / `is_proxy` / `tech_stack_json`）覆盖率 **100%**。
+（此前只有 62.8%，是因为新抓的岗位从没跑过打标。）
+
+⚠️ **`education_req` 只有 4.2%（318/7,502）**。它是 2026-10-19 新加的 schema 问题，
+只有按 7 天窗口重标过的那批有值；更早的 7,184 条是旧 schema 打的，没有这一列。
+
+这带来一个真实后果：**老的硕博岗不会被 `education_req` 拦住**。要么接受这个缺口、
+只用它筛新数据，要么显式跑 `--max-age-days 0` 全量重标（约 78 分钟模型调用）。
+清单里同时保留了列表 `education` 字段的检查作为粗兜底，但那个字段是搜索条件回显、
+不可靠（见 `docs/PLAYBOOK.md` 第 7 节），不能替代。
 
 `company_reg_json` 挂在岗位行上，同一家公司平均被复制 1.71 份（最多一家 71 份）。
 公司层数据应该抽成独立表，见 [[boss-company-data]]。
+
+## 判定规则：LLM 标签做主
+
+`analysis/decisions.py::evaluate()` 的判据分三层：
+
+1. **LLM 标签**（`role_family` / `seniority_score` / `fresh_grad` / `grad_year` /
+   `education_req` / `employment_type` / `is_proxy`）—— 主要判据
+2. **规则抽取**（`tech_stack_json`）—— 用来区分「AI 开发」和「AI 数据标注」
+3. **结构化数据**（城市、薪资、在招状态、工商注册资本、公司名）—— 兜底
+
+**不用正则解析 JD 做分类**。早前每加一条正则都是给上一个漏判打补丁，而正则
+只能覆盖想得到的情况，想不到的全漏。详细规则与实测阈值见 `docs/PLAYBOOK.md`
+第 7 节。
+
+`profile.CITY_WHITELIST` / `city_allowed()` 已删除 —— 它和 `CandidateProfile.cities`
+是两套相反语义（一个缺省白名单、一个空列表=不限），城市的唯一真源是
+`config.local.yaml` 的 `candidate.cities`。
 
 ## 证据与通用存储
 

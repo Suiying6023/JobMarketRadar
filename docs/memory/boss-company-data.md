@@ -1,6 +1,6 @@
 ---
 name: boss-company-data
-description: BOSS 企业信息三层来源：BOSS 公司页免费拿 15 项工商照面、企查查 MCP 补参保人数与风险、官方四库基本被墙
+description: BOSS 企业信息四层来源：详情页自带 6 项工商（零请求）、公司页 15 项、企查查补参保、官方四库被墙；注册资本 <100 万直接排除
 modified: 2026-10-19
 volatile: true
 metadata:
@@ -13,11 +13,44 @@ metadata:
 
 | 层 | 来源 | 字段 | 成本 |
 |---|---|---|---|
-| 工商照面 | `BOSS /gongsi/{brandId}.html` 的 `.business-detail li` | 15 项（含经营范围、所属行业、所属地区） | **¥0**，92.6% 覆盖 |
+| **简版工商（跟 JD 白拿）** | `BOSS /job_detail/{id}.html` 的 `.business-info-box` | 6 项：公司名称 / 法定代表人 / 成立日期 / 企业类型 / 经营状态 / **注册资金** | **¥0，零额外请求** |
+| 完整工商照面 | `BOSS /gongsi/{brandId}.html` 的 `.business-detail li` | 15 项（含经营范围、所属行业、所属地区） | ¥0，但要每家公司 1 个请求 |
 | 精确工商 + 风险 | 企查查 MCP（`agent.qcc.com`） | 26 项（含参保人数、实缴资本、纳税人资质、国标行业四级） | 按积分 |
 | 官方原始 | GSXT / 信用中国 / 执行信息公开网 | — | 基本不可用，见下 |
 
-## BOSS 公司页：免费，92.6%
+## 详情页自带简版工商：零请求
+
+2026-10-19 发现，抓 JD 的同一个 SSR 文档里就有：
+
+```html
+<div class="detail-section-item business-info-box">
+  <h3>工商信息</h3>
+  <ul class="level-list">
+    <li class="company-name"><span>公司名称</span>深圳昼光科技有限公司</li>
+    <li class="company-user"><span>法定代表人</span>杨超</li>
+    <li class="res-time"><span>成立日期</span>2019-10-30</li>
+    <li class="company-type"><span>企业类型</span>有限责任公司（法人独资）</li>
+    <li class="manage-state"><span>经营状态</span>存续</li>
+    <li class="company-fund"><span>注册资金</span>100万人民币</li>
+  </ul>
+</div>
+```
+
+⚠️ **页面写的是「注册资金」不是「注册资本」**。早期按后者 grep 全文一直是 0 次，
+于是误以为详情页没有工商信息、必须单独请求 `/gongsi/`。差一个字，结论完全不同。
+
+⚠️ `company_reg_json` 这个列长期**不在 `JobRecord` 里**，`upsert()` 从不写它，
+只有 `enrich_company_info.py` 用裸 SQL 维护 —— 所以覆盖率长期停在 **4%**
+（727/11,958），而不是以为的 92.6%（那是「能抓到」的比例，不是「已抓到」）。
+
+现在走正常链路：`SSR_SELECTORS` 加 6 个选择器 → `_company_reg_from_html()`
+剥标签前缀 → `JobRecord.company_reg` → `upsert`（并归入 `KEEP_IF_EMPTY_COLUMNS`，
+防止列表轮次的 `{}` 覆盖详情拿到的真数据）。
+
+**用途**：注册资本 < 100 万直接判 `low` 并排除。实测「上海达鑫和顺网络科技」
+注册资本 10 万 —— 这种皮包公司占着优先清单第一名（99 分）。
+
+## BOSS 公司页：完整版，92.6% 可抓
 
 `.business-detail li` 的 label/value 对，**页面给什么收什么**（不是写死标签）：
 

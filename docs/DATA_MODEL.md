@@ -76,3 +76,55 @@ raw_json.detail_access_verified 标记本轮详情访问核验状态：true 才�
 `raw_json.detail_source` 保存新解析器处理的详情来源：岗位ID、获取时间、正文SHA-256和访问核验状态。解析成功本身不证明完整访问；既有数据没有此字段时不补造来源证据。
 
 `detail_fetched_at` 是所保存正文的获取时间，列表观察时间单独保留。`detail_access_verified` 为未知或false时，近期非空正文仍可进入详情补取队列。新批次快照包含 `collection_rounds`、`collection_queries`、`collection_observations`；清单的 `body_quality` 区分本轮核验正文、继承/时间未明核验正文、访问未核验非空正文和缺失正文。
+
+## 决策模型标签列
+
+`job_analysis.relabel` 用决策模型给每条有正文的岗位打 8 个标签，写入下列列。
+`relabeled_at` 非空即表示这组标签来自当前 schema；`relabel_model` 记录模型名
+（失败时是 `<model>:failed`）。
+
+| 列 | 类型 | 取值 | 含义 |
+|---|---|---|---|
+| `role_family` | TEXT | `ai_app` / `algorithm` / `backend` / `fullstack` / `data` / `test` / `frontend` / `ops` / `embedded` / `product` / `operation` / `sales` / `design` / `management` / `content` / `teaching` / `ecommerce` / `implementation` / `other` | 岗位族，按**正文实际职责**判，不受标题影响 |
+| `role_confidence` | REAL | 0–1 | 上面那一项的置信度 |
+| `role_probabilities` | TEXT | JSON | 全部分布，便于按置信度过滤 |
+| `title_mismatch` | REAL | 0–1 | 标题方向词与正文职责不一致的概率 |
+| `seniority_score` | REAL | 0–4 连续值 | 0=实习应届、1=初级 1-3 年、2=中级 3-5 年、3=高级 5-8 年、4=专家管理 |
+| `employment_type` | TEXT | `fulltime` / `internship` / `parttime` / `campus` | 用工性质 |
+| `fresh_grad` | TEXT | `accept` / `maybe` / `reject` / `unstated` | 对应届生的表态。**`unstated` 不是拒绝** |
+| `grad_year` | TEXT | `2026` / `2027` / `other_year` / `any_year` / `unstated` | 限定届别 |
+| **`education_req`** | TEXT | `phd` / `master` / `bachelor` / `college` / `any` / `unstated` | **正文的学历门槛**。不能用列表的 `education` 代替 |
+| `is_proxy` | REAL | 0–1 | 外包 / 劳务派遣 / 中介代招的概率 |
+
+⚠️ **为什么学历要单独一列**：列表的 `education` 字段是**搜索条件的回显**，不是
+岗位门槛。实测某岗位列表标「本科」（因为搜索时按本科筛），正文写的却是
+「2026.9-2027.8 期间已获得或即将获得**博士/硕士**学位的同学」。只看列表会把
+硕博岗放进本科可投清单。
+
+⚠️ **`education_req` 有版本断层**：它是 2026-10-19 新加的 schema 问题，只有按
+7 天窗口重标的 318 条有值（4.2%），更早的 7,184 条是旧 schema 产物、该列为空。
+判空要按「只有新数据才有」理解，不能当成「这个岗位不提学历」。
+
+`tech_stack_json` 是**规则抽取**（`job_analysis/tech.py` 的词表匹配），不是模型产出：
+`{"by_category": {"语言": ["Python"], "AI工程": ["RAG"]}, "flat": ["Python", "RAG"]}`。
+技术词是封闭集合，规则更准、更便宜、可审计。
+
+## 工商登记列
+
+`company_reg_json` 存 GSXT 照面的简版，来自**详情页的 `.business-info-box`**，
+跟着 JD 一起抓、零额外请求：
+
+```json
+{"公司名称": "…", "法定代表人": "…", "成立时间": "2019-10-30",
+ "企业类型": "有限责任公司（法人独资）", "经营状态": "存续", "注册资本": "100万人民币"}
+```
+
+⚠️ 页面上的标签是「**注册资金**」，统一归一成「注册资本」，与
+`enrich_company_info.py` 从 `/gongsi/` 抓的完整版（含统一社会信用代码、注册地址）
+共用同一套键名。
+
+⚠️ 列默认值是 `'{}'`（长度 2），用 `<> ''` 判空会把空对象误算成「有值」——
+判有没有真数据要 `length(company_reg_json) > 2`。
+
+`company_reg_updated_at` 是这组工商数据的写入时间。
+

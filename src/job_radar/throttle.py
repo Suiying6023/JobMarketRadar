@@ -1,6 +1,7 @@
 """请求间隔的生成器。实际节流由 `pacing.RequestPacer` 执行，这里只提供取数。
 
-`human_pause()` 是当前在用的那一个；`gaussian()` 只在 SSR 详情的兜底 sleep 里用。
+`lognormal_pause()` 是当前在用的那一个（重尾右偏）；`gaussian()` 只在 SSR 详情的
+兜底 sleep 里用。
 
 Timing values are operator configuration, not platform guarantees.
 """

@@ -1,6 +1,6 @@
 ---
 name: boss-risk-control
-description: BOSS 访问与任务恢复：显式在线开关、持久暂停、任务归属校验、真实平台风险与本地参考线分开
+description: BOSS 访问与恢复：读页面原文精确判风控类别、三类停机（滑块/退出/IP限）分开提示、持久暂停与人工解除
 modified: 2026-10-19
 volatile: true
 metadata:
@@ -22,6 +22,44 @@ metadata:
 
 风险事件先写任务日志；暂停状态写入失败时结束任务并保留失败原因。等待验证期间仍响应停止。
 账户实际是否恢复依据平台状态，复检使用当前目标的真实业务响应。
+
+## 停机时怎么读平台的话
+
+平台不总是回 `code`。很多时候它直接把说明写在页面上：
+
+```
+您的IP地址存在异常行为
+您的账号可能存在异常访问行为，完成验证后即可正常使用
+访问过于频繁，请稍后再试
+```
+
+`_page_prompt()` 剥掉 script/style 取可见文本、挑含风控词的句子；
+`_prompt_verdict()` 把原话翻成 `(category, code)`：
+
+| 页面文案 | category | code |
+|---|---|---|
+| IP地址存在异常 | `network_restriction` | 35 |
+| 账户存在异常 | `account_restriction` | 36 |
+| 环境存在异常 | `environment_restriction` | 37 |
+| 访问过于频繁 | `rate_limited` | — |
+| 请先登录 / 未登录 | `authentication_required` | 7 |
+
+**文案优先于 URL 模式和字节数区间**。实测一个 1KB 的「IP地址存在异常」页，
+按字节数会归成 `empty_page`（当成我们自己的 bug）—— 短页在字节分档里毫无分辨力。
+
+⚠️ `_page_prompt()` **没命中风控词时返回空串**：正常岗位页的首句是 JD 正文，
+把它当成「平台提示」写进异常消息只会误导。
+
+## 三类停机要人做的事完全不同
+
+`worker.py` 的弹窗文案按 category 分开：
+
+- `verification_required` → 请直接拖滑块
+- `authentication_required` → **账号已退出**，请重新登录（不是滑滑块）
+- `network_restriction` (35) → **出口 IP 被限制**，账号本身没问题，换出口或等冷却
+
+2026-10-19 之前一律提示「请人工确认账号状态」，把三件事糊成一句 —— 人打开窗口
+看到的是岗位页，不知道该拖滑块、该登录、还是该换出口。
 
 ## 节奏与观测（没有请求预算）
 
