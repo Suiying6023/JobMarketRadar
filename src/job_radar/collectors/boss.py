@@ -70,7 +70,8 @@ def _inline_is_login(html: str) -> bool | None:
 
 # 详情页读到空正文时的归因标记。
 _CLOSED_MARKS = ("职位已关闭", "该职位已下线", "岗位已下线", "已停止招聘",
-                 "职位不存在", "该职位不存在", "已结束招聘", "职位已失效")
+                 "职位不存在", "该职位不存在", "页面不存在", "该页面不存在",
+                 "已结束招聘", "职位已失效")
 _LOGIN_MARKS = ("登录后查看", "请先登录", "登录/注册")
 _VERIFY_MARKS = ("拖动滑块", "请完成验证", "安全验证", "验证后继续")
 
@@ -96,13 +97,18 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
     text = html or ""
     lowered = text.casefold()
     url_l = (final_url or "").casefold()
-    base = {"status": status, "length": len(text), "url": final_url or ""}
+    # ⚠️ 必须用**字节数**：历史标定的四档（下架 ~11KB / JS 挑战 ~41KB /
+    # 验证页 ~44.5KB / 正常页 138–147KB）都是响应体字节数。中文页面
+    # `len(str)` 只有字节数的三分之一左右，拿字符数去比阈值会把 41KB 的
+    # 挑战页判成 14K 字符 → 落进 `selector_miss`（当成我们自己的 bug）。
+    size = len(text.encode("utf-8", "ignore"))
+    base = {"status": status, "length": size, "url": final_url or ""}
 
     if any(token in url_l for token in ("verify", "safe-validate", "security-check")):
         return {**base, "kind": "verification", "evidence": "url"}
     # `/web/passport/zp/security.html` 是**风控阶梯的第二级**：JS 安全挑战，
-    # 通常 10-16 秒自愈，不是硬拦。要和"滑块验证"分开 —— 混为一谈会让我们
-    # 要么对它过度反应（白停一轮），要么把它当成自己的 bug（继续加压）。
+    # 不是硬拦。要和"滑块验证"分开 —— 混为一谈会让我们要么对它过度反应
+    # （白停一轮），要么把它当成自己的 bug（继续加压）。
     # 判据沿用 `service_jobs.page_session_check`：有验证控件才算要人，
     # 没有就是可自愈的 JS 挑战。
     if "/web/passport/zp/security.html" in url_l or "/zp/security.html" in url_l:
@@ -110,7 +116,7 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
         return {**base, "kind": "verification" if hit else "js_challenge",
                 "evidence": hit or "security.html"}
     # 正文里出现验证控件**且整页很短**才认：长页面里的"安全验证"多半是页脚文案。
-    if len(text) < 8000:
+    if size < 8000:
         hit = next((m for m in _VERIFY_MARKS if m in lowered), None)
         if hit:
             return {**base, "kind": "verification", "evidence": hit}
@@ -121,8 +127,17 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
     if hit:
         return {**base, "kind": "closed", "evidence": hit}
     if "job-sec-text" not in text:
+        # 按**字节数**兜一层。历史标定（boss-scrape-layer 记忆）给了四档：
+        #   下架 ~11KB / JS 挑战 ~41KB / 验证页 ~44.5KB / 正常岗位页 138–147KB
+        # 2026-10-19 实测的 security.html 是 42,825 字节，正落在挑战页区间。
+        #
+        # 这一层是必要的：挑战页有时**直接回在 job_detail 的 URL 上**，地址栏看不
+        # 出来，正文里也不一定有「拖动滑块」，只看 URL 会把它误判成我们自己的
+        # 选择器失效（`selector_miss`）——那会让一个真实的风控信号被记成 bug。
+        if 25000 <= size <= 62000:
+            return {**base, "kind": "js_challenge", "evidence": f"size:{size}"}
         # 连容器都没有：页面很长说明结构变了，很短说明压根不是详情页。
-        kind = "selector_miss" if len(text) > 4000 else "empty_page"
+        kind = "selector_miss" if size > 4000 else "empty_page"
         return {**base, "kind": kind, "evidence": "no-container"}
     # 容器在、里面是空的：岗位在线但正文为空（少数岗位确实不写 JD）。
     return {**base, "kind": "blank_jd", "evidence": "empty-container"}
