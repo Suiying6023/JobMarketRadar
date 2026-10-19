@@ -271,4 +271,10 @@ def evaluate(row: dict, profile: CandidateProfile, now: datetime) -> dict:
         if len(sentence) >= 15 and mentions(sentence, profile.roles + profile.skills) and sentence[:240] not in evidence:
             evidence.append(sentence[:240])
     return {"bucket": bucket, "score": round(max(0, min(100, score - 8 * len(unresolved) - 40 * bool(exclusions))), 1),
-            "reasons": reasons, "concerns": concerns, "evidence": evidence[:4]}
+            "reasons": reasons, "concerns": concerns, "evidence": evidence[:4],
+            # 排除原因必须**跟着结果一起返回**。只返回 bucket 的话，界面上只能看到
+            # "暂不优先"却看不到为什么 —— 2026-10-19 分析今晚抓的数据时，
+            # 57 条里有 48 条落在这个桶，而外部拿不到任何解释。
+            # 它也是 `-40 * bool(exclusions)` 那个扣分的唯一依据，不给出来就没法核对。
+            "exclusions": list(exclusions),
+            "unresolved": list(unresolved)}
