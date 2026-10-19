@@ -28,6 +28,9 @@ pages_per_query: 2
 detail_limit_per_query: 15
 page_size: 30
 collect_details: true
+# 详情取哪条路：api（默认，需列表里的 securityId）/ native（点卡片拦截）/ ssr（打开详情页解析）
+# ssr 不依赖 securityId，每岗位 1 个文档请求、0 次接口调用，适合补库里缺正文的存量岗位。
+detail_transport: api
 request_delay_seconds:
 - 6
 - 12

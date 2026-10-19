@@ -14,6 +14,7 @@ from patchright.async_api import BrowserContext, Page
 from patchright.async_api import Error as PlaywrightError
 
 from boss_scrape.errors import AUTH_EXPIRED_CODES, RISK_CODES, RISK_TEXTS
+from boss_scrape.htmlpage import query as html_query
 
 from ..models import CityConfig, CollectionConfig, JobRecord, Platform, SearchFilters
 from ..safety import AccessBlocked, AccessGate
@@ -27,7 +28,45 @@ from .stoken import StokenRoller, roll_quietly
 ORIGIN = "https://www.zhipin.com"
 API_PATH = "/wapi/zpgeek/search/joblist.json"
 DETAIL_PATH = "/wapi/zpgeek/job/detail.json"
+DETAIL_PAGE = "/job_detail/{}.html"
 USER_INFO_PATH = "/wapi/zpuser/wap/getUserInfo.json"
+
+# SSR 详情页的选择器。2026-10-19 在两条已知正文长度的岗位上核对过：
+# `.job-sec-text` 与 detail.json 的 postDescription 归一化后逐字相等。
+SSR_SELECTORS = {
+    "jd": ".job-sec-text",
+    "job_status": ".job-status",
+    "boss_name": ".job-boss-info .name",
+    "boss_title": ".job-boss-info .boss-info-attr",
+    "boss_active": ".job-boss-info .boss-active-time",
+    "address": ".location-address",
+    "skills": ".job-keyword-list li",
+}
+
+# 详情页 HTML 里内联的 `var _jobInfo = {...}`：job_id / user_id / job_name /
+# job_salary / company / securityId。页面自己铸的 securityId 也在这里——
+# 所以「securityId 被剪掉了」并不意味着这条路走不通。
+_INLINE_JOBINFO_RE = re.compile(r"var\s+_jobInfo\s*=\s*\{(.*?)\}\s*;", re.S)
+_INLINE_PAIR_RE = re.compile(r"(\w+)\s*:\s*'([^']*)'")
+_INLINE_ISLOGIN_RE = re.compile(r"var\s+_userInfo\s*=\s*\{[^}]*?isLogin\s*:\s*(true|false)", re.S)
+
+
+def _inline_jobinfo(html: str) -> dict:
+    """解析内联 `_jobInfo` 的键值。只取单引号字符串，其它类型忽略。"""
+    match = _INLINE_JOBINFO_RE.search(html or "")
+    if not match:
+        return {}
+    return {key: value for key, value in _INLINE_PAIR_RE.findall(match.group(1))}
+
+
+def _inline_is_login(html: str) -> bool | None:
+    """详情页 HTML 里内联的 `_userInfo.isLogin`。读不到返回 None（不当作未登录）。"""
+    match = _INLINE_ISLOGIN_RE.search(html or "")
+    if not match:
+        return None
+    return match.group(1) == "true"
+
+
 # 必须是 jobs（带 s）。`/web/geek/job` 会 302 到 `/web/geek/jobs`，多一跳；
 # 2026-08-10 标定实测：code=37 重算后回搜索页那次导航正好撞上这个 302 而超时
 # （Navigation to ".../web/geek/job?..." interrupted），把重算后本该成功的详情
@@ -1015,6 +1054,10 @@ class BossCollector(Collector):
         bossInfo 里有；JD 正文在 jobInfo.postDescription，是干净的纯文本，
         不需要解析 DOM，也就不受前端 class 名改版影响。
         详情接口必须带列表响应里的 securityId 和 lid，否则会被打回空白页。
+
+        ⚠️ 这条路依赖列表响应里的 `securityId`。`securityId` 会在每次详情响应后轮换，
+        也会被历史剪枝删掉（2026-10-18 删了 11,329 行），所以它对"库里已有但没正文"
+        的岗位不可用。那种岗位走 `_collect_ssr_detail`。
         """
         await self._require_detail_login()
         raw = job.raw
@@ -1027,6 +1070,124 @@ class BossCollector(Collector):
         job = apply_detail(job, zp, access_verified=True)
         job.raw["detail_source"].update({"transport": "api", "method": "GET", "access_evidence": dict(self._detail_access_evidence)})
         # 条内延迟用高斯分布（比 uniform 更像真人：有时快有时慢），2026-08-03 拟人化
+        lo, hi = self.config.detail_delay_seconds
+        if getattr(self, "pace", None) is None:
+            await asyncio.sleep(gaussian(lo, hi))
+        return job
+
+    async def _collect_ssr_detail(self, job: JobRecord) -> JobRecord:
+        """打开岗位详情页，只放行 document，从 SSR HTML 里取正文。
+
+        为什么有这条路：详情页是 **SSR + hydration**。实测（2026-10-19）导航到
+        `/job_detail/{id}.html` 后，页面**一次都不请求 `detail.json`**（等 40 秒超时，
+        `detail_requests: []`）；它只发 `jobdetail/popupguides/query.json` 和
+        `zpitem/web/competitive/jobDetail.json`，都不是正文。
+
+        正文在 `.job-sec-text` 里，和 `detail.json` 的 `postDescription` **逐字相等**：
+        两条已知长度的岗位归一化后 661/661、6111/6111，差 0。
+
+        代价与对策：不 abort 子资源时，一次详情页导航会发 24 个 `/wapi/` 引导请求，
+        比直接 fetch 还贵。所以这里**只放行 document**，其余一律 abort——服务端只看到
+        1 个文档请求，接口调用 0 次。
+
+        这条路不依赖 `securityId`，也不碰 stoken，所以能覆盖"库里已有 job_url、
+        但没有 securityId、也不在搜索结果里"的存量岗位。
+        """
+        self._require_online()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", job.source_job_id):
+            raise ValueError("岗位 ID 字符格式无效，无法打开详情页")
+
+        url = f"{ORIGIN}{DETAIL_PAGE.format(job.source_job_id)}"
+        rowid = self._log_request(url)
+        self.request_count += 1
+
+        async def only_document(route):
+            if route.request.resource_type == "document":
+                await route.continue_()
+            else:
+                await route.abort()
+
+        await self.page.route("**/*", only_document)
+        try:
+            response = await self.page.goto(
+                url, wait_until="domcontentloaded",
+                timeout=self.config.browser.navigation_timeout_ms)
+            if response is None:
+                raise RuntimeError("详情页没有返回响应，不写入正文")
+            if response.status in (401, 403, 429):
+                self._trip_risk(rowid, f"详情页收到 HTTP {response.status}，需要人工复检",
+                                code=None, outcome="risk", http_status=response.status,
+                                category=response_condition(None, response.status, ""))
+            html = await response.text()
+        except BaseException:
+            self._finish_request(rowid, "error")
+            raise
+        finally:
+            await self.page.unroute("**/*", only_document)
+
+        # 登录态从页面内联的 `_userInfo` 读，**零额外请求**——这条路径不需要
+        # `getUserInfo.json`。读不到（None）不算未登录：页面改版少一个字段时，
+        # 宁可放行一次让正文进库，也不要因此把整轮停掉。
+        is_login = _inline_is_login(html)
+        if is_login is False:
+            self._finish_request(rowid, "authentication")
+            raise PlatformRiskStop("详情页显示未登录，不把匿名预览当作完整正文",
+                                   category="authentication_required")
+        self._detail_access_evidence = {
+            "kind": "ssr_inline_user_info", "is_login": is_login,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        fields = html_query(html, SSR_SELECTORS)
+        description = (fields["jd"]["text"] or "").strip()
+        if not description:
+            self._finish_request(rowid, "short")
+            raise RuntimeError("详情页没有读到正文（岗位可能已下线或页面改版），不把空正文写库")
+
+        inline = _inline_jobinfo(html)
+        encrypt_id = inline.get("job_id") or job.source_job_id
+        status_text = (fields["job_status"]["text"] or "").strip()
+        active = (fields["boss_active"]["text"] or "").strip()
+        boss_name = (fields["boss_name"]["text"] or "").strip()
+        if active and boss_name.endswith(active):
+            # `.name` 里带活跃文案（"李女士 刚刚活跃"），切掉才和 detail.json 的
+            # bossInfo.name 对齐。
+            boss_name = boss_name[: -len(active)].strip()
+
+        zp = {
+            "jobInfo": {
+                "encryptId": encrypt_id,
+                "encryptUserId": inline.get("user_id") or "",
+                "postDescription": description,
+                "jobStatusDesc": status_text,
+                "address": (fields["address"]["text"] or "").strip(),
+                "showSkills": [s.strip() for s in (fields["skills"]["text"] or "").split() if s.strip()],
+            },
+            "bossInfo": {
+                "name": boss_name,
+                "title": (fields["boss_title"]["text"] or "").strip(),
+                "activeTimeDesc": active,
+            },
+            "brandComInfo": {},
+        }
+
+        was_invalid = job.job_invalid
+        job = apply_detail(job, zp, access_verified=True)
+        # 关闭只降不升：页面明确写了关闭才置 True，没写就保留原标记，绝不清掉。
+        # 和刷新链路同一条判据（见 boss_scrape/refresh.py 的 classify）。
+        if "关闭" in status_text or "下线" in status_text:
+            job.job_invalid = True
+        else:
+            job.job_invalid = was_invalid
+        job.raw["detail_source"].update({
+            "transport": "ssr",
+            "method": "GET",
+            "resource_scope": "document_only",
+            "inline_security_id_present": bool(inline.get("securityId")),
+            "access_evidence": dict(self._detail_access_evidence),
+        })
+        self._finish_request(rowid, "ok")
+
         lo, hi = self.config.detail_delay_seconds
         if getattr(self, "pace", None) is None:
             await asyncio.sleep(gaussian(lo, hi))
@@ -1133,7 +1294,13 @@ class BossCollector(Collector):
                         )
                     try:
                         detailed += 1
-                        job = await (self._collect_native_detail(job) if native else self._collect_detail(job))
+                        transport = self.config.detail_transport
+                        if transport == "ssr":
+                            job = await self._collect_ssr_detail(job)
+                        elif transport == "native":
+                            job = await self._collect_native_detail(job)
+                        else:
+                            job = await self._collect_detail(job)
                         # 本轮内同一岗位也可能再出现（换关键词），记下避免重复
                         self.skip_detail_ids.add(job.canonical_key())
                     except RiskControlStop:

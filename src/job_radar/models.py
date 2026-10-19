@@ -108,6 +108,13 @@ class CollectionConfig(BaseModel):
     keywords: list[str]
     pages_per_query: int = Field(default=3, ge=1, le=10)
     list_source: Literal["api", "native"] = "api"
+    #: 详情用哪条路取。
+    #: `api`    页面内 fetch `detail.json`，**需要列表响应里的 securityId**
+    #: `native` 点搜索结果里的卡片再拦 `detail.json`，卡片必须在可视区
+    #: `ssr`    打开 `/job_detail/{id}.html`、只放行 document、解析 `.job-sec-text`
+    #:          —— 不依赖 securityId，也不碰 stoken；正文与 detail.json 逐字相等，
+    #:          代价是每岗位 1 个文档请求（子资源全 abort，接口调用 0 次）
+    detail_transport: Literal["api", "native", "ssr"] = "api"
     pages_per_keyword: dict[str, int] = Field(default_factory=dict)
     detail_limit_per_query: int = Field(default=30, ge=0, le=200)
     page_size: int = Field(default=30, ge=10, le=50)
