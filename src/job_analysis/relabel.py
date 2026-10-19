@@ -38,15 +38,45 @@ COLUMNS = ("role_family", "role_confidence", "role_probabilities", "title_mismat
            "grad_year", "grad_year_confidence", "is_proxy", "tech_stack_json")
 
 
-def load_rows(db: sqlite3.Connection, limit: int) -> list[dict]:
+def load_rows(db: sqlite3.Connection, limit: int, max_age_days: int | None = 7) -> list[dict]:
+    """选出待打标的岗位。
+
+    `max_age_days` 是**额度保护**：默认只打最近 7 天首次见到的岗位。
+    老岗位重标一次要花真金白银，而它们大多已经过期、再投也没意义 ——
+    要动存量必须显式传 `--max-age-days 0`（0/None = 不限）。
+
+    判据用 `last_seen_at` 而不是 `first_seen_at`：一条三个月前首见、但今天
+    又出现在搜索结果里的岗位，仍然是**活的**，值得打标；反过来只看首见时间
+    会把它们全漏掉。
+    """
     sql = ("SELECT canonical_id, title, company_name, salary_text, experience, education, "
            "job_description FROM jobs "
            "WHERE job_description IS NOT NULL AND TRIM(job_description) != '' "
            "AND (relabeled_at IS NULL OR relabeled_at = '')")
+    params: list[str] = []
+    if max_age_days:
+        # last_seen_at 存的是 UTC（`...Z`），这里用 SQLite 的 julianday 比较，
+        # 不依赖 Python 侧时区换算。
+        sql += " AND julianday(last_seen_at) >= julianday('now') - ?"
+        params.append(str(float(max_age_days)))
+    sql += " ORDER BY last_seen_at DESC"
     if limit:
         sql += f" LIMIT {int(limit)}"
     db.row_factory = sqlite3.Row
-    return [dict(row) for row in db.execute(sql)]
+    return [dict(row) for row in db.execute(sql, params)]
+
+
+def count_by_age(db: sqlite3.Connection) -> dict[str, int]:
+    """统计未打标的岗位里，新旧各有多少 —— 让操作者看清 `--max-age-days` 会跳过什么。"""
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        "SELECT "
+        " SUM(CASE WHEN julianday(last_seen_at) >= julianday('now') - 7 THEN 1 ELSE 0 END) AS recent,"
+        " SUM(CASE WHEN julianday(last_seen_at) <  julianday('now') - 7 THEN 1 ELSE 0 END) AS old,"
+        " COUNT(*) AS total FROM jobs "
+        "WHERE job_description IS NOT NULL AND TRIM(job_description) != '' "
+        "AND (relabeled_at IS NULL OR relabeled_at = '')").fetchone()
+    return {"recent": row["recent"] or 0, "old": row["old"] or 0, "total": row["total"] or 0}
 
 
 def write_batch(db: sqlite3.Connection, results: list[tuple[dict, dict, str | None]],
@@ -88,16 +118,34 @@ def main() -> int:
     parser.add_argument("--batch", type=int, default=200, help="每多少条提交一次")
     parser.add_argument("--db", default=str(DB))
     parser.add_argument("--dry-run", action="store_true", help="只跑不写库")
+    parser.add_argument("--max-age-days", type=float, default=7.0,
+                        help="只打最近 N 天内还活跃的岗位（默认 7；传 0 表示不限，"
+                             "会连旧存量一起打 —— 费额度，谨慎）")
+    parser.add_argument("--stats-only", action="store_true",
+                        help="只统计待打标的新旧分布，不调模型")
     args = parser.parse_args()
 
     sys.path.insert(0, str(Path(r"D:\Code\Boss\src")))
+
+    db = sqlite3.connect(args.db)
+    stats = count_by_age(db)
+    window = args.max_age_days or None
+    print(f"未打标合计 {stats['total']} 条：近 7 天活跃 {stats['recent']}，"
+          f"更早 {stats['old']}")
+    if window:
+        print(f"本次窗口 --max-age-days {window:g} → 预计处理 {stats['recent']} 条"
+              f"（跳过 {stats['old']} 条旧数据；要打旧的用 --max-age-days 0）")
+    else:
+        print(f"⚠ 不限时效 → 将处理全部 {stats['total']} 条（费额度）")
+    if args.stats_only:
+        return 0
+
     from job_radar.cli import load_config
     config = load_config(str(Path(r"D:\Code\Boss\config.local.yaml")))
     client = DecisionClient(base_url=config.llm.base_url, api_key=config.llm.api_key,
                             model=MODEL)
 
-    db = sqlite3.connect(args.db)
-    rows = load_rows(db, args.limit)
+    rows = load_rows(db, args.limit, max_age_days=window)
     total = len(rows)
     print(f"待重标: {total} 条  并发: {args.workers}  模型: {MODEL}")
     if not total:
