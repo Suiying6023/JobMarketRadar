@@ -322,8 +322,8 @@ AI Agent / 智能体开发 / 大模型应用开发 / AI后端工程师 / RAG / P
 6. **SSR 详情被记成 `list`** —— `_kind_of()` 原先只认 `/wapi/zpgeek/job/detail.json`，
    `/job_detail/*.html` 落到 `list`，让"详情占多少请求"这类分析失效。
 7. **`observed=False`** —— 补详情不是"又出现在列表里"，不能刷 `seen_count` / `last_seen_at`。
-8. **`_legacy` 测试不在门禁里** —— `pyproject.toml` 的 `testpaths` 只含
-   `tests/e2e` / `tests/scrape` / `tests/analysis`。
+8. **`_legacy` 测试不在门禁里** —— 默认门禁只有 `tests/e2e`（`pyproject.toml`
+   的 `testpaths`）。纯逻辑测试在 `tests/scrape` / `tests/analysis`，要显式跑。
 
 ---
 
@@ -352,8 +352,14 @@ $env:PYTHONIOENCODING='utf-8'
 # 死代码扫描（不联网）
 & .\.venv\Scripts\python.exe -X utf8 local\analysis\live-20261019\_deadcode_scan.py
 
-# 门禁
-& .\.venv\Scripts\python.exe -X utf8 -m pytest tests/e2e tests/scrape tests/analysis -q
+# 门禁：默认只有端到端（约 22 秒）
+& .\.venv\Scripts\python.exe -X utf8 -m pytest -q
+
+# 纯逻辑门禁（按需，不联网）：节奏 / 归因 / 外包名单 / 决策模型
+& .\.venv\Scripts\python.exe -X utf8 -m pytest tests/scrape tests/analysis -q
+
+# 历史行为查证（红着不代表现在有问题）
+& .\.venv\Scripts\python.exe -X utf8 -m pytest tests/_legacy -q
 ```
 
 风控熔断后：先 `job-radar risk-status` 看状态，人工处理完再 `job-radar risk-release

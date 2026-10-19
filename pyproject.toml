@@ -33,24 +33,26 @@ job_radar = ["web/*.html", "web/*.css", "web/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-# 默认只跑端到端套件。
+# 默认门禁 = **只有端到端**。
 #
-# 旧的 31 个文件、332 个用例绝大多数是「手写 FakePage 返回 dict」的单元测试：
-# 它们验证的是"传进去的 dict 能被解析"，没有验证请求是怎么发出去的。真实漂移
-# 就是这么来的——生产代码加了 page.on()，替身没跟上，60 个用例一起红，而因为
-# 套件跑一次要 35 秒、又长期没人跑，红灯一直亮着。
+# 旧套件（31 个文件 / 320 个用例）绝大多数是「手写 FakePage 返回 dict」的单元
+# 测试：验证的是"传进去的 dict 能被解析"，没验证请求是怎么发出去的。真实漂移
+# 就是这么来的 —— 生产代码加了 `page.on()`，替身没跟上，60 个用例一起红；而
+# 套件跑一次 35 秒、又长期没人跑，红灯就一直亮着。
 #
-# 现在默认只跑 tests/e2e：真的起一个本地 HTTP 服务，真的发请求，走完整链路。
-# `test_pipeline_e2e.py` 覆盖采集链路，`test_refresh_e2e.py` 覆盖刷新链路
-# （取值 → 解析 → 判定 → 选目标 → 落库），刷新那套是本轮新写的：
-# 之前刷新只有"把字典喂给 classify"的单元测试，所以"不落库 / 不续跑 /
-# 自愈永远失败"三个 bug 一直藏着。历史用例原样保留在 tests/_legacy/，需要时用
-#   python -m pytest tests/_legacy
-# 显式调出来查证历史行为，不进入默认门禁。
+# 所以默认只跑 tests/e2e：真的起本地 HTTP 服务、真的发请求、走完整链路。
+#   test_pipeline_e2e.py   采集链路
+#   test_refresh_e2e.py    刷新链路（取值 → 解析 → 判定 → 选目标 → 落库）
+#   test_session_offline.py 采集会话三阶段（离线，mock 掉 collector）
+#   test_keyword_rotation.py 关键词轮转
 #
-# tests/scrape 是独立抓取层（src/boss_scrape）的门禁：纯逻辑，不碰浏览器、不联网，
-# 秒级跑完（classify 判据 + Python 侧 HTML 取值 + 运行日志）。
-# tests/analysis 是分析层（src/job_analysis）的门禁：决策模型的重试语义、
-# 并发隔离、标签摊平，同样不联网。
-testpaths = ["tests/e2e", "tests/scrape", "tests/analysis"]
+# 三档，按需显式跑：
+#   pytest                       → 只有 e2e（约 22 秒）
+#   pytest tests/scrape tests/analysis   → 纯逻辑门禁（不联网，秒级）
+#   pytest tests/_legacy         → 历史行为查证，红着不代表现在有问题
+#
+# 2026-10-19 从三个目录收回成只有 e2e：注释一直写着"默认只跑 e2e"，但
+# `testpaths` 被陆续扩成了三个目录，实际每次要跑 128 个用例。同时删掉了一段
+# 引用 `src/job_analysis` 的陈旧注释 —— 那个包在项目瘦身时已经删了。
+testpaths = ["tests/e2e"]
 addopts = "-ra"
