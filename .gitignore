@@ -94,6 +94,7 @@ open_login.bat
 *.tmp
 data/*-state.sqlite3*
 data/access-policy.json*
+data/refresh-access-policy.json*
 data/*.lock
 work/
 resumes/
@@ -112,3 +113,4 @@ data/batches/
 *.db
 *.db-wal
 *.db-shm
+/.browser-interface-anonymous/

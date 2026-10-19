@@ -13,8 +13,7 @@ from .task_store import TaskStore
 from .annotations import hash_json
 
 HOT_FIELDS = ("llm", "network_enabled", "request_delay_seconds", "detail_delay_seconds", "detail_batch",
-              "detail_cooldown_seconds", "burst_threshold", "burst_penalty_seconds", "budget_mode",
-              "max_requests_per_run", "max_requests_per_day", "over_quota_action", "over_quota_ladder")
+              "detail_cooldown_seconds", "burst_threshold", "burst_penalty_seconds")
 
 
 def changed_fields(actual, requested, prefix=""):
@@ -65,6 +64,10 @@ class TaskContext:
     def require_access(self):
         cfg, _ = self.settings.read()
         AccessGate(self.database).require_online(cfg.network_enabled)
+        if self.task["kind"] == "refresh":
+            gate = AccessGate(self.database, scope="refresh")
+            if gate.state_path.exists():
+                gate.require_online(cfg.network_enabled)
 
     def log(self, message, *, level="info", kind="log", **data):
         cfg, _ = self.settings.read()
@@ -81,10 +84,11 @@ class TaskContext:
                 return await operation()
             except PlatformRiskStop as exc:
                 message = redact(str(exc), self.config())
-                self.log(message, level="warning", kind="risk")
+                self.log(message, level="warning", kind="risk", category=exc.category,
+                         code=exc.code, http_status=exc.http_status)
                 # The persistent hold prevents another automated task from proceeding.
                 owner = f"managed-task:{self.ident}"
-                gate = AccessGate(self.database)
+                gate = AccessGate(self.database, scope="refresh" if self.task["kind"] == "refresh" else "")
                 try:
                     state = gate.pause(message, source=owner)
                 except Exception:
@@ -92,11 +96,31 @@ class TaskContext:
                     raise
                 if state.source != owner:
                     raise RuntimeError("已有独立的访问暂停，当前任务停止并保留该状态")
-                url = getattr(page, "url", "") or ""
+                # Refresh can fail on a document fetched in the background, while
+                # the browser still displays its initial job. Point the operator
+                # to the failed public job URL, rather than that unrelated tab URL.
+                url = exc.request_url or getattr(page, "url", "") or ""
                 if not url.startswith("https://www.zhipin.com/"):
                     url = ""
-                self.store.update(self.ident, status="waiting_verification", verification={"url": url.split("?")[0], "message": message})
-                self.log("等待用户在任务浏览器中处理验证", kind="verification")
+                self.store.update(self.ident, status="waiting_verification", verification={
+                    "url": url.split("?")[0], "message": message, "category": exc.category,
+                    "code": exc.code, "http_status": exc.http_status})
+                self.log("任务已暂停，等待平台状态和当前业务请求复检", kind="verification", category=exc.category)
+                # 自动把窗口推到前台。实测（2026-10-18）`code=36` 是"要求人工过验证"，
+                # 不是限速：等 12 分钟无效，整页重载也无效，只有人点一下能解。
+                # 原先必须由操作者再敲一条 show 命令才会弹窗，等于把一个"必须人来"
+                # 的动作藏在了第二道门后面。
+                try:
+                    if page is not None and not getattr(self.config().browser, "headless", False):
+                        await browser.show(page)
+                        on_verify = any(hint in (getattr(page, "url", "") or "")
+                                        for hint in ("verify", "safe-validate"))
+                        self.log("已自动弹出浏览器窗口" +
+                                 ("；当前就是验证页，请直接完成验证" if on_verify
+                                  else "；若不是验证页，请人工确认账号状态"),
+                                 kind="verification", category=exc.category)
+                except Exception:  # noqa: BLE001 - 弹窗失败不影响暂停语义
+                    self.log("窗口显示失败，请检查浏览器是否可见后重试", level="warning")
                 while True:
                     if self.store.consume(self.ident, "show"):
                         try:
@@ -127,7 +151,13 @@ async def run(context, parent):
     guard = asyncio.create_task(watch())
     try:
         result = await execute(context)
-        context.store.finish(context.ident, "succeeded", result=result)
+        failed = int(result.get("failed", context.progress.get("failed", 0)) or 0)
+        if failed:
+            message = f"任务处理结束，仍有{failed}条记录失败；已保存的成功结果保留，可重新处理失败项"
+            context.log(message, level="error")
+            context.store.finish(context.ident, "failed", result=result, error=message)
+        else:
+            context.store.finish(context.ident, "succeeded", result=result)
     except asyncio.CancelledError:
         context.store.finish(context.ident, "cancelled")
     except Exception as exc:

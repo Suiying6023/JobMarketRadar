@@ -267,11 +267,13 @@ class AccessGate:
     用法（人工侧）：`gate.release("2026-09-16 账号已自然解封，用户确认")`。
     """
 
-    def __init__(self, database_path: str | Path):
+    def __init__(self, database_path: str | Path, *, scope: str = ""):
         path = Path(database_path) if not isinstance(database_path, Path) else database_path
         # 允许直接传目录（临时库/测试用 tmp_path 时更自然）。
         base = path if path.is_dir() else path.parent
-        self.state_path = base / STATE_FILENAME
+        if scope not in ("", "refresh"):
+            raise ValueError("访问范围无效")
+        self.state_path = base / ("refresh-access-policy.json" if scope else STATE_FILENAME)
 
     # ---- 读 ----
 

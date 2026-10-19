@@ -41,6 +41,8 @@ class TaskManager:
         if kind not in KINDS:
             raise ValueError("任务类型无效")
         opts = TaskOptions.model_validate(options or {})
+        if kind in ("collect", "recommend") and opts.canonical_ids:
+            raise ValueError("指定岗位主键适用于详情、标签和状态任务；列表采集使用查询计划")
         cfg, revision = self.settings.read()
         self.store.retention = cfg.service.event_retention
         if kind == "collect" and any(not city.boss_code for city in cfg.cities):
@@ -51,10 +53,14 @@ class TaskManager:
                     raise TaskConflict("请先配置并启用 LLM 端点与模型")
             else:
                 AccessGate(self.database).require_online(cfg.network_enabled)
+                if kind == "refresh":
+                    refresh_gate = AccessGate(self.database, scope="refresh")
+                    if refresh_gate.state_path.exists():
+                        refresh_gate.require_online(cfg.network_enabled)
         with self._lock:
             if self._closed:
                 raise TaskConflict("服务正在停止")
-            resource = ("preview" if opts.dry_run else "llm" if kind == "tag" else "browser")
+            resource = ("preview" if opts.dry_run else "llm" if kind == "tag" else "refresh" if kind == "refresh" else "browser")
             task = self.store.create(kind, opts, revision, resource)
             ident = task["id"]
             env = os.environ.copy()
@@ -148,7 +154,9 @@ class TaskManager:
         cfg, _ = self.settings.read()
         if not cfg.network_enabled:
             raise TaskConflict("请先在配置中启用在线访问")
-        gate = AccessGate(self.database)
+        if task["kind"] == "refresh":
+            AccessGate(self.database).require_online(cfg.network_enabled)
+        gate = AccessGate(self.database, scope="refresh" if task["kind"] == "refresh" else "")
         state = gate.read_state()
         if not state.ready:
             gate.release("用户确认完成验证，按实际业务响应复检", expected_source=f"managed-task:{ident}")

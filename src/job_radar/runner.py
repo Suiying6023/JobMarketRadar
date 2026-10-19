@@ -8,6 +8,7 @@ from rich.progress import Progress
 from .collectors.boss import BossCollector, RiskControlStop
 from .collectors.stubs import PendingPlatformCollector
 from .models import CollectionConfig, CollectionStats, Platform
+from .rounds import rotate_keywords
 from .safety import AccessBlocked
 from .storage import JobStore
 
@@ -70,34 +71,29 @@ async def run_collection(config: CollectionConfig) -> CollectionStats:
                 collector = make_collector(platform, config)
                 # 去重前置：把库里已有 JD 的岗位灌给采集器，详情配额不浪费在重复岗位上
                 if hasattr(collector, "skip_detail_ids"):
-                    collector.skip_detail_ids = store.detailed_ids()
+                    collector.skip_detail_ids = store.detailed_ids(config.service.detail_after_hours)
                     console.print(f"[dim]已有详情 {len(collector.skip_detail_ids)} 条，本轮跳过其详情请求[/]")
-                # 共享请求账本，跨进程记录业务请求与所选预算模式
+                # 共享请求账本，跨进程记录业务请求的观测（只记录，不参与放行）
                 if hasattr(collector, "ledger"):
                     collector.ledger = store
                     collector.ledger_script = "runner"
-                    console.print(f"[dim]今日账本 {store.request_counts()}"
-                                  f"，单日上限 {config.max_requests_per_day}[/]")
+                    console.print(f"[dim]今日请求观测 {store.request_counts()}[/]")
                 try:
                     # ⚠️ `start()` 必须在 try 内。它在**起浏览器之前**会先过访问策略
                     # 闸门（network_enabled + access-policy.json），这一步失败是常见
                     # 路径（冻结期、忘记解除、配置里没开）。原先 start 在 try 外，
                     # 一失败就既不 close 也不落 record_run —— 现场只留一个 traceback。
                     await collector.start()
-                    keywords = config.keywords
-                    if len(keywords) > config.max_keywords_per_run:
-                        if config.budget_mode == "enforce":
-                            keywords = keywords[:config.max_keywords_per_run]
-                        else:
-                            console.print("[yellow]关键词数量超过经验参考值；按本次显式配置执行。[/]")
+                    # 关键词轮转与页深上限与 `rounds.query_plan` 保持一致：
+                    # 两处都无条件生效。历史上前者只在 budget_mode=enforce 下才轮转，
+                    # 默认 reference 时轮转从不发生——那是 bug，不是策略。
+                    keywords = rotate_keywords(config.keywords, store.keyword_recency(),
+                                               config.max_keywords_per_run)
                     for city in config.cities:
                         for keyword in keywords:
                             # 翻页深度按关键词取：`pages_per_keyword` 里配过的用它，
-                            # 其余用 pages_per_query。原先一律传 pages_per_query，
-                            # 于是配置里按词配的深度被静默忽略（高产词该深翻却只翻 3 页）。
-                            pages = config.pages_for(keyword)
-                            if pages > config.max_page_number and config.budget_mode == "enforce":
-                                pages = config.max_page_number
+                            # 其余用 pages_per_query，并且都不超过 max_page_number。
+                            pages = min(config.pages_for(keyword), config.max_page_number)
                             for filters in config.filters:
                                 stats.queries += 1
                                 console.print(
@@ -116,12 +112,14 @@ async def run_collection(config: CollectionConfig) -> CollectionStats:
                                     console.print(f"[bold red]访问被策略拦住: {exc}[/]")
                                     return stats
                                 except RiskControlStop as exc:
-                                    # 命中风控或达到请求预算：整轮停止，不再换城市或关键词继续试探。
+                                    # 命中风控：整轮停止，不再换城市或关键词继续试探。
                                     stats.stopped_reason = str(exc)
                                     console.print(f"[bold red]已停止采集: {exc}[/]")
                                     return stats
                                 except Exception as exc:
                                     console.print(f"[red]任务失败: {exc}[/]")
+                            # 记下「这个词刚采过」，供下一轮的轮转排序用。
+                            store.touch_keyword_progress(city.name, keyword)
                 except (AccessBlocked, RiskControlStop) as exc:
                     stats.stopped_reason = str(exc)
                     console.print(f"[bold red]本轮已停止: {exc}[/]")

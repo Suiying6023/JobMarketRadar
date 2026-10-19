@@ -95,20 +95,19 @@ CREATE TABLE IF NOT EXISTS collection_runs (
     stats_json TEXT NOT NULL DEFAULT '{}'
 );
 
--- 请求账本用于本地计划与审计，不是平台的官方额度或风控机制说明。
+-- 请求记录表用于本地审计，不是平台的官方额度或风控机制说明。
 -- 历史采样不足以证明任何频率、累计量或延迟值能保证账号安全。
--- 原先只有 collection_runs 表且 record_run() 零调用，实查 0 行，等于没有账本：
+-- 原先只有 collection_runs 表且 record_run() 零调用，实查 0 行，等于没有记录：
 -- expand_list / backfill_details / backfill_activity 各跑各的，谁也不知道今天
 -- 一共发了多少请求，"今天已经很克制了"完全是凭感觉。
 -- 一行 = 一次业务尝试，kind 区分 list/detail/security_check；不含整页资源总数。
--- ⚠️ 两条链路都写这张表，但**各有独立日线**：采集链路（list/detail/security_check，
--- 带账号 cookie + 家宽 IP）由 `max_requests_per_day` 卡，口径见
--- `JobStore.COLLECT_KINDS`；状态刷新链路（detail_page，免登录 + 波尔机房 IP）
--- 由 refresh_status_loop 自己的 `--daily-cap` 卡。风控按「IP + 账号信任度」判，
--- 两条链路既不同出口也不同登录态，合并计数只会让彼此凭空少掉额度。
+-- ⚠️ **这张表现在只做观测，不做配额。** 2026-10-19 起取消了按日线的拦截机制：
+-- 日线是我们按历史轮次反推的推测值，不是平台给的额度，把它当硬线等于在证据不足
+-- 时替用户做决定。节奏由 `request_delay_seconds` / `burst_*` 控制，出事即停由
+-- `AccessGate` 持久熔断负责，两者都读这张表但不依赖它放行。
 -- ⚠️ ts 由 Python 写入**本地时间**，不用 SQLite 的 CURRENT_TIMESTAMP（那是 UTC）。
 -- 混用会让同一行的 ts 和 day 差 8 小时（day 按本地日算，见 log_request 注释），
--- 看账本时极易误判成两批不同的事件——实测已经误导过一次判读。
+-- 看记录时极易误判成两批不同的事件——实测已经误导过一次判读。
 -- 落盘的 risk_dump 文件名也是本地时间，统一本地时间才能对齐着看。
 CREATE TABLE IF NOT EXISTS request_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,76 +169,36 @@ CREATE INDEX IF NOT EXISTS idx_request_log_day ON request_log(day, kind);
 """
 
 
-class BudgetExceeded(RuntimeError):
-    """严格日线到顶：额度**没有**预留成功，这次请求绝不能发出去。
-
-    ⚠️ 与「账本读不出来」区分：那是观测失败，这是预算用尽。两者都不许发请求，
-    但处置不同 —— 前者要查库/查锁，后者等次日或调档。
-    """
-
-
 def current_local_day() -> str:
     """账本的「今天」= **本地日历日**。
 
-    平台给的解封时刻按北京时间，用 UTC 会让早上 8 点前的「今天」错位到前一天，
-    把昨天的额度算进今天（`log_request` 与 `request_counts` 都按这个口径）。
+    平台给的解封时刻按北京时间，用 UTC 会让早上 8 点前的「今天」错位到前一天
+    （`log_request` 与 `request_counts` 都按这个口径）。
     """
     return datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
-def budget_scope(kind: str) -> tuple[str, ...]:
-    """某类请求受哪一条日线约束。
+def log_request_on(conn: sqlite3.Connection, kind: str, script: str = "",
+                   note: str = "") -> int:
+    """记一行请求**观测**，返回行 id。**不做任何额度判断，不会拒绝任何请求。**
 
-    采集链路（`JobStore.COLLECT_KINDS`：list/detail/security_check/recommend）
-    共用一条线，因为它们同账号、同出口、同风控主体；
-    其余 kind（如 `detail_page`）各算各的 —— 两条链路既不同登录态也不同 IP，
-    合并计数只会让彼此凭空少掉额度。
+    ⚠️ 口径：一行 = 一次业务尝试，不是真实 HTTP 资源总数（stoken 重算、挑战页
+    子资源不在这里逐条计数）。它只回答"这条链路什么时候做过多少次、结果如何"，
+    不参与任何放行/拦截决定 —— 放行由调用方的节奏参数和风控熔断负责。
+
+    历史说明：这里原本是 `reserve_request_on()`，会在 `BEGIN IMMEDIATE` 里数当天
+    已发请求数、到自设日线就抛 `BudgetExceeded` 拦下请求。那套账本机制已取消：
+    日线是我们按历史轮次反推的推测值，不是平台给的额度，把它当硬线等于在证据不足时
+    替用户做决定。现在只保留记录，节奏与熔断各自独立生效。
     """
-    if kind in JobStore.COLLECT_KINDS:
-        return tuple(sorted(JobStore.COLLECT_KINDS))
-    return (kind,)
-
-
-def reserve_request_on(conn: sqlite3.Connection, kind: str, daily_cap: int | None,
-                       script: str = "", note: str = "") -> int:
-    """在**一个事务里**统计并预留一次请求额度，返回预留行 id。
-
-    为什么必须是 `BEGIN IMMEDIATE` 而不是「先 SELECT 再 INSERT」：
-    三个脚本各跑各的进程（也有同机并行的时候），先读后写在并发下会双花 ——
-    两个进程都看到 used=cap-1，然后各插一行。IMMEDIATE 先把写锁拿到手，
-    读与写在同一个事务里，跨进程不会超额。
-    ⚠️ 调用点必须在**请求发出之前**；预留失败（BudgetExceeded）时一个字节都不许发。
-    ⚠️ 一行 = 一次**业务尝试**，不是真实 HTTP 资源总数：stoken 重算/挑战页子资源
-    不在这里逐条计数（口径说明见 `REQ_PER_DETAIL` 与 `REQ_PER_RECOVER`）。
-    """
-    if daily_cap is not None and daily_cap <= 0:
-        raise ValueError(f"daily_cap 必须是正数或 None（None=本次不设线），收到 {daily_cap!r}")
-    scope = budget_scope(kind)
-    marks = ",".join("?" * len(scope))
     now = datetime.now().astimezone()
-    cur = conn.cursor()
-    try:
-        cur.execute("BEGIN IMMEDIATE")
-        used = int(cur.execute(
-            f"SELECT COUNT(*) FROM request_log WHERE day = ? AND kind IN ({marks})",
-            (current_local_day(), *scope)).fetchone()[0])
-        if daily_cap is not None and used >= daily_cap:
-            conn.rollback()
-            raise BudgetExceeded(
-                f"今日累计请求已达 {used}/{daily_cap}（{kind} 口径，跨进程账本预留），"
-                f"额度未预留，请求不发出，主动停止")
-        cur.execute(
-            "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"),
-             kind, "pending", None, script, note))
-        rowid = int(cur.lastrowid or 0)
-        conn.commit()
-        return rowid
-    except BaseException:
-        if conn.in_transaction:      # BudgetExceeded 分支已 rollback，这里兜其他异常
-            conn.rollback()
-        raise
+    cur = conn.execute(
+        "INSERT INTO request_log(ts, day, kind, outcome, code, script, note) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"),
+         kind, "pending", None, script, note))
+    conn.commit()
+    return int(cur.lastrowid or 0)
 
 
 def mark_outcome_on(conn: sqlite3.Connection, rowid: int | None,
@@ -390,21 +349,33 @@ class JobStore:
         "recruiter_active_days",
     )
 
-    # 单向布尔标记：只有详情接口给，且一旦为真就不该被列表轮次的 0 覆盖回假。
-    # （岗位下架、代招不会变回来；真要重置由 clean/backfill 脚本直接 UPDATE。）
+    # 列表未提供的详情布尔标记不能被默认值覆盖；新详情可更新为 false。
     KEEP_IF_FALSY_COLUMNS = (
         "recruiter_certificated",    # 招聘者认证
         "is_proxy_job",              # 代招标记
         "job_invalid",               # 岗位失效
     )
 
-    def upsert(self, job: JobRecord) -> str:
+    def upsert(self, job: JobRecord, *, observed: bool = True) -> str:
         canonical_id = job.canonical_key()
         existing = self.conn.execute(
-            "SELECT matched_queries_json, skills_json, welfare_json, raw_json FROM jobs WHERE canonical_id = ?",
+            "SELECT matched_queries_json, skills_json, welfare_json, raw_json, job_description, detail_fetched_at FROM jobs WHERE canonical_id = ?",
             (canonical_id,),
         ).fetchone()
 
+        # Anonymous previews observed in live runs are a strict half-length/400-character
+        # prefix of the stored body. Preserve them as evidence, without replacing the full JD.
+        preview = False
+        if existing and job.job_description.strip() and existing["job_description"]:
+            new_text, old_text = job.job_description, existing["job_description"]
+            preview = not job.raw.get("detail_access_verified") and len(new_text) < len(old_text) and old_text.startswith(new_text) and (
+                len(new_text) == 400 or abs(len(new_text)*2-len(old_text)) <= 4)
+            if preview:
+                job.raw["detail_access_verified"] = False
+                job.raw["detail_preview"] = {"description": new_text, "fetched_at": job.detail_fetched_at,
+                                             "reason": "short prefix matching the observed anonymous preview pattern"}
+                job.job_description = old_text
+                job.detail_fetched_at = existing["detail_fetched_at"]
         payload = job.model_dump(mode="json")
 
         if existing:
@@ -425,6 +396,9 @@ class JobStore:
             if old_raw:
                 new_raw = payload.get("raw", {})
                 merged_raw = {**old_raw, **new_raw}  # 新值覆盖同名顶层键
+                if job.job_description.strip() and job.detail_fetched_at and not preview:
+                    merged_raw.pop("detail_error", None)
+                    merged_raw.pop("detail_preview", None)
                 payload["raw"] = merged_raw
             status = "updated"
         else:
@@ -511,10 +485,27 @@ class JobStore:
             f"THEN jobs.{name} ELSE excluded.{name} END"
             for name in self.KEEP_IF_FALSY_COLUMNS
         ]
-        # JD 保留更长的那份：第二轮若只抓列表，不该把已有 JD 清空。
+        if job.detail_fetched_at and job.raw.get("detail"):
+            for name in self.KEEP_IF_FALSY_COLUMNS:
+                updates = [sql for sql in updates if not sql.startswith(name + "=")]
+                updates.append(f"{name}=excluded.{name}")
+        # 正文与正文时间一起更新，旧详情导入不能让时间倒退。
+        updates = [sql for sql in updates if not sql.startswith("detail_fetched_at=")]
         updates.append(
-            "job_description=CASE WHEN length(excluded.job_description) > "
-            "length(jobs.job_description) THEN excluded.job_description "
+            "detail_fetched_at=CASE WHEN trim(excluded.job_description) <> '' AND excluded.detail_fetched_at <> '' "
+            "AND (jobs.detail_fetched_at = '' OR julianday(excluded.detail_fetched_at) >= julianday(jobs.detail_fetched_at)) "
+            "THEN excluded.detail_fetched_at ELSE jobs.detail_fetched_at END"
+        )
+        # 正文按成功获取的时间更新；新版正文缩短也必须保存。
+        # 纯列表记录保留正文。没有正文时间的旧导入才沿用长度兜底。
+        updates.append(
+            "job_description=CASE WHEN trim(excluded.job_description) <> '' AND ("
+            "trim(jobs.job_description) = '' OR "
+            "(excluded.detail_fetched_at <> '' AND (jobs.detail_fetched_at = '' OR "
+            "julianday(excluded.detail_fetched_at) >= julianday(jobs.detail_fetched_at))) OR "
+            "(excluded.detail_fetched_at = '' AND "
+            "length(excluded.job_description) > length(jobs.job_description))) "
+            "THEN excluded.job_description "
             "ELSE jobs.job_description END"
         )
         updates += [
@@ -526,10 +517,13 @@ class JobStore:
             # 只有详情路径能写的键），所以这里可以安全覆盖。
             "raw_json=excluded.raw_json",
             # first_seen_at 刻意不在更新列表里，保证首次发现时间永不丢失。
-            "last_seen_at=excluded.last_seen_at",
-            "seen_count=jobs.seen_count + 1",
             "updated_at=CURRENT_TIMESTAMP",
         ]
+        if observed:
+            updates += ["last_seen_at=excluded.last_seen_at", "seen_count=jobs.seen_count + 1"]
+        else:
+            # 补详情不是再次出现在搜索列表，保持列表观察时间及次数。
+            updates.remove("collected_at=excluded.collected_at")
 
         self.conn.execute(
             f"INSERT INTO jobs ({columns}) VALUES ({placeholders}) "
@@ -567,12 +561,11 @@ class JobStore:
         """记一次业务请求尝试，返回行 id（便于事后回填 outcome）。
 
         `day` 用**本地日历日**而不是 UTC：封禁的自动解锁时间是按平台所在时区
-        （北京时间）给的，用 UTC 会让"今天"在早上 8 点前错位到前一天，
-        把昨天的额度算进今天。
+        （北京时间）给的，用 UTC 会让"今天"在早上 8 点前错位到前一天。
 
-        ⚠️ 这个方法**不参与日线执行**（它是"先记账再发请求"，读与写不在同一事务里，
-        并发下会双花）。严格的日线执行点是 `reserve_request()`；本方法留着是给
-        刷新链路按摊薄系数批量记账、以及测试直接构造账本用的。
+        这是**观测**，不是配额：不做任何额度判断，也不会拒绝任何请求。
+        节奏由 `request_delay_seconds` / `burst_*` 控制，出事的停止由
+        `AccessGate` 持久熔断负责，两者都与这张表无关。
         """
         now = datetime.now().astimezone()
         cur = self.conn.execute(
@@ -591,63 +584,24 @@ class JobStore:
         self.conn.commit()
         return int(cur.lastrowid or 0)
 
-    def reserve_request(self, kind: str, daily_cap: int | None,
-                        script: str = "", note: str = "") -> int:
-        """严格日线：同一事务里统计 + 预留一行，返回行 id。**发请求之前必须调用**。
-
-        与 `log_request` 的区别就是这个方法**会在超额时抛 BudgetExceeded**，
-        所以它是唯一能保证"跨进程不超额"的入口（`BEGIN IMMEDIATE` 见模块级实现）。
-        调用方的动作是：拿到 BudgetExceeded → 停止，不降速、不重试、不换 kind 绕过。
-        """
-        if self.conn.in_transaction:
-            # 调用方留了未提交的事务；BEGIN IMMEDIATE 会直接报 "cannot start a
-            # transaction within a transaction"。账本行是"请求已经花掉"的记录，
-            # 先落盘比冒着手工事务边界出错更安全。
-            self.conn.commit()
-        return reserve_request_on(self.conn, kind, daily_cap, script=script, note=note)
-
     def mark_outcome(self, rowid: int | None, outcome: str,
                      code: int | None = None) -> bool:
-        """回填预留行的最终结果（只改自己那一行，见模块级 `mark_outcome_on`）。"""
+        """回填请求行的最终结果（只改自己那一行，见模块级 `mark_outcome_on`）。"""
         return mark_outcome_on(self.conn, rowid, outcome, code)
-
-    #: 采集链路的 kind（带账号 cookie、走本机家宽、打 /wapi JSON 接口）。
-    #: `total` 只累计这些——它是 `max_requests_per_day` 的执行口径。
-    COLLECT_KINDS = frozenset({"list", "detail", "security_check", "recommend"})
-
-    #: 抓 1 条详情的账面请求开销，**用于把日线余量换算成"还能抓多少条"**。
-    #: 全库实测 `(detail + security_check) / detail` = 1.19
-    #: （code=37 每约 5.3 条一次，每次重算记 1 次）。
-    #:
-    #: ⚠️ 这是**账面**口径，不是真实上网次数：每次 stoken 重算真实发约 37 次请求，
-    #: 而账本按设计只记 1 行。闸门按账面设，真实压力另行标定 ——
-    #: 所以别拿这个数估"打了平台多少次"。
-    #:
-    #: ⚠️ 把 list 请求也摊进来是 1.38，但闸门不该用那个：list 与 detail
-    #: 对账号的压力不等价，且 list 一次能得约 11 条岗位。
-    REQ_PER_DETAIL = 1.2
 
     def request_counts(self, day: str | None = None) -> dict[str, int]:
         """某天各类请求数（默认今天本地日）。返回 {'list': n, ..., 'total': n}。
 
-        `total` **只累计采集链路**（`COLLECT_KINDS`），不含状态刷新链路的
-        `detail_page`。两条链路是不同账号（带 cookie vs 免登录）、不同出口
-        （家宽 vs 波尔机房 IP），风控是按「IP + 账号信任度」判的，各自独立记账——
-        把免登录跳板的请求算进采集账号的日线，会让采集侧凭空少掉额度：
-        刷 100 条状态（1400 次 detail_page）就能把日线 1000 直接顶满，
-        而那 1400 次请求从未经过采集账号或家宽 IP。
-
-        刷新链路自己按 `--daily-cap` 卡 `detail_page` 的量（见
-        `scripts/refresh_status_loop.py`），不共用这条线。
+        纯统计口径：`total` 是当天所有 kind 的和。它不驱动任何拦截 ——
+        采集链路（带账号 cookie）与刷新链路（免登录、不同出口）都记在这里，
+        因为这张表现在只回答"今天各链路各做了多少次"。
         """
         day = day or datetime.now().astimezone().strftime("%Y-%m-%d")
         rows = self.conn.execute(
             "SELECT kind, COUNT(*) FROM request_log WHERE day = ? GROUP BY kind", (day,)
         ).fetchall()
         counts = {str(k): int(n) for k, n in rows}
-        counts["total"] = sum(
-            n for kind, n in counts.items() if kind in self.COLLECT_KINDS
-        )
+        counts["total"] = sum(counts.values())
         return counts
 
     # ---- 关键词翻页进度 ----
@@ -674,6 +628,26 @@ class JobStore:
         )
         self.conn.commit()
 
+    def touch_keyword_progress(self, city: str, keyword: str) -> None:
+        """只把「最后一次采过」的时间往前推，**不动**翻页进度。
+
+        `last_page` / `exhausted` / `last_new` 是深层续翻用的，属于另一件事；
+        轮转只需要知道「这个词多久没碰过了」，所以单独一个方法，避免互相覆盖。
+        """
+        self.conn.execute(
+            "INSERT INTO keyword_progress(city, keyword, last_page, exhausted, "
+            "  last_new, updated_at) VALUES (?, ?, 0, 0, 0, ?) "
+            "ON CONFLICT(city, keyword) DO UPDATE SET updated_at = excluded.updated_at",
+            (city, keyword,
+             datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        self.conn.commit()
+
+    def keyword_recency(self) -> dict[str, str]:
+        """`{关键词: 最后一次采过的时间}`，跨城市取最晚的那次。"""
+        return {row[0]: row[1] or "" for row in self.conn.execute(
+            "SELECT keyword, MAX(updated_at) FROM keyword_progress GROUP BY keyword")}
+
     def record_chat_action(self, canonical_id: str, action: str, status: str, message: str = "") -> None:
         self.conn.execute(
             "INSERT INTO chat_actions(canonical_id, action, status, message) VALUES (?, ?, ?, ?)",
@@ -681,17 +655,16 @@ class JobStore:
         )
         self.conn.commit()
 
-    def detailed_ids(self) -> set[str]:
-        """已抓到 JD 的 canonical_id 集合，供采集器在调详情接口前跳过。
-
-        详情接口是整条链路里最贵的资源（约 4-5 条/cookie 窗口，封禁红线 150-200 条），
-        原先列表页每见到一个画像内岗位就无条件抓详情，同一岗位在多个关键词的搜索
-        结果里重复出现时会被反复抓取 —— 库里 13 个关键词交叉覆盖，重复率很高。
-        """
+    def detailed_ids(self, after_hours: float | None = None) -> set[str]:
+        """已有正文的岗位；指定时效时只跳过仍在有效期内的正文。"""
+        where = "trim(job_description) <> ''"
+        params = ()
+        if after_hours is not None:
+            where += " AND julianday(detail_fetched_at) BETWEEN julianday('now') - ? / 24.0 AND julianday('now')"
+            params = (after_hours,)
         return {
             r[0] for r in self.conn.execute(
-                "SELECT canonical_id FROM jobs WHERE job_description IS NOT NULL "
-                "AND job_description != ''"
+                f"SELECT canonical_id FROM jobs WHERE {where}", params
             )
         }
 

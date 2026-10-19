@@ -7,11 +7,12 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-KINDS = {"collect": "采集岗位", "details": "补全详情", "refresh": "刷新状态", "tag": "LLM 打标"}
+KINDS = {"collect": "采集岗位", "recommend": "推荐岗位", "details": "补全详情", "refresh": "刷新状态", "tag": "LLM 打标"}
 ACTIVE = ("queued", "running", "waiting_verification", "stopping")
 TERMINAL = ("succeeded", "failed", "cancelled", "interrupted")
 
@@ -24,6 +25,10 @@ class TaskOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     limit: int = Field(default=100, ge=1, le=100000)
     dry_run: bool = False
+    round_id: str = Field(default="", pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+    canonical_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(default_factory=list, max_length=1000)
+    recommend_pages: int = Field(default=2, ge=1, le=6)
+    expectation_label: str = Field(default="", max_length=100)
 
 
 def now() -> str:
@@ -118,11 +123,31 @@ class TaskStore:
         return self.get(ident)
 
     def finish(self, ident: str, status: str, *, error: str = "", result: dict | None = None):
+        """把「状态变终态」和「终态事件」写进**同一个事务**。
+
+        这两件事以前是两次独立提交，中间存在一个窗口：任务已经能被读成 succeeded，
+        但「任务完成」这条事件还没落库。轮询方（网页、外部脚本、测试）的典型写法是
+        「等到终态 → 读事件」，正好卡在窗口里就会看到事件流在终态前一条断掉；
+        按游标分页的调用方还会在稍后多读出一条，看起来像分页错乱。
+        全量测试并发跑的时候这个窗口被放大，能被稳定命中。
+        """
         if status not in TERMINAL:
             raise ValueError("终态无效")
-        self.update(ident, status=status, finished_at=now(), error=error, result=result or {}, verification=None)
-        self.event(ident, "state", {"succeeded": "任务完成", "failed": "任务失败", "cancelled": "任务已停止", "interrupted": "任务已中断"}[status],
-                   level="error" if status == "failed" else "info")
+        label = {"succeeded": "任务完成", "failed": "任务失败",
+                 "cancelled": "任务已停止", "interrupted": "任务已中断"}[status]
+        level = "error" if status == "failed" else "info"
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE tasks SET status=?,finished_at=?,error=?,result=?,verification=NULL "
+                "WHERE id=? AND status NOT IN ('succeeded','failed','cancelled','interrupted')",
+                (status, now(), error, json.dumps(result or {}, ensure_ascii=False), ident),
+            )
+            db.execute(
+                "INSERT INTO task_events(task_id,created_at,type,level,message,data) VALUES (?,?,?,?,?,?)",
+                (ident, now(), "state", level, label[:4000], "{}"),
+            )
+        return self.get(ident)
 
     def command(self, ident: str, command: str):
         column = {"stop": "stop_requested", "resume": "resume_requested", "show": "show_requested"}.get(command)

@@ -57,7 +57,6 @@ export const app = {
   saving: false,
   /** 本页有未保存修改时，远端修订发生了变化 */
   staleRemote: false,
-  budgetModeSupported: false,
   /** 用户勾选要清空的密钥路径 */
   clearSecrets: new Set(),
   saveProblems: [],
@@ -70,7 +69,7 @@ export const app = {
   overviewLoading: false,
   view: 'stats',
   jobs: {
-    q: '', city: '', tier: '', page: 1, page_size: 30,
+    q: '', city: '', tier: '', hiring: '', page: 1, page_size: 30,
     data: null, loading: false, error: null,
     cursor: -1, selectedId: null, detail: null,
     detailLoading: false, detailError: null,
@@ -96,6 +95,7 @@ export function normalizeState(raw) {
     config: data.config && typeof data.config === 'object' ? data.config : {},
     revision: data.revision === undefined ? null : data.revision,
     csrf_token: str(data.csrf_token),
+    refresh_safety: data.refresh_safety && typeof data.refresh_safety === 'object' ? data.refresh_safety : null,
     safety: {
       mode: str(safety.mode),
       reason: str(safety.reason),
@@ -232,7 +232,8 @@ export const EFFECT_LABELS = {
   browser: '浏览器与连接',
   refresh: '刷新与出口',
   keywords: '搜索词',
-  cities: '城市',
+    cities: '城市',
+    list_source: '列表采集方式',
   filters: '筛选组合',
   candidate: '候选人画像',
   database_path: '数据库路径',
@@ -240,7 +241,7 @@ export const EFFECT_LABELS = {
 
 export const EFFECT_ORDER = [
   'network_enabled', 'browser', 'refresh', 'llm', 'service.batch_size',
-  'request_delay_seconds', 'detail_delay_seconds', 'cities', 'keywords', 'filters',
+    'request_delay_seconds', 'detail_delay_seconds', 'cities', 'keywords', 'filters', 'list_source',
   'candidate', 'database_path',
 ];
 
@@ -415,14 +416,6 @@ export function validateConfig() {
   const refresh = config.refresh && typeof config.refresh === 'object' ? config.refresh : null;
   if (refresh && str(refresh.route) === 'proxy' && !str(refresh.proxy_server).trim()) {
     problems.push({ message: '刷新出口：选择代理路线时必须填写代理地址。', focus: 'cfg-refresh-proxy' });
-  }
-  const service = config.service && typeof config.service === 'object' ? config.service : null;
-  if (service) {
-    const budget = num(config.max_requests_per_run);
-    const daily = num(config.max_requests_per_day);
-    if (budget !== null && daily !== null && budget > daily) {
-      warnings.push('单轮请求参考线高于单日参考线：实际会在单日线处被截断。');
-    }
   }
 
   return { problems, warnings };

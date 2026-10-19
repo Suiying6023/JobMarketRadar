@@ -70,6 +70,12 @@ export function normalizeTask(raw) {
       processed: num(progress.processed) ?? 0,
       total: num(progress.total),
       failed: num(progress.failed) ?? 0,
+      round_id: str(progress.round_id),
+      round_jobs: num(progress.round_jobs),
+      queries_done: num(progress.queries_done),
+      queries_total: num(progress.queries_total),
+      duplicates: num(progress.duplicates),
+      requests: num(progress.requests),
       pending_configuration: progress.pending_configuration && typeof progress.pending_configuration === 'object'
         ? {fields: Array.isArray(progress.pending_configuration.fields) ? progress.pending_configuration.fields.map(String) : []} : null,
     },
@@ -254,6 +260,11 @@ function taskMetaRows(task) {
     ['配置修订（生效）', task.applied_revision.startsWith('partial:') ? '部分应用 · '+task.applied_revision.slice(8,16) : task.applied_revision ? task.applied_revision.slice(0, 8) : '—'],
     ['等待新任务的配置', task.progress.pending_configuration?.fields.join('、') || '—'],
     ['数量上限', task.options.limit === null ? '—' : fmtInt(task.options.limit)],
+    ['采集批次', task.progress.round_id || task.options.extra.round_id || '—'],
+    ['批次岗位数', task.progress.round_jobs === null ? '—' : fmtInt(task.progress.round_jobs)],
+    ['完成查询', task.progress.queries_total === null ? '—' : `${task.progress.queries_done || 0} / ${task.progress.queries_total}`],
+    ['重复列表命中', task.progress.duplicates === null ? '—' : fmtInt(task.progress.duplicates)],
+    ['业务请求数', task.progress.requests === null ? '—' : fmtInt(task.progress.requests)],
     ['其它选项', Object.keys(task.options.extra).length ? valueText(task.options.extra) : '—'],
     ['失败数', fmtInt(task.progress.failed)],
   ];
@@ -513,6 +524,7 @@ export async function startTask(button) {
   const kindSelect = document.getElementById('task-kind');
   const limitInput = document.getElementById('task-limit');
   const dryRunBox = document.getElementById('task-dry-run');
+  const roundId = document.getElementById('task-round-id')?.value.trim() || '';
   const message = document.getElementById('task-start-msg');
   if (!kindSelect || !limitInput || !dryRunBox) return;
 
@@ -537,7 +549,7 @@ export async function startTask(button) {
   setPending(button, true, '启动中…');
   if (message) { message.className = 'hint'; setText(message, ''); }
   try {
-    const task = normalizeTask(await API.createTask({ kind: kindSelect.value, options: { limit, dry_run: dryRun } }));
+    const task = normalizeTask(await API.createTask({ kind: kindSelect.value, options: { limit, dry_run: dryRun, round_id: roundId } }));
     if (message) {
       message.className = 'hint';
       setText(message, `已创建任务 ${task.id}（${kindLabel(task.kind)}${dryRun ? '，计划预览' : ''}）。`);
@@ -668,6 +680,14 @@ export function renderAccessPanel() {
     ['策略文件', safety.corrupt ? '内容损坏，已按关闭处理' : ''],
   ]);
   if (more) host.appendChild(more);
+  const refresh = stateInfo.refresh_safety;
+  if (refresh) {
+    host.appendChild(h('div', {class: 'callout callout-info'},
+      h('p', {text: `独立刷新状态：${safetyLabel(refresh.mode)}${refresh.reason ? ' · '+sanitizeTechnical(refresh.reason) : ''}`}),
+      h('p', {class:'hint',text:'刷新暂停单独保留；全局暂停仍会停止所有平台任务。'}),
+      refresh.mode !== 'ready' ? h('button', {class:'btn btn-sm',type:'button',text:'人工恢复刷新访问',
+        onclick:() => { void releaseAccess('refresh'); }}) : null));
+  }
 }
 
 export async function pauseAccess() {
@@ -692,12 +712,12 @@ export async function pauseAccess() {
   }
 }
 
-export async function releaseAccess() {
-  const safety = app.state ? app.state.safety : null;
+export async function releaseAccess(scope = '') {
+  const safety = app.state ? (scope === 'refresh' ? app.state.refresh_safety : app.state.safety) : null;
   const blocked = releaseBlocked(safety);
   if (blocked) { toast(blocked, 'error'); return; }
   const result = await openDialog({
-    title: '人工恢复访问',
+    title: scope === 'refresh' ? '人工恢复刷新访问' : '人工恢复访问',
     note: '恢复后联网任务可以再次执行。请在你确认平台侧限制解除后再操作。',
     confirmLabel: '确认恢复',
     requireText: '请填写恢复依据（用于记录依据什么判断可以恢复）。',
@@ -708,7 +728,7 @@ export async function releaseAccess() {
   if (!result.ok) return;
   try {
     // confirmation 会随请求发给后端并写入策略文件，作为「依据什么判断可以恢复」的痕迹。
-    await API.access({ action: 'release', confirmed: true, confirmation: result.text });
+    await API.access({ action: 'release', scope, confirmed: true, confirmation: result.text });
     await loadState({ preserveDraft: true });
     renderAccessPanel();
     toast('访问已恢复。', 'ok');

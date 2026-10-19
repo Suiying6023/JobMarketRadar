@@ -30,7 +30,6 @@ request_delay_seconds:
 detail_delay_seconds:
 - 4
 - 6
-max_requests_per_run: 250
 detail_batch: 5
 detail_cooldown_seconds:
 - 90
@@ -84,6 +83,5 @@ auto_chat:
   dry_run: true
   require_manual_confirm: true
 network_enabled: false
-budget_mode: reference
 max_page_number: 10
 max_keywords_per_run: 3

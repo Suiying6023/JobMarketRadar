@@ -35,6 +35,5 @@ auto_chat:
   enabled: false
   dry_run: true
 network_enabled: false
-budget_mode: reference
 max_page_number: 10
 max_keywords_per_run: 3

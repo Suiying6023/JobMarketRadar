@@ -83,7 +83,6 @@ auto_chat:
   min_delay_seconds: 8
   max_delay_seconds: 15
 network_enabled: false
-budget_mode: reference
 max_page_number: 10
 max_keywords_per_run: 3
 service:

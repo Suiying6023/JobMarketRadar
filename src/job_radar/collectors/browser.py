@@ -2,11 +2,37 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from patchright.async_api import async_playwright
+from patchright.async_api import Error as BrowserError, async_playwright
 
 from ..local_files import file_mutex
 from ..models import BrowserConfig, BrowserMode
-from ..refresh_fetch import launch_args
+
+# 窗口默认落点 `x,y`：主屏之外，跑批时不抢焦点。
+DEFAULT_WINDOW_POSITION = "2400,1400"
+
+
+def launch_args(window_position: str = DEFAULT_WINDOW_POSITION) -> list[str]:
+    """浏览器启动参数。两条链路共用，别在调用处另拼一份。
+
+    `--disable-blink-features=AutomationControlled` 是反检测必需项，
+    同时也是 `cleanup_browsers.py` 认「这个浏览器是我们起的」的特征之一。
+
+    ⚠️ **`window_position` 的坐标必须为正**。挑战 JS 把窗口几何当环境指纹：
+    负的大数被判为异常环境，请求会被推去登录页（`/web/user/?seed=...`）而
+    **不给可自解的挑战、也不给可点的验证页**——那种窗口人是点不动的。
+    实测 `-32000,-32000` 得 0/4，正坐标 `2400,1400` 挑战率 7%（n=14），
+    优于在屏的 14-16%（这两个数是窗口探针口径，只用于组间比较）。
+    最小化同样不行（Windows 把坐标写成 -21333）。
+    传空字符串 = 不指定位置，窗口开在屏幕中央会抢焦点。
+    """
+    args = ["--disable-blink-features=AutomationControlled"]
+    if window_position:
+        if window_position.startswith("-") or ",-" in window_position:
+            raise ValueError(
+                f"窗口坐标必须为正，收到 {window_position!r}。"
+                "负坐标会让挑战 JS 判为异常环境，请求被推去登录页（实测 0/4）。")
+        args.append(f"--window-position={window_position}")
+    return args
 
 
 class BrowserSession:
@@ -92,7 +118,12 @@ class BrowserSession:
     async def close(self):
         try:
             if self.owns_context and self.context:
-                await self.context.close()
+                try:
+                    await self.context.close()
+                except BrowserError as exc:
+                    # Closing the user login window already closes its persistent context.
+                    if "Target page, context or browser has been closed" not in str(exc):
+                        raise
         finally:
             try:
                 if self.playwright:

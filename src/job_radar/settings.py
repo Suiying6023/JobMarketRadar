@@ -17,10 +17,10 @@ from .service_config import SECRET_PATHS, public_config
 APPLY_POLICY = {
     "llm": "下一批次", "service.batch_size": "下一批次", "request_delay_seconds": "下一批次",
     "detail_delay_seconds": "下一批次", "network_enabled": "下一次请求前检查",
-    "browser": "新任务", "refresh": "新任务", "keywords": "新任务", "cities": "新任务",
+    "browser": "新任务", "refresh": "新任务", "keywords": "新任务", "cities": "新任务", "list_source": "新任务及新采集批次",
     "filters": "新任务", "candidate": "保存后更新岗位复核；采集选行在新任务生效",
     "service.candidate_filtering": "新任务", "service.event_retention": "新任务",
-    "budget_mode": "下一批次", "max_requests_per_run": "下一批次", "max_requests_per_day": "下一批次",
+    "service.detail_after_hours": "新任务",
     "database_path": "服务重启",
 }
 
@@ -40,7 +40,6 @@ def init_config(path: str | Path, database: str = "data/jobs.sqlite3") -> Path:
         raise FileExistsError("配置已存在，不覆盖现有文件")
     cfg = CollectionConfig(cities=[{"name": "全国"}], keywords=["AI Agent", "大模型应用开发", "Python"],
                            database_path=database, pages_per_query=1, detail_limit_per_query=5,
-                           max_requests_per_run=30, max_requests_per_day=100,
                            candidate=CandidateProfile(roles=["Agent", "智能体", "LLM", "大模型", "RAG"],
                                                       skills=["Python", "SQL", "FastAPI"]))
     with file_mutex(target.with_name(target.name + ".lock")):

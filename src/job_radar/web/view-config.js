@@ -291,11 +291,20 @@ function secretField(config, id, label, path, hint) {
 function planSection(config) {
   return group('采集计划', '控制每轮采多少、翻多深。',
     grid(
+      configHas('list_source') ? selectField({
+        id: 'cfg-list-source', label: '列表采集方式',
+        get: () => config.list_source,
+        set: (value) => { config.list_source = value; },
+        options: [{ value: 'native', label: '随网页搜索和翻页读取' }, { value: 'api', label: '直接读取列表接口' }],
+        hint: '网页方式每页数量由网站决定，同时补详情时读取卡片响应。更换方式请使用新的批次编号。',
+        onChange: markDirty,
+      }).node : null,
       numField(config, 'cfg-pages-per-query', '默认每词翻页深度', ['pages_per_query'], { min: 1, max: 10, integer: true, fallback: 3 }),
       numField(config, 'cfg-max-page-number', '单关键词最大页数', ['max_page_number'], { min: 1, max: 30, integer: true, fallback: 10 }),
       numField(config, 'cfg-max-keywords', '单轮关键词数', ['max_keywords_per_run'], { min: 1, max: 50, integer: true, fallback: 3 }),
       numField(config, 'cfg-detail-limit', '每词详情补全上限', ['detail_limit_per_query'], { min: 0, max: 200, integer: true, fallback: 30 }),
-      numField(config, 'cfg-page-size', '每页请求条数', ['page_size'], { min: 10, max: 50, integer: true, fallback: 30 }),
+      numField(config, 'cfg-detail-after', '正文更新间隔（小时，0 表示每轮更新）', ['service', 'detail_after_hours'], { min: 0, max: 87600, fallback: 168 }),
+      numField(config, 'cfg-page-size', '直接读取接口时每页条数', ['page_size'], { min: 10, max: 50, integer: true, fallback: 30 }),
       checkField({
         id: 'cfg-collect-details', label: '采集时同时补全详情',
         checked: config.collect_details === true,
@@ -306,36 +315,8 @@ function planSection(config) {
 }
 
 function budgetSection(config) {
-  const modes = [
-    { value: 'reference', label: '仅作参考，到线提示' },
-    { value: 'enforce', label: '强制限制，到线停止' },
-  ];
-  const overQuota = [
-    { value: 'stop', label: '到线停止本轮' },
-    { value: 'slow', label: '到线降速继续' },
-  ];
-  return group('请求预算与间隔', '本机自设的参考线。',
+  return group('请求节奏', '拟人化的间隔与冷却。没有日线拦截——出事由访问策略的持久熔断停下来。',
     grid(
-      configHas('budget_mode')
-        ? selectField({
-          id: 'cfg-budget-mode', label: '参考线处理方式', options: modes,
-          get: () => str(config.budget_mode) || 'reference',
-          set: (value) => { config.budget_mode = value; },
-          onChange: markDirty,
-        }).node
-        : h('div', { class: 'field' },
-          h('span', { class: 'field-label', text: '参考线处理方式' }),
-          h('p', { class: 'hint', text: '运行中的服务尚未提供该字段，保存时保留原值。' })),
-      numField(config, 'cfg-max-run', '单轮请求参考线', ['max_requests_per_run'], { min: 1, max: 5000, integer: true, fallback: 500 }),
-      numField(config, 'cfg-max-day', '单日请求参考线', ['max_requests_per_day'], { min: 1, max: 6000, integer: true, fallback: 600 }),
-      configHas('over_quota_action')
-        ? selectField({
-          id: 'cfg-over-quota', label: '越过单日线后', options: overQuota,
-          get: () => str(config.over_quota_action) || 'stop',
-          set: (value) => { config.over_quota_action = value; },
-          onChange: markDirty,
-        }).node
-        : null,
       configHas('detail_batch')
         ? numField(config, 'cfg-detail-batch', '详情批大小', ['detail_batch'], { min: 1, max: 50, integer: true, fallback: 5 })
         : null,
@@ -496,6 +477,13 @@ function llmSection(config) {
         hint: '本机密钥为空时读取这个环境变量。',
       }).node,
       numField(llm, 'cfg-llm-timeout', '请求超时（秒）', ['timeout_seconds'], { min: 1, max: 600, step: 1, fallback: 60 }),
+      numField(llm, 'cfg-llm-concurrency', '同时抽取数量', ['concurrency'], { min: 1, max: 64, integer: true, fallback: 1 }),
+      ('reasoning_effort' in llm) ? selectField({
+        id: 'cfg-llm-effort', label: '推理强度（由接口支持情况决定）',
+        options: ['auto', 'none', 'minimal', 'low', 'medium', 'high'].map(value => ({value, label: value})),
+        get: () => llm.reasoning_effort || 'auto',
+        set: value => { llm.reasoning_effort = value; }, onChange: markDirty,
+      }).node : null,
       numField(llm, 'cfg-llm-max-tokens', '最大输出 tokens', ['max_tokens'], { min: 64, max: 32768, integer: true, fallback: 2048 }),
       numField(llm, 'cfg-llm-max-input', '最大输入字符数', ['max_input_chars'], { min: 1000, max: 100000, integer: true, fallback: 20000 })),
     secretField(config, 'cfg-llm-api-key', 'API key（本机保存）', 'llm.api_key',
@@ -681,7 +669,6 @@ export function renderConfig() {
   if (!configHas('service')) missing.push('service');
   if (!configHas('refresh')) missing.push('refresh');
   if (!configHas('llm')) missing.push('llm');
-  if (!configHas('budget_mode')) missing.push('budget_mode');
   if (missing.length) {
     root.appendChild(h('p', {
       class: 'callout callout-info', role: 'note',

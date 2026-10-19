@@ -553,6 +553,8 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 .job-badges { grid-area: labels; display: flex; gap: 6px; flex-wrap: wrap; align-content: start; min-width: 0; }
 .job-meta { font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
 .job-snapshot { font-size: 12.5px; color: var(--ink-3); }
+/* 「挂了多久 / HR 多久没动」：比快照时间更贴近「这个岗位还在不在招」 */
+.job-hiring { font-size: 12.5px; color: var(--ink-2); }
 .job-actions { grid-area: actions; display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 .job-actions .btn { width: 100%; justify-content: center; }
 

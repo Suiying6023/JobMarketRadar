@@ -24,7 +24,114 @@ READ_COLUMNS = (
     "financing_stage", "industry", "job_url", "job_description", "skills_json", "matched_queries_json",
     "glm_tags_json", "glm_tags_updated_at", "job_invalid", "job_status_desc", "is_proxy_job",
     "retention_status", "bookmarked", "detail_fetched_at", "first_seen_at", "last_seen_at", "updated_at",
+    # 在招判断用的三组信号：平台状态（job_status_desc/job_invalid）、HR 活跃度
+    # （recruiter_active_status / _days / online）、被观测次数（seen_count）。
+    "recruiter_active_status", "recruiter_active_days", "recruiter_online", "seen_count",
 )
+
+# ---------------------------------------------------------------- 在招判断
+#
+# 列表里出现 ≠ 在招：死岗位也挂在列表上。实测（11,812 条）能用的信号有三组，
+# 优先级从硬到软：
+#   1. `job_status_desc` 平台直接给「招聘中 / 最新 / 职位已关闭」+ `job_invalid` 失效位
+#   2. `recruiter_active_days` / `recruiter_active_status` HR 活跃度
+#      （在线 27.0% / 刚刚活跃 19.1% / 今日活跃 9.6% / 3日内活跃 9.7% / 半年前活跃 3.9%）
+#   3. `first_seen_at` 岗位存在时长（同日 53.5% / 8-30 天 19.8% / 31 天以上 7.9%）
+#
+# 判定**只在这里做一次**，前端只负责显示，避免两处口径漂移。
+
+HIRING_LEVELS = ("open", "warm", "cold", "stale", "closed", "unknown")
+
+HIRING_LABELS = {
+    "open": "在招 · HR 近期活跃",
+    "warm": "近期活跃",
+    "cold": "一月内动过",
+    "stale": "HR 长期未动",
+    "closed": "平台标已关闭",
+    "unknown": "在招状态未知",
+}
+
+# 排序权重：越靠前越值得投。closed 沉底，unknown 排在 stale 之前（没证据不等于坏消息）。
+_HIRING_RANK = {"open": 0, "warm": 1, "unknown": 2, "cold": 3, "stale": 4, "closed": 5}
+
+_HR_OPEN = ("在线", "刚刚活跃", "今日活跃", "3日内活跃")
+_HR_WARM = ("本周活跃", "2周内活跃", "本月活跃")
+_HR_STALE = ("2月内活跃", "3月内活跃", "4月内活跃", "5月内活跃", "近半年活跃", "半年前活跃")
+
+
+def _level_from_days(value) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return None
+    if days <= 1:
+        return "open"
+    if days <= 7:
+        return "warm"
+    if days <= 30:
+        return "cold"
+    return "stale"
+
+
+def _level_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    if any(key in text for key in _HR_OPEN):
+        return "open"
+    if any(key in text for key in _HR_WARM):
+        return "warm"
+    if any(key in text for key in _HR_STALE):
+        return "stale"
+    return None
+
+
+def hiring_of(row: dict, now: datetime | None = None) -> dict:
+    """把三组信号折成五档 + 展示用的原始证据。纯函数，可脱库测试。
+
+    `recruiter_active_days` 是从 `recruiter_active_status` 解析出来的，两者可能
+    不同步（列表轮次和详情轮次各写各的）。所以**取两者中更活跃的那个**，而不是
+    先到先得——实测有「HR 在线」但 days 还停在 3 天前的行，按先到先得会被误判成 warm。
+    """
+    status = (row.get("job_status_desc") or "").strip()
+    hr_text = (row.get("recruiter_active_status") or "").strip()
+
+    if bool(row.get("job_invalid")) or "关闭" in status or "下线" in status:
+        level = "closed"
+    else:
+        candidates = [lv for lv in (_level_from_days(row.get("recruiter_active_days")),
+                                    _level_from_text(hr_text)) if lv]
+        if row.get("recruiter_online") or "在线" in hr_text:
+            candidates.append("open")
+        if candidates:
+            level = min(candidates, key=lambda lv: _HIRING_RANK[lv])
+        elif status in ("招聘中", "最新"):
+            level = "open"
+        else:
+            level = "unknown"
+
+    age_days = None
+    first = parse_time(row.get("first_seen_at"))
+    if first is not None:
+        ref = now or datetime.now(timezone.utc)
+        try:
+            age_days = round((ref - first).total_seconds() / 86400, 1)
+        except TypeError:
+            age_days = None
+
+    return {
+        "level": level,
+        "label": HIRING_LABELS[level],
+        "job_state": status or ("已失效" if row.get("job_invalid") else ""),
+        "hr_text": hr_text,
+        "age_days": age_days,
+        "seen_count": int(row.get("seen_count") or 0),
+    }
+
+
+def hiring_rank(item: dict) -> int:
+    return _HIRING_RANK.get((item.get("hiring") or {}).get("level"), 2)
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
@@ -126,6 +233,7 @@ class MarketSnapshot:
             "decision": decision, "skills": parse_json(row.get("skills_json"), []),
             "bookmarked": bool(row.get("bookmarked")), "applied": False, "note": "",
             "duplicate_count": self._duplicates[_duplicate_key(row)],
+            "hiring": hiring_of(row, self.now),
         }
         result.update(self.legacy_actions.get(row["canonical_id"], {}))
         if details:
@@ -134,17 +242,29 @@ class MarketSnapshot:
                           legacy_retention=row.get("retention_status") or "", first_seen_at=row.get("first_seen_at") or "")
         return result
 
-    def select(self, profile: CandidateProfile, q: str = "", city: str = "", tier: str = "") -> list[tuple[dict, dict]]:
+    def select(self, profile: CandidateProfile, q: str = "", city: str = "", tier: str = "",
+               hiring: str = "") -> list[tuple[dict, dict]]:
         q = q.strip().casefold()
+        hiring = (hiring or "").strip()
         selected = []
         for row, decision in self.ranked(profile):
             if city and row.get("city") != city:
                 continue
             if tier and decision["bucket"] != tier:
                 continue
+            if hiring and hiring_of(row, self.now)["level"] != hiring:
+                continue
             if q and q not in " ".join(str(row.get(k) or "") for k in ("title", "company_name", "city", "job_description")).casefold():
                 continue
             selected.append((row, decision))
+        # 排序：先按画像分桶（适配度），桶内**在招的排前面**——同一桶里一条「HR 在线」
+        # 和一条「平台标已关闭」对求职者的价值完全不同，原来的纯分数排序看不出来。
+        selected.sort(key=lambda pair: (
+            BUCKETS.index(pair[1]["bucket"]),
+            _HIRING_RANK.get(hiring_of(pair[0], self.now)["level"], 2),
+            -pair[1]["score"],
+            pair[0]["canonical_id"],
+        ))
         return selected
 
     def _groups(self, column: str) -> list[dict]:

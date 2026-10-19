@@ -25,7 +25,6 @@ export function reconcileConfig(app, next, preserveDraft = false) {
 
 export function draftPayload(app) {
   const config = clone(app.draft);
-  if (app.budgetModeSupported === false) delete config.budget_mode;
   const result = {revision: app.draftRevision, config};
   const cleared = [...(app.clearSecrets || [])];
   if (cleared.length) result.clear_secrets = cleared;

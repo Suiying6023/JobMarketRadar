@@ -33,8 +33,8 @@ def request(url, path, payload=None):
 
 
 @tasks.command("start")
-def start(kind: str, limit: int = 100, dry_run: bool = False, url: str = "http://127.0.0.1:8765"):
-    request(url, "/api/tasks", {"kind": kind, "options": {"limit": limit, "dry_run": dry_run}})
+def start(kind: str, limit: int = 100, dry_run: bool = False, round_id: str = "", url: str = "http://127.0.0.1:8765"):
+    request(url, "/api/tasks", {"kind": kind, "options": {"limit": limit, "dry_run": dry_run, "round_id": round_id}})
 
 
 @tasks.command("list")
@@ -83,12 +83,12 @@ def config_set(file: Path, url: str = "http://127.0.0.1:8765"):
     request(url, "/api/config", payload)
 
 
-def run_task(kind: str, config: str = "config.local.yaml", limit: int = 100, dry_run: bool = False):
+def run_task(kind: str, config: str = "config.local.yaml", limit: int = 100, dry_run: bool = False, round_id: str = ""):
     """直接运行一个任务，结束时输出 JSON；与网页使用同一任务核心。"""
     task = None
     try:
         with TaskManager(SettingsStore(config)) as manager:
-            task = manager.start(kind, {"limit": limit, "dry_run": dry_run})
+            task = manager.start(kind, {"limit": limit, "dry_run": dry_run, "round_id": round_id})
             try:
                 while manager.store.get(task["id"])["status"] not in TERMINAL:
                     if manager.store.get(task["id"])["status"] == "waiting_verification":

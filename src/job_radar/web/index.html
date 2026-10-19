@@ -59,7 +59,7 @@
   <section id="view-jobs" class="view" aria-labelledby="jobs-h" hidden>
     <div class="view-head">
       <h2 id="jobs-h">岗位池</h2>
-      <p class="view-sub">本机缓存的岗位记录：检索、阅读 JD 原文、写本地复核记录。</p>
+      <p class="view-sub">本机缓存的岗位记录：检索、阅读 JD 原文、写本地复核记录。在招状态由平台状态与 HR 活跃度判定，同优先级下在招的排前面。</p>
     </div>
 
     <form id="jobs-filters" class="filters" role="search" aria-label="岗位筛选">
@@ -78,6 +78,12 @@
         <label for="f-tier">复核优先级</label>
         <select id="f-tier" name="tier">
           <option value="">全部优先级</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="f-hiring">在招状态</label>
+        <select id="f-hiring" name="hiring">
+          <option value="">全部在招状态</option>
         </select>
       </div>
       <div class="field field-narrow">
@@ -159,6 +165,11 @@
             <span>计划预览</span>
           </label>
           <p class="hint">生成任务计划；取消勾选后执行实际任务。</p>
+        </div>
+        <div class="field">
+          <label for="task-round-id">采集批次（可留空）</label>
+          <input id="task-round-id" type="text" maxlength="80" placeholder="例如 20260930-ai">
+          <p class="hint">采集时留空创建新批次；填写已有批次则接着未完成的查询。补详情、刷新和打标填写批次可只处理这一轮。</p>
         </div>
       </div>
       <div class="group-actions">

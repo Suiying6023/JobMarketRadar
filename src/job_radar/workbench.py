@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from pydantic import ValidationError
 
 from .analysis.decisions import BUCKETS
-from .analysis.market import MarketSnapshot, csv_export
+from .analysis.market import HIRING_LEVELS, MarketSnapshot, csv_export
 from .candidate import CandidateProfile
 from .settings import APPLY_POLICY, RevisionConflict, SettingsStore, resolve_database
 from .service_config import public_config, secret_status
@@ -128,7 +128,9 @@ class Workbench:
         if not cfg.network_enabled and safety.get("mode") == "ready":
             safety = {**safety, "mode": "offline", "reason": "在线访问已关闭"}
         return {"config": public_config(cfg), "revision": revision, "csrf_token": self.csrf,
-                "safety": safety, "version": VERSION, "secrets": secret_status(cfg), "apply_policy": APPLY_POLICY}
+                "safety": safety, "refresh_safety": AccessGate(self.database, scope="refresh").read_state().as_dict()
+                    if AccessGate(self.database, scope="refresh").state_path.exists() else None,
+                "version": VERSION, "secrets": secret_status(cfg), "apply_policy": APPLY_POLICY}
 
     def annotate(self, items: list[dict]) -> list[dict]:
         saved = self.notes.all()
@@ -195,9 +197,11 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _filter(query: dict) -> dict:
-        fields = {key: query.get(key, [""])[0] for key in ("q", "city", "tier")}
+        fields = {key: query.get(key, [""])[0] for key in ("q", "city", "tier", "hiring")}
         if len(fields["q"]) > 200 or len(fields["city"]) > 100 or (fields["tier"] and fields["tier"] not in BUCKETS):
             raise ValueError("筛选参数无效")
+        if fields["hiring"] and fields["hiring"] not in HIRING_LEVELS:
+            raise ValueError("在招状态筛选参数无效")
         return fields
 
     def do_GET(self):
@@ -228,6 +232,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/tasks":
                 self._json(200, app.tasks.list())
+                return
+            if path == "/api/rounds":
+                from .rounds import list_rounds
+                self._json(200, {"items": list_rounds(app.database)})
                 return
             if path.startswith("/api/tasks/"):
                 parts = path.strip("/").split("/")
@@ -321,13 +329,15 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._json(404, {"error": "未找到操作"})
             elif path == "/api/access":
+                scope = payload.get("scope", "")
+                gate = AccessGate(app.database, scope=scope)
                 if payload.get("action") == "pause":
                     reason = payload.get("reason", "手动暂停")
                     if not isinstance(reason, str) or len(reason) > 500:
                         raise ValueError("暂停原因最多 500 字")
-                    AccessGate(app.database).pause(reason)
+                    gate.pause(reason)
                     for task in app.tasks.store.active():
-                        if task["kind"] != "tag" and not task["options"]["dry_run"]:
+                        if task["kind"] != "tag" and not task["options"]["dry_run"] and (not scope or task["kind"] == "refresh"):
                             app.tasks.stop(task["id"])
                 elif payload.get("action") == "release":
                     if payload.get("confirmed") is not True:
@@ -335,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                     confirmation = payload.get("confirmation", "用户通过管理页确认平台状态已恢复")
                     if not isinstance(confirmation, str) or not confirmation.strip() or len(confirmation) > 500:
                         raise ValueError("恢复依据需为 1–500 字")
-                    AccessGate(app.database).release(confirmation)
+                    gate.release(confirmation)
                 else:
                     raise ValueError("访问状态操作无效")
                 self._json(200, app.state())

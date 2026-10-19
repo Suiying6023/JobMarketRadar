@@ -18,6 +18,33 @@ const BUCKET_BADGE = {
   '暂不优先': 'badge-later',
 };
 
+/**
+ * 「是否在招」的五档。判定在服务端 `analysis/market.py::hiring_of` 里做一次，
+ * 这里只负责显示——前端不做第二套判断，避免两处口径漂移。
+ */
+const HIRING_BADGE = {
+  open: 'badge-ok',
+  warm: 'badge-run',
+  cold: 'badge-warn',
+  stale: 'badge-later',
+  closed: 'badge-bad',
+  unknown: 'badge-neutral',
+};
+
+const HIRING_FILTERS = [
+  { value: '', label: '全部在招状态' },
+  { value: 'open', label: '在招（HR 近期活跃）' },
+  { value: 'warm', label: '近期活跃' },
+  { value: 'cold', label: '一月内动过' },
+  { value: 'stale', label: '长期未动' },
+  { value: 'closed', label: '平台标已关闭' },
+  { value: 'unknown', label: '无法判断' },
+];
+
+export function hiringFilterChoices() {
+  return HIRING_FILTERS.slice();
+}
+
 let searchTimer = null;
 let jobsToken = 0;
 
@@ -64,6 +91,19 @@ export function normalizeItem(raw) {
     legacy_match_reason: str(item.legacy_match_reason),
     legacy_retention: str(item.legacy_retention),
     first_seen_at: str(item.first_seen_at),
+    /** 在招信号：服务端已判定好的五档 + 原始证据，前端只显示不重算。 */
+    hiring: (() => {
+      const raw = item.hiring && typeof item.hiring === 'object' ? item.hiring : {};
+      const level = str(raw.level) || 'unknown';
+      return {
+        level: HIRING_BADGE[level] ? level : 'unknown',
+        label: str(raw.label) || '在招状态未知',
+        hr_text: str(raw.hr_text),
+        job_state: str(raw.job_state),
+        age_days: num(raw.age_days),
+        seen_count: num(raw.seen_count),
+      };
+    })(),
   };
 }
 
@@ -80,7 +120,7 @@ function normalizeJobsPayload(raw) {
 function currentParams(extra = {}) {
   const jobs = app.jobs;
   return {
-    q: jobs.q, city: jobs.city, tier: jobs.tier,
+    q: jobs.q, city: jobs.city, tier: jobs.tier, hiring: jobs.hiring,
     page: jobs.page, page_size: jobs.page_size, ...extra,
   };
 }
@@ -149,11 +189,32 @@ export function populateJobFilters() {
     tierSelect.value = previous;
     if (tierSelect.value !== previous) { tierSelect.value = ''; app.jobs.tier = ''; }
   }
+  const hiringSelect = document.getElementById('f-hiring');
+  if (hiringSelect) {
+    const previous = app.jobs.hiring;
+    clear(hiringSelect);
+    for (const choice of HIRING_FILTERS) {
+      hiringSelect.appendChild(h('option', { value: choice.value, text: choice.label }));
+    }
+    hiringSelect.value = previous;
+    if (hiringSelect.value !== previous) { hiringSelect.value = ''; app.jobs.hiring = ''; }
+  }
 }
 
-function statusChip(item) {
-  const closed = item.snapshot_status.includes('已标关闭');
-  return badge(closed ? '快照已关闭' : '待核实', closed ? 'badge-later' : 'badge-neutral');
+function hiringChip(item) {
+  return badge(item.hiring.label, HIRING_BADGE[item.hiring.level] || 'badge-neutral');
+}
+
+/** 「挂了多久 / HR 多久没动」这一行：在招判断里最直观的两个数。 */
+function hiringLine(item) {
+  const parts = [];
+  if (item.hiring.hr_text) parts.push(`HR ${item.hiring.hr_text}`);
+  const age = item.hiring.age_days;
+  if (age !== null && age !== undefined) {
+    parts.push(age < 1 ? '今天首次见到' : `已挂 ${Math.round(age)} 天`);
+  }
+  if (item.hiring.seen_count) parts.push(`见过 ${item.hiring.seen_count} 次`);
+  return parts.join(' · ');
 }
 
 function jobCard(item, index) {
@@ -164,6 +225,7 @@ function jobCard(item, index) {
     item.experience || '经验未提供',
     item.education || '学历未提供',
   ];
+  const hiringText = hiringLine(item);
   return h('li', {
     class: `job${app.jobs.selectedId === item.id ? ' is-selected' : ''}`,
     dataset: { id: item.id, index: String(index) },
@@ -178,12 +240,13 @@ function jobCard(item, index) {
     h('p', { class: 'job-snapshot' },
       item.detail_fetched_at
         ? `详情快照 ${fmtTime(item.detail_fetched_at)}（${relTime(item.detail_fetched_at)}）${item.stale ? ' · 偏旧' : ''}`
-        : '没有详情快照时间')),
+        : '没有详情快照时间'),
+    hiringText ? h('p', { class: 'job-hiring' }, hiringText) : null),
   h('div', { class: 'job-badges', 'aria-label': '岗位标签' },
+    hiringChip(item),
     badge(item.decision.bucket, BUCKET_BADGE[item.decision.bucket] || 'badge-neutral'),
     item.decision.score === null ? null : badge(`排序分 ${item.decision.score}`, 'badge-quiet'),
-    item.duplicate_count && item.duplicate_count > 1 ? badge(`疑似重复 ×${item.duplicate_count}`, 'badge-quiet') : null,
-    statusChip(item)),
+    item.duplicate_count && item.duplicate_count > 1 ? badge(`疑似重复 ×${item.duplicate_count}`, 'badge-quiet') : null),
   h('div', { class: 'job-actions' },
     h('button', {
       class: 'btn btn-sm btn-quiet', type: 'button', 'data-act': 'detail', 'data-id': item.id,
@@ -372,13 +435,16 @@ export function renderDetail() {
       item.salary || '未提供薪资', item.experience || '经验未提供', item.education || '学历未提供',
       item.company_size || null, item.industry || null].filter(Boolean).join(' · ') }),
     h('div', { class: 'job-badges' },
+      hiringChip(item),
       badge(item.decision.bucket, BUCKET_BADGE[item.decision.bucket] || 'badge-neutral'),
-      statusChip(item),
       item.duplicate_count && item.duplicate_count > 1 ? badge(`疑似重复 ×${item.duplicate_count}`, 'badge-quiet') : null),
     h('p', { class: 'detail-meta' },
       item.detail_fetched_at
         ? `详情快照 ${fmtTime(item.detail_fetched_at)}（${relTime(item.detail_fetched_at)}）`
         : '没有详情快照时间'),
+    h('p', { class: 'detail-meta', text: `在招判断：${item.hiring.label}`
+      + (item.hiring.job_state ? ` · 平台状态「${item.hiring.job_state}」` : '')
+      + (hiringLine(item) ? ` · ${hiringLine(item)}` : '') }),
     url ? externalLink(url, '在原站打开该岗位', 'btn btn-sm') : h('p', { class: 'hint', text: '该记录没有可用的站内链接。' })));
 
   const noteDraft = pendingNoteDraft(item.id);
@@ -419,9 +485,19 @@ export function renderDetail() {
   body.appendChild(decisionBlock(item));
 
   if (item.annotation && Object.keys(item.annotation.payload).length) {
-    const rows = Object.entries(item.annotation.payload).map(([key, value]) => [key, valueText(value)]);
+    const annotationLabels = {
+      role: '岗位方向', skills: '技术导航', education: '学历要求', experience: '经验要求',
+      employment_type: '岗位性质', responsibilities: '职责', evidence: '原文依据',
+      required_skills: '要求相关技术', preferred_skills: '优先相关技术',
+      requirement_notes: '择一、优先与放宽条件', fresh_graduate: '对应届生的明确表态',
+      graduation_years: '明确届别', school_requirement: '院校条件', work_schedule: '工作制度',
+    };
+    const rows = Object.entries(item.annotation.payload)
+      .filter(([key]) => !['evidence_ids', 'requirement_note_ids'].includes(key))
+      .map(([key, value]) => [annotationLabels[key] || key, valueText(value)]);
     body.appendChild(h('div', { class: 'detail-block' },
       h('h4', { text: '模型标注' }),
+      h('p', { class: 'hint', text: '技术名称用于定位要求；是否必须同时掌握、能否放宽，请结合条件原句核实。' }),
       item.annotation.stale ? h('p', {class:'callout callout-info',text:'岗位原文或标注配置已更新，可重新打标生成当前版本。'}) : null,
       h('p', { class: 'hint', text: [item.annotation.model || '未记录模型',
         item.annotation.created_at ? fmtTime(item.annotation.created_at) : null].filter(Boolean).join(' · ') }),
@@ -431,7 +507,7 @@ export function renderDetail() {
 
   const extra = [];
   if (item.matched_queries.length) extra.push(['命中的搜索词', item.matched_queries.join('、')]);
-  if (item.skills.length) extra.push(['技能标签', item.skills.join('、')]);
+  if (item.skills.length) extra.push(['列表与历史累计技能标签', item.skills.join('、')]);
   if (item.legacy_match) extra.push(['历史模型判定', `${item.legacy_match}${item.legacy_match_reason ? ` · ${item.legacy_match_reason}` : ''}`]);
   if (item.legacy_retention) extra.push(['历史保留分层', item.legacy_retention]);
   if (item.first_seen_at) extra.push(['首次入库', fmtTime(item.first_seen_at)]);
@@ -483,6 +559,7 @@ export function resetJobFilters() {
   app.jobs.q = '';
   app.jobs.city = '';
   app.jobs.tier = '';
+  app.jobs.hiring = '';
   app.jobs.page = 1;
   app.jobs.cursor = -1;
   const q = document.getElementById('f-q');
@@ -531,6 +608,16 @@ export function wireJobsEvents() {
   if (tier) {
     tier.addEventListener('change', () => {
       app.jobs.tier = tier.value;
+      app.jobs.page = 1;
+      app.jobs.cursor = -1;
+      void loadJobs();
+    });
+  }
+
+  const hiring = document.getElementById('f-hiring');
+  if (hiring) {
+    hiring.addEventListener('change', () => {
+      app.jobs.hiring = hiring.value;
       app.jobs.page = 1;
       app.jobs.cursor = -1;
       void loadJobs();

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 
 
@@ -44,15 +45,30 @@ def annotation_key(row: dict, cfg) -> tuple[str, str, str, str]:
 
 
 def annotation_input(row: dict, cfg) -> dict:
-    return {"title": row.get("title", ""), "company": row.get("company_name", ""),
+    value = {"title": row.get("title", ""), "company": row.get("company_name", ""),
             "city": row.get("city", ""), "education": row.get("education", ""), "experience": row.get("experience", ""),
             "job_description": (row.get("job_description") or "")[:cfg.llm.max_input_chars],
-            "input_truncated": len(row.get("job_description") or "") > cfg.llm.max_input_chars,
-            "target_roles": cfg.candidate.roles if cfg.candidate else [],
-            "skill_keywords": cfg.candidate.skills if cfg.candidate else []}
+            "input_truncated": len(row.get("job_description") or "") > cfg.llm.max_input_chars}
+    spans = []
+    for field in ("title", "company", "city", "education", "experience", "job_description"):
+        for index, match in enumerate(re.finditer(r"[^\n\r。；;]+[。；;]?", value[field])):
+            text = match.group().strip()
+            if text:
+                spans.append({"id": f"{field}:{index}", "text": text})
+    value["source_spans"] = spans
+    graduate_text = value["title"] + "\n" + value["job_description"]
+    value["allowed_fresh_graduate_codes"] = [0, 1, 2, 3] if re.search(r"应届|校招|\d{2,4}届", graduate_text) else [0]
+    if re.search(r"(?:还没|尚未|未)毕业.{0,8}校招|校招.{0,8}(?:还没|尚未|未)毕业", graduate_text):
+        value["qualification_scope_instruction"] = (
+            "未毕业校招生与已毕业应届生分别判断。仅限制未毕业者不能归纳为拒绝所有应届生；"
+            "保留限制对象和毕业年限的原句到requirement_note_ids，毕业年限写experience。"
+            "没有对所有应届生的明确表态时fresh_graduate填0。")
+    return value
 
 
 def has_annotation(db, row, cfg):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='job_annotations'").fetchone():
+        return False
     return db.execute("SELECT 1 FROM job_annotations WHERE canonical_id=? AND input_hash=? AND prompt_hash=? AND provider=? AND model=?",
                       (row["canonical_id"], *annotation_key(row, cfg))).fetchone() is not None
 
@@ -84,16 +100,29 @@ def annotation_stale(row, cfg, annotation):
     return annotation_key(row, cfg) != tuple(annotation.get(k) for k in ("input_hash", "prompt_hash", "provider", "model"))
 
 
-def record_status(db, row, task_id, evidence, invalid: bool | None):
+def record_status(db, row, task_id, evidence, invalid: bool | None,
+                  checked_at: str | None = None):
+    """记一次状态检查。`invalid` 三态：True 失效 / False 有效 / None 判不了。
+
+    `checked_at` 只在**补录**时用：把历史 JSONL 里的观测时间原样写回，
+    否则补录会把几十条记录全按"刚刚"算，冷却期与先后顺序就都失真了。
+    行的 `updated_at` 始终是写入时刻 —— 它表示这行被改过，不是被观测过。
+    """
     stamp = datetime.now(timezone.utc).isoformat()
+    observed = checked_at or stamp
     outcome = "unknown" if invalid is None else "closed" if invalid else "open"
     with db:
         db.execute("INSERT INTO job_status_checks(canonical_id,task_id,checked_at,outcome,evidence_json) VALUES (?,?,?,?,?)",
-                   (row["canonical_id"], task_id, stamp, outcome, json.dumps(evidence, ensure_ascii=False)))
+                   (row["canonical_id"], task_id, observed, outcome, json.dumps(evidence, ensure_ascii=False)))
         if invalid is not None:
             # A status check never changes the timestamp of the stored JD body.
             db.execute("UPDATE jobs SET job_invalid=?,job_status_desc=?,updated_at=? WHERE canonical_id=?",
                        (int(invalid), evidence.get("job_status") or ("职位已关闭" if invalid else "招聘中"), stamp, row["canonical_id"]))
+            active = (evidence.get("active_time") or "").strip()
+            if active:
+                from .normalization import active_days_from_desc
+                db.execute("UPDATE jobs SET recruiter_active_status=?,recruiter_active_days=? WHERE canonical_id=?",
+                           (active, active_days_from_desc(active), row["canonical_id"]))
 
 
 def last_status_times(db) -> dict:
