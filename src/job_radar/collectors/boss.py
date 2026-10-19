@@ -1120,6 +1120,10 @@ class BossCollector(Collector):
             detail = (f"{detail}｜这是平台要求**人工过验证**（岗位页会被 302 到 "
                       f"verify.html），等待和重载都无效；请运行 `job-radar verify` "
                       f"在弹出的窗口里完成验证，再手动解除冻结")
+        # 置前窗口**不在这里做**：本方法是同步的，`browser.show()` 是协程，
+        # 调度出去的任务很可能在进程退出前没跑到。真正的置前在
+        # `worker.TaskContext.verified()` 里（`await browser.show(page)`），
+        # 所有采集路径的 PlatformRiskStop 都要经过它。
         raise PlatformRiskStop(f"{detail}{note}", code=code, http_status=http_status, category=category)
 
     async def _recover_code37(self, seed: str, name: str, ts: str) -> None:
