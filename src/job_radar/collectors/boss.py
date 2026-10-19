@@ -1347,6 +1347,28 @@ class BossCollector(Collector):
         })
         self._finish_request(rowid, "ok")
 
+        # **导航之后必须补滚一次 stoken。**
+        #
+        # 整页导航会轮换 cookie 里的种子（`__zp_sseed__` / `__zp_sname__` /
+        # `__zp_sts__`），但**不会重算 `__zp_stoken__`**；而滚动器只在
+        # 「接口响应成功之后」才滚动（见 `_same_origin_fetch`）。
+        #
+        # 2026-10-19 实测：一次导航之后列表接口仍然 `code=0`（种子变了、stoken
+        # 没变，服务端容忍一次）；但 `sweep` 的形态是「1 个列表 + 8 条详情导航」，
+        # 8 次种子轮换中间一次都不重算 —— 下一个列表请求就拿到 `code=37`
+        # 「您的环境存在异常」。**这不是封禁**：浏览器里页面完全正常，人工确认过。
+        #
+        # 成本 0 个请求：滚动是纯 JS 计算，种子已经在 cookie jar 里。
+        roller = self._stoken_roller
+        if roller is not None:
+            try:
+                self.last_roll = await roll_quietly(roller)
+                self._stoken_roll_ok = bool(self.last_roll)
+                if self._stoken_roll_ok:
+                    self._requests_since_remint = 0
+            except Exception:  # noqa: BLE001 - 滚动失败只降级，不影响已经拿到的正文
+                self._stoken_roll_ok = False
+
         lo, hi = self.config.detail_delay_seconds
         if getattr(self, "pace", None) is None:
             await asyncio.sleep(gaussian(lo, hi))
