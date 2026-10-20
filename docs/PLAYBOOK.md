@@ -141,19 +141,34 @@ A/B 实测（6 次导航 + 1 次列表复检）：
 
 ### 空正文要分清是哪一种空
 
-`_ssr_blank_reason()` **先看平台文案**，没命中才退回 URL / 字节数判据。
+`_ssr_blank_reason()` 分三层判据，**从硬到软**：
+
+1. **`code-block` 结构**（最硬）：`403.html` 里内联多个块，只有带 `show` 的生效
+2. **页面文案**：`IP存在异常` / `账户存在异常` / `访问过于频繁` …
+3. **模型兜底**：规则都认不出来时，把可见文本丢给决策模型判
 
 ```
 IP地址存在异常   → ip_restricted,          network_restriction, 35
-账户存在异常     → account_restricted,     account_restriction, 36
+账户存在异常     → account_restricted,     account_restriction, 32（403页）/36（verify页）
 环境存在异常     → environment_restricted, environment_restriction, 37
 访问过于频繁     → rate_limited
 请先登录/未登录  → login_wall,             authentication_required, 7
 ```
 
-**为什么文案优先**：URL 和字节数只能判出「大概是哪一类」，判不出「这次为什么」。
-实测一个 **1KB** 的「您的IP地址存在异常行为」页，按字节数会归成 `empty_page`
-—— 被当成我们自己的 bug。
+**为什么要有模型这一层**：2026-10-20 那次，规则的四层判据全部漏掉同一个封禁页 ——
+URL 不认识 `403.html`、字节数（44KB）落进 JS 挑战页区间（25–62KB）、
+文案模式要求「地址」二字而平台写的是「您的 IP 存在异常行为」、
+code 编号被页面里第一个块带偏。每补一次规则都要等下一次事故来验证。
+
+**分工**：规则管它擅长的（`show` 标记、`expire-time` 这种机械提取、零成本），
+模型管语义（「这是什么页」）。规则先跑，认不出来才叫模型 ——
+正常下线的岗位很多，不能每个都问模型。
+
+⚠️ **模型失败必须退回规则**，不能把「模型没答上来」当成「页面没问题」——
+那等于给一个可能已封禁的账号开继续请求的口子。
+
+⚠️ 认不出来的页面会落盘到 `local/abnormal/<时间>-<kind>.{html,txt}`，
+供人事后复核。规则判错时光看 `request_log` 查不出真相 —— 真相在页面文字里。
 
 非风险类的归因：
 
@@ -164,7 +179,7 @@ IP地址存在异常   → ip_restricted,          network_restriction, 35
 | `closed` | 岗位真下线 | 正常，跳过 |
 | `selector_miss` | 页面在但没容器 | 我们的 bug，要查 |
 | `empty_page` | 页面几乎空白 | 瞬时，可重试 |
-| `blank_jd` | 容器在但空 | 岗位没写 JD |
+| `unknown_page` | 模型也判不出来 | **停**，看落盘的页面 |
 
 `_page_prompt()` 剥掉 script/style 取可见文本，**没命中风控词时返回空串** ——
 正常岗位页的首句是 JD 正文，当成「平台提示」写进异常消息只会误导。

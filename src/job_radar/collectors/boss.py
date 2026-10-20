@@ -236,6 +236,43 @@ def _expire_to_iso(value: str | None) -> str:
     return ""
 
 
+def _dump_abnormal_page(html: str, diag: dict, visible: str) -> str:
+    """把异常页面的 HTML + 可见文本落盘，供人事后复核。
+
+    为什么值得留：规则判错的时候（2026-10-20 那次封禁被判成 JS 挑战），
+    光看 `request_log` 里的 `js_challenge` 根本查不出真相 ——
+    真相在页面文字里。留着原件才能复盘，也才能给模型当样本。
+
+    写盘失败只警告，不影响停机结论。
+    """
+    try:
+        root = Path(__file__).resolve().parents[3] / "local" / "abnormal"
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        kind = str(diag.get("kind") or "unknown")
+        stem = f"{stamp}-{kind}"
+        (root / f"{stem}.html").write_text(html or "", encoding="utf-8")
+        lines = [
+            f"kind      : {kind}",
+            f"category  : {diag.get('category')}",
+            f"code      : {diag.get('code')}",
+            f"evidence  : {diag.get('evidence')}",
+            f"http      : {diag.get('status')}",
+            f"bytes     : {diag.get('length')}",
+            f"expire_at : {diag.get('expire_at')}",
+            f"url       : {diag.get('url')}",
+            f"prompt    : {diag.get('prompt')}",
+            "",
+            "---- 可见文本 ----",
+            visible,
+        ]
+        (root / f"{stem}.txt").write_text("\n".join(lines), encoding="utf-8")
+        return str(root / f"{stem}.txt")
+    except Exception as exc:  # noqa: BLE001 - 落盘失败不该掩盖风控结论
+        print(f"[PAGE-DUMP-FAIL] {type(exc).__name__}: {exc}", flush=True)
+        return ""
+
+
 def _parse_block_page(html: str) -> dict | None:
     """解析限制 / 封禁页，取出**生效的那个 code**、平台原话和恢复时间。
 
@@ -301,7 +338,7 @@ def _is_challenge_url(url: str) -> bool:
             or "safe-validate" in lowered)
 
 
-def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
+def _ssr_blank_reason(html: str, final_url: str, status: int, judge=None) -> dict:
     """详情页没有 `.job-sec-text` 时，**说清是哪一种空**。
 
     为什么值得单独做：2026-10-19 一轮校准有 5 条失败，原来的错误信息一律是
@@ -314,6 +351,19 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
 
     糊在一起的代价是双向的：真下线被当成风控而白白停轮，风控被当成下线而继续
     加压，选择器失效则长期无声地丢正文。所以这里把证据带回异常消息里。
+
+    ## 两套判据，规则在前、模型兜底
+
+    规则（本函数下半部分）处理**结构性、零成本**的判据：URL 模式、字节数分档、
+    `code-block` 结构。它们对已知页面又快又准。
+
+    `judge` 是一个可选回调（签名 `judge(text, url, size, status) -> dict`），
+    由 `job_analysis.page_state.classify_page` 提供。**当规则拿不准时调用它** ——
+    平台改文案、换编号、上新页面，规则一定会漏，而模型读得懂新写法。
+
+    2026-10-20 那次事故就是规则漏判的典型：封禁页 `403.html?code=32` 不在
+    `_is_challenge_url()` 里，字节数又落进 JS 挑战页区间，于是被判成
+    「读早了，等 2 秒会自愈」，对一个已封禁的账号又发了十几个请求。
 
     ⚠️ 归因顺序是刻意的：**地址栏优先于正文关键词**。`verify` 出现在 URL 上是
     平台把我们送去了验证页，这是硬证据；而"安全验证"四个字可能只是页面脚本里的
@@ -394,6 +444,16 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
     if hit:
         return {**base, "kind": "closed", "evidence": hit}
     if "job-sec-text" not in text:
+        # 规则到这里都认不出来 —— **这正是让模型插手的时刻**。
+        # 字节数分档只是历史的经验区间，平台换一次版式就失效；而模型读得懂
+        # 「您的账户存在异常行为，已暂时被限制访问！」这种没见过的新写法。
+        #
+        # 只在「没有正文容器」这条路上调用：真有 `job-sec-text` 就不必花模型调用，
+        # 而正常下线的岗位会先在 `_CLOSED_MARKS` 那步被拦掉。
+        if judge is not None:
+            judged = _judge_page(judge, text, final_url, size, status)
+            if judged:
+                return {**base, **judged}
         # 按**字节数**兜一层。历史标定（boss-scrape-layer 记忆）给了四档：
         #   下架 ~11KB / JS 挑战 ~41KB / 验证页 ~44.5KB / 正常岗位页 138–147KB
         # 2026-10-19 实测的 security.html 是 42,825 字节，正落在挑战页区间。
@@ -408,6 +468,54 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
         return {**base, "kind": kind, "evidence": "no-container"}
     # 容器在、里面是空的：岗位在线但正文为空（少数岗位确实不写 JD）。
     return {**base, "kind": "blank_jd", "evidence": "empty-container"}
+
+
+#: 模型判出的页面状态 → `_ssr_blank_reason` 的 kind。
+_JUDGE_KIND = {
+    "normal_content": "selector_miss",
+    "job_closed": "closed",
+    "job_not_found": "closed",
+    "login_required": "login_wall",
+    "verification_required": "verification",
+    "rate_limited": "rate_limited",
+    "account_restricted": "account_restricted",
+    "ip_restricted": "ip_restricted",
+    "environment_flagged": "environment_restricted",
+    "page_changed": "selector_miss",
+    "unknown": "unknown_page",
+}
+
+
+def _judge_page(judge, text: str, url: str, size: int, status: int) -> dict | None:
+    """调用模型回调判页，返回可并入归因字典的字段。
+
+    **模型失败一律返回 None，退回规则判据。** 不能把「模型没答上来」
+    当成「页面没问题」—— 那等于给一个可能已封禁的账号开了继续请求的口子。
+
+    `judge` 的签名是 `judge(text, url, size, status) -> {state, action, category, ...}`，
+    由 `job_analysis.page_state.classify_page` 适配而来（见 `build_collector`）。
+    """
+    try:
+        result = judge(text, url, size, status) or {}
+    except Exception as exc:  # noqa: BLE001 - 判页失败必须退回规则而不是放行
+        print(f"[JUDGE-FAIL] {type(exc).__name__}: {str(exc)[:160]}；退回规则判据",
+              flush=True)
+        return None
+    state = str(result.get("state") or "").strip()
+    if state not in _JUDGE_KIND:
+        return None
+    kind = _JUDGE_KIND[state]
+    verdict = {
+        "kind": kind,
+        "evidence": f"llm:{state}",
+        "llm_state": state,
+        "llm_action": result.get("action") or "stop",
+        "llm_confidence": result.get("confidence"),
+    }
+    category = result.get("category")
+    if category:
+        verdict["category"] = category
+    return verdict
 
 
 # 必须是 jobs（带 s）。`/web/geek/job` 会 302 到 `/web/geek/jobs`，多一跳；
@@ -1584,7 +1692,16 @@ class BossCollector(Collector):
         fields = html_query(html, SSR_SELECTORS)
         description = (fields["jd"]["text"] or "").strip()
         if not description:
-            diag = _ssr_blank_reason(html, self.page.url or url, response.status)
+            diag = _ssr_blank_reason(html, self.page.url or url, response.status,
+                                     judge=getattr(self, "page_judge", None))
+            # 认不出来的页面留个原件：规则判错时光看 request_log 查不出真相
+            # （2026-10-20 那次封禁被判成 js_challenge 就是这样藏了一夜）。
+            if diag["kind"] in ("unknown_page", "selector_miss", "js_challenge",
+                                "verification", "empty_page"):
+                saved = _dump_abnormal_page(html, diag, _page_prompt(html))
+                if saved:
+                    diag["page_dump"] = saved
+                    print(f"[PAGE-DUMP] {diag['kind']} → {saved}", flush=True)
             # 验证页与登录墙是**平台状态问题**，必须停；其余是岗位/选择器问题，
             # 记一条分类后继续跑下一条。
             # 页面文案直接判出风险类别时，**立刻熔断** —— 这是最硬的证据。

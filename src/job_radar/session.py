@@ -48,6 +48,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 from datetime import datetime, timezone
@@ -238,7 +239,52 @@ def build_collector(ctx, store, cfg, *, recommendation: bool = False, script: st
     collector.ledger_script = script
     collector.gate_source = f"managed-task:{ctx.ident}"
     collector.skip_detail_ids = store.detailed_ids(cfg.service.detail_after_hours)
+    collector.page_judge = build_page_judge(cfg)
     return collector, pacer
+
+
+def build_page_judge(cfg):
+    """把决策模型包装成「判页」回调，供采集器在规则认不出来时调用。
+
+    为什么放在这里而不是写进采集器：采集层（`job_radar`）不该反向依赖分析包
+    （`job_analysis`），这和 `pace` / `ledger` 用的是同一套注入方式。
+
+    **配置里没有 LLM 凭据时返回 None** —— 采集照常跑，只用规则判据。
+    这让判页能力是增强而不是硬依赖。
+    """
+    llm = getattr(cfg, "llm", None)
+    base_url = getattr(llm, "base_url", "") or ""
+    if not base_url:
+        return None
+    try:
+        from job_analysis.decision import DecisionClient
+        from job_analysis.page_state import classify_page
+    except Exception:  # noqa: BLE001 - 分析包不可用不影响采集
+        return None
+    api_key = getattr(llm, "api_key", "") or ""
+    if not api_key:
+        env_name = getattr(llm, "api_key_env", "") or ""
+        api_key = os.environ.get(env_name, "") if env_name else ""
+    if not api_key:
+        return None
+    client = DecisionClient(base_url=base_url, api_key=api_key)
+
+    def judge(html: str, url: str, size: int, status: int) -> dict:
+        # 只把**可见文本**交给模型：44KB 的 HTML 塞进去既浪费上下文，
+        # 也会让模型被标签和脚本干扰。`_visible_text` 剥 script/style 再剥标签。
+        return classify_page(client, _visible_text(html), url=url, size=size,
+                             http_status=status)
+
+    return judge
+
+
+def _visible_text(html: str) -> str:
+    """HTML → 可见文本。判页只看文字，不送标签。"""
+    from .collectors.boss import _DROP_RE, _SPACE_RE, _TAG_RE
+
+    text = _DROP_RE.sub(" ", html or "")
+    text = _TAG_RE.sub(" ", text)
+    return _SPACE_RE.sub(" ", text).strip()
 
 
 def bump(ctx, name: str, amount: int = 1) -> int:
