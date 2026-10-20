@@ -40,7 +40,10 @@ def test_returns_empty_on_normal_job_page():
 
 @pytest.mark.parametrize("prompt,category,code", [
     ("您的IP地址存在异常行为", "network_restriction", 35),
-    ("您的账户存在异常行为", "account_restriction", 36),
+    # 「账户存在异常」在 verify.html 是 code=36、在 403.html 是 code=32，
+    # 纯文本判不出是哪个，所以 code 留空由 URL / code-block 补 —— 见
+    # `test_block_page.py` 里对封禁页的断言。
+    ("您的账户存在异常行为", "account_restriction", None),
     ("您的环境存在异常", "environment_restriction", 37),
     ("访问过于频繁，请稍后再试", "rate_limited", None),
     ("请先登录后再查看", "authentication_required", 7),

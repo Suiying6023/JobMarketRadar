@@ -158,9 +158,18 @@ def _page_prompt(html: str, limit: int = 120) -> str:
 
 #: 页面文案 → 停机类别。**这是最精确的一层判据** —— 平台自己写的原因
 #: 比 URL 模式、字节数区间都更可靠，也直接告诉人下一步该做什么。
+#:
+#: ⚠️ 匹配前会把**空白全部去掉**再看。平台的实际文案是
+#: 「您的 IP 存在异常行为」（IP 后有空格、且没有「地址」二字），
+#: 而最初写成 `ip地址存在异常` 就永远匹配不上 —— 结果一个真封禁被判成了
+#: `js_challenge`，白白多发了十几个请求。模式一律按「去掉空白后的子串」写。
 _PROMPT_CATEGORY = (
-    (("ip地址存在异常", "ip 地址存在异常", "ip存在异常"), "network_restriction", 35),
-    (("账户存在异常", "账号存在异常", "账号可能存在异常"), "account_restriction", 36),
+    (("ip存在异常", "ip地址存在异常"), "network_restriction", 35),
+    # 「账户存在异常」在不同页面配**不同的 code**：`verify.html` 上是 36
+    # （要求滑块验证），`403.html` 上是 32（直接限制访问）。纯文本判不出是哪个，
+    # 所以 code 留空 —— 由 URL 或 `code-block` 结构补。猜一个数只会误导。
+    (("账户存在异常", "账号存在异常", "账号可能存在异常", "账户异常"),
+     "account_restriction", None),
     (("环境存在异常", "环境异常"), "environment_restriction", 37),
     (("访问过于频繁", "操作过于频繁", "操作太频繁"), "rate_limited", None),
     (("重新登录", "请先登录", "登录已失效", "未登录"), "authentication_required", 7),
@@ -169,13 +178,112 @@ _PROMPT_CATEGORY = (
 
 def _prompt_verdict(prompt: str) -> tuple[str, int | None] | None:
     """把页面文案翻成 (category, code)。认不出返回 None，交给其他判据。"""
-    lowered = (prompt or "").casefold()
+    # 去掉所有空白再比：平台文案里 `IP 存在异常`、`IP地址存在异常` 都出现过。
+    lowered = _SPACE_RE.sub("", (prompt or "").casefold())
     if not lowered:
         return None
     for marks, category, code in _PROMPT_CATEGORY:
         if any(mark in lowered for mark in marks):
             return category, code
     return None
+
+
+#: 封禁页 `/web/passport/zp/403.html?code=N` 的结构：同一页里**内联了多个
+#: `code-block`**，只有带 `show` 的那个生效。
+#:
+#: 2026-10-20 实测抓到的页面同时含 `id="code31"`（IP 受限）和
+#: `id="code32" class="code-block show"`（账户受限）—— 只看文案会挑中第一个
+#: 命中的句子，把「IP 异常」当成主因，实际生效的是**账户限制**。
+_BLOCK_ID_RE = re.compile(r'id="code(\d+)"', re.I)
+_EXPIRE_RE = re.compile(r'class="[^"]*\bexpire-time\b[^"]*"[^>]*>([^<]*)<', re.I)
+
+#: code → (类别, 给人看的说明)。实测 `403.html` 里：31 是 IP 受限、32 是账户受限。
+#: **这张表只是兜底** —— 优先按生效块自己的文案判（见 `_parse_block_page`），
+#: 因为平台可能新增 code，而文案口径比编号稳定。
+_BLOCK_CODES = {
+    31: ("network_restriction", "IP 地址存在异常"),
+    32: ("account_restriction", "账户存在异常行为，已被限制访问"),
+    33: ("account_restriction", "账号访问受限"),
+    34: ("account_restriction", "账号访问受限"),
+    35: ("network_restriction", "IP 地址存在异常"),
+    36: ("verification_required", "要求人工验证"),
+    37: ("environment_restriction", "环境存在异常"),
+}
+
+_BLOCK_LABELS = {
+    "network_restriction": "IP 地址存在异常",
+    "account_restriction": "账户存在异常行为，已被限制访问",
+    "environment_restriction": "环境存在异常",
+    "rate_limited": "访问过于频繁",
+    "authentication_required": "需要登录",
+}
+
+
+def _expire_to_iso(value: str | None) -> str:
+    """把封禁页上的 `2026-10-21 00:01` 转成闸门能用的 ISO 串。
+
+    解析不出来就返回空串（当成「没有明确期限」），**不猜时间** ——
+    `normalise_resume_after` 遇到不可解析的值会抛错，那会让停机路径本身崩掉。
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).astimezone().isoformat(timespec="seconds")
+        except ValueError:
+            continue
+    return ""
+
+
+def _parse_block_page(html: str) -> dict | None:
+    """解析限制 / 封禁页，取出**生效的那个 code**、平台原话和恢复时间。
+
+    没有 `id="codeN"` 结构时返回 None，交给其他判据 —— **不猜**。
+    """
+    text = html or ""
+    marks = list(_BLOCK_ID_RE.finditer(text))
+    if not marks:
+        return None
+
+    segments = []
+    for index, match in enumerate(marks):
+        tag_start = text.rfind("<div", 0, match.start())
+        if tag_start < 0:
+            continue
+        tag_end = text.find(">", match.start())
+        tag = text[tag_start:tag_end + 1] if tag_end > 0 else ""
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
+        segments.append({
+            "code": int(match.group(1)),
+            "active": bool(re.search(r'class="[^"]*\bshow\b', tag)),
+            "html": text[tag_start:end],
+        })
+    if not segments:
+        return None
+
+    chosen = next((s for s in segments if s["active"]), segments[0])
+    raw = chosen["html"]
+    expire = _EXPIRE_RE.search(raw)
+    visible = _SPACE_RE.sub(" ", _TAG_RE.sub(" ", _DROP_RE.sub(" ", raw))).strip()
+    # **优先用生效块自己的文案判类别**，编号只作兜底：平台新增 code 时，
+    # 文案口径（「IP 存在异常」/「账户存在异常」）仍然可信。
+    by_text = _prompt_verdict(visible)
+    if by_text:
+        category = by_text[0]
+        label = _BLOCK_LABELS.get(category, "访问受限")
+    else:
+        category, label = _BLOCK_CODES.get(
+            chosen["code"], ("account_restriction", "访问受限"))
+    return {
+        "code": chosen["code"],
+        "category": category,
+        "label": label,
+        "expire_at": (expire.group(1).strip() if expire else ""),
+        "message": visible[:200],
+        "all_codes": [s["code"] for s in segments],
+    }
+
 
 
 # 详情页读到空正文时的归因标记。
@@ -224,9 +332,32 @@ def _ssr_blank_reason(html: str, final_url: str, status: int) -> dict:
     base = {"status": status, "length": size, "url": final_url or "",
             "prompt": _page_prompt(html)}
 
-    # **先看页面自己说什么。** 平台文案是最精确的判据：`IP地址存在异常`
-    # 就是网络限制，`账户存在异常` 就是账号限制 —— 比按 URL 或字节数猜准得多。
-    # 这一步只改判据来源，不改「撞墙即停」的语义。
+    # **最高优先级：限制页 / 封禁页。**
+    #
+    # `/web/passport/zp/403.html?code=32` 这类页面里内联了多个 `code-block`，
+    # 只有带 `show` 的那个生效。它既不在 `_is_challenge_url()` 里（那三个是
+    # security/verify/safe-validate），字节数又恰好落在 JS 挑战页的区间，
+    # 于是**一个真封禁被按字节数判成了 `js_challenge`** —— 2026-10-20 实测：
+    # 页面明写「您的账户存在异常行为，已暂时被限制访问！将于 2026-10-21 00:01
+    # 恢复正常」，我们却当成"读早了，等 2 秒会自愈"，继续发了十几个请求。
+    #
+    # 这条必须放在 `_prompt_verdict` 之前：`_page_prompt` 只取「第一句含风控词的
+    # 话」，而这一页第一句是 code31 的「IP 存在异常」，会把主因判成 IP 限制，
+    # 掩盖真正的账号限制。
+    block = _parse_block_page(html)
+    if block:
+        kind = {"account_restriction": "account_restricted",
+                "network_restriction": "ip_restricted",
+                "environment_restriction": "environment_restricted",
+                "verification_required": "verification",
+                }.get(block["category"], "banned")
+        return {**base, "kind": kind, "category": block["category"],
+                "code": block["code"], "evidence": f"block:{block['code']}",
+                "prompt": block["message"], "expire_at": block["expire_at"],
+                "label": block["label"], "all_codes": block["all_codes"]}
+
+    # 其次看页面自己说什么。`IP存在异常` 就是网络限制，`账户存在异常` 就是
+    # 账号限制 —— 比按 URL 或字节数猜准得多。只改判据来源，不改「撞墙即停」的语义。
     verdict = _prompt_verdict(base.get("prompt", ""))
     if verdict:
         category, code = verdict
@@ -1089,7 +1220,8 @@ class BossCollector(Collector):
 
     def _trip_risk(self, rowid: int | None, detail: str, *,
                    code: int | None, outcome: str = "risk",
-                   http_status: int | None = None, category: str | None = None) -> None:
+                   http_status: int | None = None, category: str | None = None,
+                   resume_after: str = "") -> None:
         """风控响应统一出口：落账本 → **持久熔断** → 抛 RiskControlStop。
 
         顺序是有意的：账本是事后取证的来源，策略文件是**活过本次进程**的那一份。
@@ -1106,6 +1238,7 @@ class BossCollector(Collector):
             try:
                 gate.pause(
                     f"{detail}（script={self.ledger_script or 'collector'}）",
+                    resume_after=resume_after or None,
                     source=getattr(self, "gate_source", f"boss:{self.ledger_script or 'collector'}"))
                 persisted = True
             except Exception as exc:  # noqa: BLE001 - 写盘失败必须显形但不掩盖风控
@@ -1120,6 +1253,11 @@ class BossCollector(Collector):
             detail = (f"{detail}｜这是平台要求**人工过验证**（岗位页会被 302 到 "
                       f"verify.html），等待和重载都无效；请运行 `job-radar verify` "
                       f"在弹出的窗口里完成验证，再手动解除冻结")
+        elif code in (31, 32, 33, 34):
+            # 账号限制。和「验证」完全不同 —— 拖滑块和重登都没用，只能等。
+            detail = (f"{detail}｜这是**账号访问限制**（不是滑块验证、也不是 IP 问题）："
+                      f"拖滑块、重新登录、重载页面都无效，只能在平台给出的时间之后"
+                      f"再确认。期间每多发一个请求都可能延长限制期限。")
         # 置前窗口**不在这里做**：本方法是同步的，`browser.show()` 是协程，
         # 调度出去的任务很可能在进程退出前没跑到。真正的置前在
         # `worker.TaskContext.verified()` 里（`await browser.show(page)`），
@@ -1452,11 +1590,20 @@ class BossCollector(Collector):
             # 页面文案直接判出风险类别时，**立刻熔断** —— 这是最硬的证据。
             if diag.get("category") and diag["kind"] in (
                     "ip_restricted", "account_restricted", "environment_restricted",
-                    "rate_limited", "login_wall"):
+                    "rate_limited", "login_wall", "banned"):
                 self._finish_request(rowid, diag["kind"], diag.get("code"))
-                self._trip_risk(rowid, f"详情页提示「{diag['prompt']}」",
-                                code=diag.get("code"), outcome="risk",
-                                http_status=response.status, category=diag["category"])
+                # 封禁页会明写恢复时间（`expire-time`），带上它 —— 闸门的
+                # `resume_after` 就是靠这个挡住「到点前提前 release」。
+                extra = ""
+                if diag.get("expire_at"):
+                    extra = f"，平台称将于 {diag['expire_at']} 恢复"
+                label = diag.get("label") or "详情页提示"
+                self._trip_risk(
+                    rowid,
+                    f"{label}（code={diag.get('code')}）｜平台原话「{diag['prompt'][:120]}」{extra}",
+                    code=diag.get("code"), outcome="risk",
+                    http_status=response.status, category=diag["category"],
+                    resume_after=_expire_to_iso(diag.get("expire_at")))
             if diag["kind"] == "verification":
                 # 平台原话优先：它直接说明「为什么要验证」。
                 why = (f"平台提示「{diag['prompt']}」" if diag.get("prompt")
